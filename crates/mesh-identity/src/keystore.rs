@@ -100,6 +100,8 @@ pub enum KeystoreError {
     WeakPassword(PasswordVerdict),
     #[error("{0}")]
     Device(#[from] crate::device::DeviceError),
+    #[error("couldn't use the system keyring: {0}")]
+    Keyring(String),
     #[error("couldn't get randomness from the system: {0}")]
     Random(getrandom::Error),
     #[error("couldn't read or write the identity file: {0}")]
@@ -122,6 +124,17 @@ struct BackupContents {
     username: String,
     root_secret: [u8; 32],
     device_list: Vec<u8>,
+}
+
+/// How a sealed file is opened.
+#[derive(Clone, Copy)]
+enum Opener<'a> {
+    Password {
+        username: &'a str,
+        password: &'a str,
+    },
+    /// The data key itself, kept in the OS keyring ("keep unlocked").
+    DataKey(&'a [u8; 32]),
 }
 
 /// One sealed file's header and its unwrapped data key.
@@ -158,8 +171,7 @@ impl Sealed {
     fn open(
         path: &Path,
         magic: &'static [u8; 4],
-        username: &str,
-        password: &str,
+        with: Opener<'_>,
     ) -> Result<(Self, Zeroizing<Vec<u8>>), KeystoreError> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -190,13 +202,19 @@ impl Sealed {
         let wrapped: [u8; WRAPPED_LEN] = bytes[PARAMS_END..HEADER_LEN]
             .try_into()
             .expect("wrapped key");
-        let kek = derive_kek(username, password, &salt, params)?;
-        let data_key = Zeroizing::new(
-            open_bytes(&kek, &wrapped, &bytes[..PARAMS_END])?
-                .as_slice()
-                .try_into()
-                .map_err(|_| KeystoreError::CannotUnlock)?,
-        );
+        let data_key = match with {
+            Opener::Password { username, password } => {
+                let kek = derive_kek(username, password, &salt, params)?;
+                Zeroizing::new(
+                    open_bytes(&kek, &wrapped, &bytes[..PARAMS_END])?
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| KeystoreError::CannotUnlock)?,
+                )
+            }
+            // Wrong keys fail below: the contents only open with the real one.
+            Opener::DataKey(key) => Zeroizing::new(*key),
+        };
         let contents = open_bytes(&data_key, &bytes[HEADER_LEN..], &bytes[..HEADER_LEN])?;
         Ok((
             Self {
@@ -324,9 +342,26 @@ impl Keystore {
 
     /// Opens the identity at `path` with its username and password.
     pub fn unlock(path: &Path, username: &str, password: &str) -> Result<Self, KeystoreError> {
-        let (sealed, plain) = Sealed::open(path, KEYSTORE_MAGIC, username, password)?;
+        let (sealed, plain) = Sealed::open(
+            path,
+            KEYSTORE_MAGIC,
+            Opener::Password { username, password },
+        )?;
+        Self::decode(path, sealed, &plain)
+    }
+
+    /// Opens the identity with its data key (from the OS keyring).
+    pub(crate) fn open_with_data_key(
+        path: &Path,
+        data_key: &[u8; 32],
+    ) -> Result<Self, KeystoreError> {
+        let (sealed, plain) = Sealed::open(path, KEYSTORE_MAGIC, Opener::DataKey(data_key))?;
+        Self::decode(path, sealed, &plain)
+    }
+
+    fn decode(path: &Path, sealed: Sealed, plain: &[u8]) -> Result<Self, KeystoreError> {
         let contents: Contents =
-            postcard::from_bytes(&plain).map_err(|_| KeystoreError::CannotUnlock)?;
+            postcard::from_bytes(plain).map_err(|_| KeystoreError::CannotUnlock)?;
         let root = RootKey::from_secret_bytes(contents.root_secret);
         let devices = DeviceList::from_bytes(&contents.device_list)
             .map_err(|_| KeystoreError::CannotUnlock)?;
@@ -341,6 +376,11 @@ impl Keystore {
             device: DeviceKey::from_secret_bytes(contents.device_secret),
             devices,
         })
+    }
+
+    /// Where this keystore lives.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Changes this device's password. The data key stays the same, so
@@ -419,7 +459,14 @@ impl Keystore {
         device_name: &str,
         params: KdfParams,
     ) -> Result<Self, KeystoreError> {
-        let (_, plain) = Sealed::open(backup, BACKUP_MAGIC, username, backup_password)?;
+        let (_, plain) = Sealed::open(
+            backup,
+            BACKUP_MAGIC,
+            Opener::Password {
+                username,
+                password: backup_password,
+            },
+        )?;
         let contents: BackupContents =
             postcard::from_bytes(&plain).map_err(|_| KeystoreError::CannotUnlock)?;
         let root = RootKey::from_secret_bytes(contents.root_secret);
