@@ -5,6 +5,11 @@
 
 mod device;
 mod id;
+mod password;
 
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
 pub use id::{DeviceKey, IdError, Link, MeshId, RootKey};
+pub use password::{
+    MAX_USERNAME_LEN, MIN_PASSWORD_LEN, PasswordVerdict, check_password, normalize_username,
+    valid_username,
+};
