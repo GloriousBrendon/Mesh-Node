@@ -2,7 +2,8 @@
 //! is a breaking format change: old keystores, IDs or records stop working.
 //! Where possible each vector comes from an independent source, not this crate.
 
-use mesh_identity::{Link, MeshId, RootKey};
+use ed25519_dalek::VerifyingKey;
+use mesh_identity::{DeviceCert, DeviceList, Link, MeshId, RootKey};
 
 /// RFC 8032 §7.1 test 1 secret key; its public key is published there.
 const RFC8032_SECRET: [u8; 32] =
@@ -23,6 +24,40 @@ fn id_text_of_a_known_key() {
         Link::parse(&format!("mesh://id/{RFC8032_MESH_ID}")).unwrap(),
         Link::Id(root.id())
     );
+}
+
+/// RFC 8032 §7.1 test 2 public key, used as a device key.
+const RFC8032_TEST2_PUBLIC: [u8; 32] =
+    hex32("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+/// 2026-10-22 00:00 UTC.
+const CREATED_AT: u64 = 1_792_627_200;
+/// A "Laptop" certificate for the test 2 key, laid out and signed by OpenSSL
+/// (`pkeyutl -sign -rawin`) over `mesh/v1/device-cert\0` + the body.
+const CERT_HEX: &str = "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c000000006ad9520000064c6170746f7022969f1f98743a53a0f67dc1b6b11608b1ab2d9c84cdc90a610ba2235a9ffda6de734a4c144d6c8f91b4342d446b2906b0744ca048d35f3b58384f1244fabf0e";
+/// A seq-1 list holding that certificate, nothing revoked; also from OpenSSL.
+const LIST_HEX: &str = "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00000000000000010001009101d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c000000006ad9520000064c6170746f7022969f1f98743a53a0f67dc1b6b11608b1ab2d9c84cdc90a610ba2235a9ffda6de734a4c144d6c8f91b4342d446b2906b0744ca048d35f3b58384f1244fabf0e000059d63bd32ddab81deed962aa43718cf3b152d62a4a262bb4fc723d2558b3ca4602f25e7b1bc9b91ceffe10d4134fca12e9039833eba9a9e0da3f42d1f630df06";
+
+#[test]
+fn device_cert_and_list_layouts() {
+    let root = RootKey::from_secret_bytes(RFC8032_SECRET);
+    let device = VerifyingKey::from_bytes(&RFC8032_TEST2_PUBLIC).unwrap();
+    let cert = DeviceCert::issue(&root, &device, "Laptop", CREATED_AT).unwrap();
+    assert_eq!(hex(&cert.to_bytes()), CERT_HEX);
+    assert_eq!(DeviceCert::from_bytes(&unhex(CERT_HEX)).unwrap(), cert);
+    let list = DeviceList::first(&root, cert).unwrap();
+    assert_eq!(hex(&list.to_bytes()), LIST_HEX);
+    assert_eq!(DeviceList::from_bytes(&unhex(LIST_HEX)).unwrap(), list);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 const fn hex32(s: &str) -> [u8; 32] {
