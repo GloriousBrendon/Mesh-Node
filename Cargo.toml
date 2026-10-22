@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/mesh-identity", "crates/mesh-node"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# Every dependency is justified here (design/mesh/SPEC-identity.md, in Mesh-Voice).
+[workspace.dependencies]
+# Keys and signatures; the major version iroh 1.x uses, so device keys pass straight to transport.
+ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"] }
+# Keystore and friend-code key derivation (Argon2id).
+argon2 = "0.6"
+# XChaCha20-Poly1305 for the keystore and code records.
+chacha20poly1305 = "0.11"
+# Safety number and other derivations.
+blake3 = "1.8"
+# The mesh1… ID text with its bech32m checksum.
+bech32 = "0.12"
+# Device-link key exchange (latest stable; 0.5 is still a pre-release).
+spake2 = "0.4"
+# Wiping secrets from memory.
+zeroize = { version = "1", features = ["derive"] }
+# The password strength check (refuses weak passwords).
+zxcvbn = "3"
+# "Keep unlocked on this device": Credential Manager / Secret Service.
+keyring = "4"
+# OS randomness.
+getrandom = "0.4"
+# Encoding the encrypted keystore payload only (never signed bytes).
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+# Typed errors the UI can show.
+thiserror = "2"
+# Property tests (dev only).
+proptest = "1"
+
+mesh-identity = { path = "crates/mesh-identity" }

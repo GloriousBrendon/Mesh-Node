@@ -1,0 +1,25 @@
+[package]
+name = "mesh-identity"
+description = "Mesh identity: keys and IDs, devices, the password keystore, friend codes, safety numbers, device linking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+blake3.workspace = true
+bech32.workspace = true
+spake2.workspace = true
+zeroize.workspace = true
+zxcvbn.workspace = true
+keyring.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
