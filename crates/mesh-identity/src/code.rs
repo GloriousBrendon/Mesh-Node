@@ -124,6 +124,10 @@ impl FriendCode {
         Ok(Self(n.to_be_bytes()[3..].try_into().expect("5 bytes")))
     }
 
+    pub(crate) fn as_bytes(&self) -> &[u8; 5] {
+        &self.0
+    }
+
     /// `mesh://code/K7QM-3XPA`.
     pub fn link(&self) -> String {
         format!("mesh://code/{self}")

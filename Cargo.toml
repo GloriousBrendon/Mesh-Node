@@ -20,8 +20,10 @@ chacha20poly1305 = "0.11"
 blake3 = "1.8"
 # The mesh1… ID text with its bech32m checksum.
 bech32 = "0.12"
-# Device-link key exchange (latest stable; 0.5 is still a pre-release).
-spake2 = "0.4"
+# Device-link key exchange. 0.5 is a pre-release but RustCrypto's current line: it
+# shares curve25519-dalek 5 and sha2 0.11 with everything else, where 0.4 pulled in
+# their old majors. Pinned exactly; move to 0.5.0 when it ships.
+spake2 = { version = "=0.5.0-pre.0", features = ["getrandom"] }
 # Wiping secrets from memory.
 zeroize = { version = "1", features = ["derive"] }
 # The password strength check (refuses weak passwords).

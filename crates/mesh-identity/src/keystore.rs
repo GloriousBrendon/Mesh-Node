@@ -32,6 +32,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::code::{ActiveCode, CodeError, CodeRevoke, FriendCode, HeldCode};
 use crate::device::{DeviceCert, DeviceList};
 use crate::id::{DeviceKey, MeshId, RootKey};
+use crate::link::{LinkError, LinkedIdentity};
 use crate::password::{PasswordVerdict, check_password, normalize_username, valid_username};
 
 const KEYSTORE_MAGIC: &[u8; 4] = b"MKS1";
@@ -103,6 +104,8 @@ pub enum KeystoreError {
     Device(#[from] crate::device::DeviceError),
     #[error("{0}")]
     Code(#[from] CodeError),
+    #[error("{0}")]
+    Link(#[from] LinkError),
     #[error("couldn't use the system keyring: {0}")]
     Keyring(String),
     #[error("couldn't get randomness from the system: {0}")]
@@ -496,6 +499,43 @@ impl Keystore {
             device,
             devices,
         )
+    }
+
+    /// Saves an identity received by linking as this device's keystore.
+    /// `username` must be the identity's (you're asked to type it, as a
+    /// check); `password` is this device's own, under the password policy.
+    pub fn create_from_link(
+        path: &Path,
+        linked: LinkedIdentity,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, KeystoreError> {
+        Self::create_from_link_with(path, linked, username, password, KdfParams::DEFAULT)
+    }
+
+    pub(crate) fn create_from_link_with(
+        path: &Path,
+        linked: LinkedIdentity,
+        username: &str,
+        password: &str,
+        params: KdfParams,
+    ) -> Result<Self, KeystoreError> {
+        if normalize_username(username) != normalize_username(&linked.username) {
+            return Err(KeystoreError::CannotUnlock);
+        }
+        let LinkedIdentity {
+            root,
+            device,
+            username,
+            devices,
+        } = linked;
+        Self::save_new(path, &username, password, params, root, device, devices)
+    }
+
+    /// Adds a newly linked device to the list (`seq + 1`) and saves.
+    pub(crate) fn add_device(&mut self, cert: DeviceCert) -> Result<(), KeystoreError> {
+        self.devices = self.devices.with_device(&self.root, cert)?;
+        self.save()
     }
 
     pub fn id(&self) -> MeshId {
