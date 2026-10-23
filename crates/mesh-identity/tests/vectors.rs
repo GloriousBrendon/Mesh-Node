@@ -3,7 +3,7 @@
 //! Where possible each vector comes from an independent source, not this crate.
 
 use ed25519_dalek::VerifyingKey;
-use mesh_identity::{DeviceCert, DeviceList, Link, MeshId, RootKey};
+use mesh_identity::{DeviceCert, DeviceList, Link, MeshId, RootKey, SafetyNumber};
 
 /// RFC 8032 §7.1 test 1 secret key; its public key is published there.
 const RFC8032_SECRET: [u8; 32] =
@@ -47,6 +47,18 @@ fn device_cert_and_list_layouts() {
     let list = DeviceList::first(&root, cert).unwrap();
     assert_eq!(hex(&list.to_bytes()), LIST_HEX);
     assert_eq!(DeviceList::from_bytes(&unhex(LIST_HEX)).unwrap(), list);
+}
+
+/// The safety number for the RFC 8032 test 1 and test 2 keys, computed with
+/// the Python `blake3` package.
+const SAFETY_1_2: &str = "19256 56656 35643 41587 80798 88066 37649 59233 71793 03060 32272 11953";
+
+#[test]
+fn safety_number_of_a_known_pair() {
+    let a = MeshId::from_bytes(&RFC8032_PUBLIC).unwrap();
+    let b = MeshId::from_bytes(&RFC8032_TEST2_PUBLIC).unwrap();
+    assert_eq!(SafetyNumber::new(&a, &b).to_string(), SAFETY_1_2);
+    assert_eq!(SafetyNumber::new(&b, &a).to_string(), SAFETY_1_2);
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -8,6 +8,7 @@ mod id;
 mod keystore;
 mod password;
 mod remember;
+mod safety;
 
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
 pub use id::{DeviceKey, IdError, Link, MeshId, RootKey};
@@ -17,3 +18,4 @@ pub use password::{
     valid_username,
 };
 pub use remember::{is_kept, keyring_status};
+pub use safety::SafetyNumber;
