@@ -29,6 +29,7 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::code::{ActiveCode, CodeError, CodeRevoke, FriendCode, HeldCode};
 use crate::device::{DeviceCert, DeviceList};
 use crate::id::{DeviceKey, MeshId, RootKey};
 use crate::password::{PasswordVerdict, check_password, normalize_username, valid_username};
@@ -100,6 +101,8 @@ pub enum KeystoreError {
     WeakPassword(PasswordVerdict),
     #[error("{0}")]
     Device(#[from] crate::device::DeviceError),
+    #[error("{0}")]
+    Code(#[from] CodeError),
     #[error("couldn't use the system keyring: {0}")]
     Keyring(String),
     #[error("couldn't get randomness from the system: {0}")]
@@ -116,6 +119,8 @@ struct Contents {
     root_secret: [u8; 32],
     device_secret: [u8; 32],
     device_list: Vec<u8>,
+    /// Friend codes made on this device (not backed up: codes are short-lived).
+    codes: Vec<ActiveCode>,
 }
 
 /// A backup's contents: no device key (see the module docs).
@@ -275,6 +280,7 @@ pub struct Keystore {
     root: RootKey,
     device: DeviceKey,
     devices: DeviceList,
+    codes: Vec<ActiveCode>,
 }
 
 impl Keystore {
@@ -335,6 +341,7 @@ impl Keystore {
             root,
             device,
             devices,
+            codes: Vec::new(),
         };
         store.save()?;
         Ok(store)
@@ -375,6 +382,7 @@ impl Keystore {
             root,
             device: DeviceKey::from_secret_bytes(contents.device_secret),
             devices,
+            codes: contents.codes.clone(),
         })
     }
 
@@ -511,6 +519,48 @@ impl Keystore {
         &self.root
     }
 
+    /// A new friend code for this identity, and the record to hand to a
+    /// holder. Expired codes are dropped from the list at the same time.
+    pub fn create_code(
+        &mut self,
+        expiry: Option<u64>,
+        uses: Option<u32>,
+    ) -> Result<(FriendCode, HeldCode), KeystoreError> {
+        let code = FriendCode::generate().map_err(KeystoreError::Random)?;
+        let now = unix_now();
+        let held = HeldCode::new(&self.root, &code, now, expiry, uses)?;
+        self.codes.retain(|c| !expired(c, now));
+        self.codes.push(ActiveCode {
+            code,
+            created_at: now,
+            expires_at: held.expires_at(),
+            max_uses: held.max_uses(),
+        });
+        self.save()?;
+        Ok((code, held))
+    }
+
+    /// Codes made on this device that haven't expired.
+    pub fn codes(&self) -> Vec<ActiveCode> {
+        let now = unix_now();
+        self.codes
+            .iter()
+            .filter(|c| !expired(c, now))
+            .copied()
+            .collect()
+    }
+
+    /// Removes `code` from the list and returns the revoke to send to its
+    /// holder. Works for codes made on another device too.
+    pub fn revoke_code(&mut self, code: &FriendCode) -> Result<CodeRevoke, KeystoreError> {
+        let before = self.codes.len();
+        self.codes.retain(|c| c.code != *code);
+        if self.codes.len() != before {
+            self.save()?;
+        }
+        Ok(CodeRevoke::new(&self.root, code))
+    }
+
     /// The key other modules use to encrypt their local stores.
     pub fn data_key(&self) -> &[u8; 32] {
         &self.sealed.data_key
@@ -522,6 +572,7 @@ impl Keystore {
             root_secret: *self.root.secret_bytes(),
             device_secret: *self.device.secret_bytes(),
             device_list: self.devices.to_bytes(),
+            codes: self.codes.clone(),
         };
         let plain = Zeroizing::new(
             postcard::to_allocvec(&contents).map_err(|e| std::io::Error::other(e.to_string()))?,
@@ -578,6 +629,10 @@ fn random<const N: usize>() -> Result<[u8; N], KeystoreError> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).map_err(KeystoreError::Random)?;
     Ok(bytes)
+}
+
+fn expired(code: &ActiveCode, now: u64) -> bool {
+    code.expires_at.is_some_and(|at| at <= now)
 }
 
 fn unix_now() -> u64 {
@@ -834,6 +889,31 @@ mod tests {
         )));
         drop(restored);
         assert!(Keystore::unlock(&laptop, "Brendon", PASSWORD).is_ok());
+    }
+
+    #[test]
+    fn friend_codes_are_kept_and_revoked() {
+        let path = temp_path("codes");
+        let mut store = create(&path);
+        let (code, held) = store.create_code(Some(3600), Some(5)).unwrap();
+        assert_eq!(held.open(&code, unix_now()).unwrap().root(), store.id());
+        let (other, _) = store.create_code(None, None).unwrap();
+        assert!(matches!(
+            store.create_code(Some(1), None),
+            Err(KeystoreError::Code(CodeError::NotAChoice))
+        ));
+        drop(store);
+        let mut store = Keystore::unlock(&path, "Brendon", PASSWORD).unwrap();
+        let listed: Vec<_> = store.codes().iter().map(|c| c.code).collect();
+        assert_eq!(listed, [code, other]);
+        assert_eq!(store.codes()[0].max_uses, Some(5));
+        assert_eq!(store.codes()[1].expires_at, None);
+        let revoke = store.revoke_code(&code).unwrap();
+        assert!(held.is_revoked_by(&revoke));
+        drop(store);
+        let store = Keystore::unlock(&path, "Brendon", PASSWORD).unwrap();
+        assert_eq!(store.codes().len(), 1);
+        assert_eq!(store.codes()[0].code, other);
     }
 
     /// Unlock time with the real settings: `cargo test --release -- --ignored unlock_time`.

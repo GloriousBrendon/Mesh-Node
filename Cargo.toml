@@ -39,3 +39,10 @@ thiserror = "2"
 proptest = "1"
 
 mesh-identity = { path = "crates/mesh-identity" }
+
+# Friend codes use fixed, deliberately slow Argon2 settings; optimise it in
+# debug builds too, so tests don't take minutes.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

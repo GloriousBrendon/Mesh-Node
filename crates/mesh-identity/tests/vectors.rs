@@ -3,7 +3,9 @@
 //! Where possible each vector comes from an independent source, not this crate.
 
 use ed25519_dalek::VerifyingKey;
-use mesh_identity::{DeviceCert, DeviceList, Link, MeshId, RootKey, SafetyNumber};
+use mesh_identity::{
+    CodeRevoke, DeviceCert, DeviceList, FriendCode, HeldCode, Link, MeshId, RootKey, SafetyNumber,
+};
 
 /// RFC 8032 §7.1 test 1 secret key; its public key is published there.
 const RFC8032_SECRET: [u8; 32] =
@@ -59,6 +61,30 @@ fn safety_number_of_a_known_pair() {
     let b = MeshId::from_bytes(&RFC8032_TEST2_PUBLIC).unwrap();
     assert_eq!(SafetyNumber::new(&a, &b).to_string(), SAFETY_1_2);
     assert_eq!(SafetyNumber::new(&b, &a).to_string(), SAFETY_1_2);
+}
+
+/// A 7-day, single-use record for code `K7QM-3XPA` owned by the RFC 8032 test
+/// 1 key, sealed with nonce 00..17, and its revoke; computed with the Python
+/// `argon2-cffi`, `pynacl` and `blake3` packages, not this crate.
+const CODE: &str = "K7QM-3XPA";
+const CODE_LOOKUP_ID: &str = "093be1285368acf2d4ec090a6f94e2ad";
+const HELD_HEX: &str = "093be1285368acf2d4ec090a6f94e2ad000000006ae28c8000000001ac767dc78fb2c6888af3b7cef592be01247b93c4bdd5f0082ed25bd74ed79401000102030405060708090a0b0c0d0e0f101112131415161754bc4927aad8d6a3e67a2fe9a5610c37910c48abd2da2e213cba6cacc304e3f2ed8d413b3431087f495cf69cb3beeace1f5f65d6addad097433bab4e2aeecacb792089ae444bca9917c13a04d3118852723a6ff5ea752127e9c9a041eb11c073ecc477bd6fef9538135cc7052f55d3da097065e3cecd6aeb8d041e0f6f3f6f5d06ea5bc122eccc50c27253d4abb0a7a7f843a6d45a";
+const REVOKE_HEX: &str = "093be1285368acf2d4ec090a6f94e2ad9ec6255a34676c1f935aa6fb2c6fe8e4486443bffd43fe0801e3c2424f0fbb95";
+
+#[test]
+fn friend_code_derivation_and_record_layout() {
+    let root = RootKey::from_secret_bytes(RFC8032_SECRET);
+    let code = FriendCode::parse(CODE).unwrap();
+    let held = HeldCode::from_bytes(&unhex(HELD_HEX)).unwrap();
+    assert_eq!(hex(&held.lookup_id()), CODE_LOOKUP_ID);
+    let record = held.open(&code, CREATED_AT).unwrap();
+    assert_eq!(record.root(), root.id());
+    assert_eq!(record.created_at(), CREATED_AT);
+    assert_eq!(record.expires_at(), Some(CREATED_AT + 7 * 86_400));
+    assert_eq!(record.max_uses(), Some(1));
+    let revoke = CodeRevoke::new(&root, &code);
+    assert_eq!(hex(&revoke.to_bytes()), REVOKE_HEX);
+    assert!(held.is_revoked_by(&revoke));
 }
 
 fn hex(bytes: &[u8]) -> String {

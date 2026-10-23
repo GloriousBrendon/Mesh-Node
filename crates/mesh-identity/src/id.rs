@@ -9,6 +9,8 @@ use bech32::primitives::decode::CheckedHrpstring;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
+use crate::code::{CodeError, FriendCode};
+
 const HRP: bech32::Hrp = bech32::Hrp::parse_unchecked("mesh");
 /// `mesh1` + 52 data characters (32 bytes) + a 6-character checksum.
 const ID_TEXT_LEN: usize = 63;
@@ -29,6 +31,8 @@ pub enum IdError {
     NotAKey,
     #[error("that isn't a Mesh link")]
     NotALink,
+    #[error("{0}")]
+    Code(#[from] CodeError),
 }
 
 /// A person's root key: their identity. It signs only identity records
@@ -173,10 +177,12 @@ impl fmt::Debug for MeshId {
     }
 }
 
-/// Something shared by hand: an ID, as a `mesh://` link or bare `mesh1…` text.
+/// Something shared by hand: an ID (a `mesh://id/` link or bare `mesh1…`
+/// text) or a friend code (a `mesh://code/` link).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Link {
     Id(MeshId),
+    Code(FriendCode),
 }
 
 impl Link {
@@ -190,6 +196,9 @@ impl Link {
                     Some((kind, id)) if kind.eq_ignore_ascii_case("id") => {
                         MeshId::parse(id).map(Link::Id)
                     }
+                    Some((kind, code)) if kind.eq_ignore_ascii_case("code") => {
+                        Ok(Link::Code(FriendCode::parse(code)?))
+                    }
                     _ => Err(IdError::NotALink),
                 }
             }
@@ -202,6 +211,7 @@ impl fmt::Display for Link {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Link::Id(id) => f.write_str(&id.link()),
+            Link::Code(code) => f.write_str(&code.link()),
         }
     }
 }
@@ -232,6 +242,9 @@ mod tests {
             Ok(Link::Id(id))
         );
         assert_eq!(Link::Id(id).to_string(), id.link());
+        let code = FriendCode::parse("K7QM-3XPA").unwrap();
+        assert_eq!(Link::parse("mesh://code/k7qm-3xpa"), Ok(Link::Code(code)));
+        assert_eq!(Link::Code(code).to_string(), "mesh://code/K7QM-3XPA");
     }
 
     #[test]
@@ -257,6 +270,10 @@ mod tests {
         assert_eq!(MeshId::parse(""), Err(IdError::NotMesh));
         assert_eq!(Link::parse("mesh://space/abc"), Err(IdError::NotALink));
         assert_eq!(Link::parse("mesh://id"), Err(IdError::NotALink));
+        assert_eq!(
+            Link::parse("mesh://code/K7QM-3XPU"),
+            Err(IdError::Code(CodeError::BadCharacter('U')))
+        );
     }
 
     #[test]

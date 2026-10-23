@@ -3,6 +3,7 @@
 //! safety numbers and device linking. See `design/mesh/SPEC-identity.md` in
 //! Mesh-Voice. No networking here.
 
+mod code;
 mod device;
 mod id;
 mod keystore;
@@ -10,6 +11,10 @@ mod password;
 mod remember;
 mod safety;
 
+pub use code::{
+    ActiveCode, CodeError, CodeRecord, CodeRevoke, DEFAULT_EXPIRY, DEFAULT_USES, EXPIRY_CHOICES,
+    FriendCode, HeldCode, USE_CHOICES,
+};
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
 pub use id::{DeviceKey, IdError, Link, MeshId, RootKey};
 pub use keystore::{KdfParams, Keystore, KeystoreError};
