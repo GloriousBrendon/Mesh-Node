@@ -35,6 +35,8 @@ getrandom = "0.4"
 # Encoding the encrypted keystore payload only (never signed bytes).
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+# The helper's JSON-lines protocol on stdio (mesh-node only), as mesh-wa and mesh-dc use.
+serde_json = "1"
 # Typed errors the UI can show.
 thiserror = "2"
 # Property tests (dev only).
