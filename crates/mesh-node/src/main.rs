@@ -27,7 +27,19 @@ fn main() {
         eprintln!("mesh-node: can't create {}: {e}", dir.display());
         std::process::exit(1);
     }
-    helper::run(&dir);
+    // Identity commands run on this thread (Argon2 takes a second); the
+    // runtime's workers keep the node's connections going meanwhile.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("mesh-node: can't start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(helper::run(&dir));
 }
 
 /// `%APPDATA%\mesh\node` on Windows, `$XDG_DATA_HOME/mesh/node` (or

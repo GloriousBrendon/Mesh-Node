@@ -2386,6 +2386,7 @@ dependencies = [
  "mesh-identity",
  "serde",
  "serde_json",
+ "tokio",
  "zeroize",
 ]
 

@@ -1,4 +1,6 @@
-//! Helper mode: identity commands over JSON lines on stdio.
+//! Helper mode: identity commands over JSON lines on stdio. stdin is read on
+//! its own thread and fed into the async loop (SPEC-transport D8), so the
+//! node's connections keep running while a command is handled.
 //!
 //! Commands are never logged or echoed: passwords travel in them. Each
 //! command answers with one event; a failure is a `meshError` with a stable
@@ -90,12 +92,23 @@ fn emit(binding: &str, payload: Value) {
     let _ = out.flush();
 }
 
+/// Commands read but not yet handled; the reader waits past this.
+const QUEUED_COMMANDS: usize = 16;
+
 /// Reads commands until stdin closes (Mesh quit or restarted us).
-pub fn run(dir: &Path) {
+pub async fn run(dir: &Path) {
     let mut helper = Helper::new(dir.join(KEYSTORE_FILE));
     helper.emit_identity();
-    for line in std::io::stdin().lock().lines() {
-        let Ok(mut line) = line else { break };
+    let (tx, mut lines) = tokio::sync::mpsc::channel::<String>(QUEUED_COMMANDS);
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.blocking_send(line).is_err() {
+                break;
+            }
+        }
+    });
+    while let Some(mut line) = lines.recv().await {
         match serde_json::from_str::<Cmd>(line.trim()) {
             Ok(mut cmd) => {
                 if let Err(Fail(kind, message)) = helper.handle(&cmd.func, &cmd.args) {
