@@ -1,0 +1,21 @@
+# iroh-relay 1.4.1 for Mesh (SPEC-seed D3, D4). Plain http inside the Docker
+# network; Caddy terminates TLS on the relay.* name and proxies here.
+enable_relay = true
+http_bind_addr = "[::]:3340"
+# Needs its own UDP port, which would need a port forward (D0). Clients get
+# the same help from n0's relays.
+enable_quic_addr_discovery = false
+# Nothing leaves the machine either way; off keeps nothing listening.
+enable_metrics = false
+
+# Open to every iroh endpoint (D4: the default, so no [access] table), with a
+# cap on what each one costs.
+
+[limits]
+accept_conn_limit = 20.0
+accept_conn_burst = 100
+
+[limits.client.rx]
+# 2 MB/s steady per client (16 Mbit/s), bursts to 4 MB.
+bytes_per_second = 2_000_000
+max_burst_bytes = 4_000_000

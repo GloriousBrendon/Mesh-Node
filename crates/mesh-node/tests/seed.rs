@@ -76,7 +76,15 @@ impl Seed {
         );
         assert!(self.child.wait().unwrap().success(), "exits cleanly");
         self.log.extend(self.lines.try_iter());
-        self.log
+        std::mem::take(&mut self.log)
+    }
+}
+
+/// A failing test mustn't leave a seed running: it doesn't exit with us.
+impl Drop for Seed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

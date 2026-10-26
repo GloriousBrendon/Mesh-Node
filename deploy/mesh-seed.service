@@ -1,0 +1,29 @@
+# mesh-node in seed mode without Docker (a VPS later). Put the relay URL in
+# /etc/mesh-seed.env as MESH_RELAY_URL=https://relay.example.org
+[Unit]
+Description=Mesh seed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/mesh-seed.env
+ExecStart=/usr/local/bin/mesh-node seed --data /var/lib/mesh-seed --relay ${MESH_RELAY_URL}
+Restart=on-failure
+DynamicUser=yes
+StateDirectory=mesh-seed
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

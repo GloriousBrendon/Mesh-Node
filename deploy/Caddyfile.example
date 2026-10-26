@@ -1,0 +1,5 @@
+# Add to the homelab's Caddyfile. Caddy handles the websocket upgrade the
+# relay uses by itself.
+relay.example.org {
+	reverse_proxy relay:3340
+}

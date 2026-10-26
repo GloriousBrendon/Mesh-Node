@@ -1,0 +1,45 @@
+# Mesh's seed and relay (SPEC-seed). No ports are published: Caddy reaches
+# the relay over the proxy network, and the seed is reached through the
+# relay like any Mesh device (D0).
+#
+#   cp .env.example .env   # then set MESH_RELAY_URL and PROXY_NETWORK
+#   docker compose up -d --build
+#   docker compose logs seed | grep ticket   # the seed's ticket
+name: mesh
+
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "65532:65532"
+
+services:
+  relay:
+    <<: *hardened
+    build:
+      context: ..
+      dockerfile: deploy/relay.Dockerfile
+    image: mesh-relay:1.4.1
+    networks: [proxy]
+
+  seed:
+    <<: *hardened
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: mesh-seed
+    command: ["--relay", "${MESH_RELAY_URL:?set MESH_RELAY_URL in .env}"]
+    volumes:
+      - seed-data:/data
+    networks: [default]
+    stop_grace_period: 10s
+
+volumes:
+  seed-data:
+
+networks:
+  # The network Caddy is on, so it can proxy relay.<domain> to relay:3340.
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-proxy}
