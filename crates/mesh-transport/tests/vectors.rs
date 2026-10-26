@@ -7,13 +7,14 @@ use mesh_transport::MeshAddr;
 fn ticket() {
     let addr = MeshAddr {
         device: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-        relay: "https://euc1-1.relay.n0.iroh.link./".parse().unwrap(),
+        relay: Some("https://euc1-1.relay.n0.iroh.link./".parse().unwrap()),
+        direct: Vec::new(),
     };
     // The key is OpenSSL's Ed25519 public key for 32 bytes of 0x03.
     assert_eq!(
-        addr.ticket(),
+        addr.ticket().unwrap(),
         "mesh://node/ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\
          ?relay=https://euc1-1.relay.n0.iroh.link./"
     );
-    assert_eq!(MeshAddr::from_ticket(&addr.ticket()), Ok(addr));
+    assert_eq!(MeshAddr::from_ticket(&addr.ticket().unwrap()), Ok(addr));
 }

@@ -20,9 +20,11 @@ pub enum TicketError {
 }
 
 impl MeshAddr {
-    /// This address as a ticket to paste.
-    pub fn ticket(&self) -> String {
-        format!("{PREFIX}{}?relay={}", self.device, self.relay)
+    /// This address as a ticket to paste: the key and relay only, never the
+    /// direct addresses. Needs a relay (`NoRelay` until the node has one).
+    pub fn ticket(&self) -> Result<String, TicketError> {
+        let relay = self.relay.as_ref().ok_or(TicketError::NoRelay)?;
+        Ok(format!("{PREFIX}{}?relay={relay}", self.device))
     }
 
     /// Reads a pasted ticket; each failure says what's wrong with it.
@@ -38,7 +40,11 @@ impl MeshAddr {
         if !matches!(relay.scheme(), "https" | "http") {
             return Err(TicketError::BadRelay);
         }
-        Ok(Self { device, relay })
+        Ok(Self {
+            device,
+            relay: Some(relay),
+            direct: Vec::new(),
+        })
     }
 }
 
@@ -49,14 +55,29 @@ mod tests {
     fn addr() -> MeshAddr {
         MeshAddr {
             device: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-            relay: "https://euc1-1.relay.n0.iroh.link./".parse().unwrap(),
+            relay: Some("https://euc1-1.relay.n0.iroh.link./".parse().unwrap()),
+            direct: Vec::new(),
         }
     }
 
     #[test]
     fn round_trips() {
-        let ticket = addr().ticket();
+        let ticket = addr().ticket().unwrap();
         assert!(ticket.starts_with(PREFIX));
+        // Direct addresses never go into a ticket.
+        let with_ip = MeshAddr {
+            direct: vec!["192.168.1.2:4000".parse().unwrap()],
+            ..addr()
+        };
+        assert_eq!(with_ip.ticket(), Ok(ticket.clone()));
+        assert_eq!(
+            MeshAddr {
+                relay: None,
+                ..addr()
+            }
+            .ticket(),
+            Err(TicketError::NoRelay)
+        );
         assert_eq!(MeshAddr::from_ticket(&ticket), Ok(addr()));
         assert_eq!(
             MeshAddr::from_ticket(&format!("  {ticket}\n")),
@@ -67,7 +88,7 @@ mod tests {
 
     #[test]
     fn each_mistake_has_its_own_error() {
-        let ticket = addr().ticket();
+        let ticket = addr().ticket().unwrap();
         let key = addr().device.to_string();
         let cases = [
             (
