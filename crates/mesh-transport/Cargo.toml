@@ -1,0 +1,13 @@
+[package]
+name = "mesh-transport"
+description = "Mesh's transport: authenticated QUIC between devices, dialled by device key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+mesh-identity.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
