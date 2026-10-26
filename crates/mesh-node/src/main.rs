@@ -3,9 +3,12 @@
 //! lines, events go out on stdout as `{"binding":..,"payload":"<json>"}`
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
 //! `--relay <url>` (repeatable) replaces n0's public relays.
+//!
+//! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed).
 
 mod codes;
 mod helper;
+mod seed;
 
 use mesh_transport::{RelayUrl, Relays};
 use std::path::PathBuf;
@@ -16,12 +19,14 @@ fn main() {
         println!("mesh-node {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    let seed = args.get(1).is_some_and(|a| a == "seed");
+    // A seed always says where its key lives.
     let dir = args
         .iter()
         .position(|a| a == "--data")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
-        .or_else(default_data_dir);
+        .or_else(|| default_data_dir().filter(|_| !seed));
     let Some(dir) = dir else {
         eprintln!("mesh-node: no data directory; pass --data <dir>");
         std::process::exit(2);
@@ -59,7 +64,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    runtime.block_on(helper::run(&dir, relays));
+    if seed {
+        if let Err(e) = runtime.block_on(seed::run(&dir, relays)) {
+            eprintln!("mesh-node seed: {e}");
+            std::process::exit(1);
+        }
+    } else {
+        runtime.block_on(helper::run(&dir, relays));
+    }
 }
 
 /// A relay from `--relay`: https, or plain http only on this machine (a

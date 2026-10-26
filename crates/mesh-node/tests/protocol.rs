@@ -9,37 +9,15 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
+mod common;
+use common::Relay;
+
 const USER: &str = "Brendon";
 const PASSWORD: &str = "correct horse battery staple";
 const NEW_PASSWORD: &str = "violet lantern drifts upriver";
 const BACKUP_PASSWORD: &str = "seventeen quiet harbour owls";
 /// Starts like an ID but is far too short.
 const SHORT_ID: &str = "mesh1";
-
-/// A plain-http relay on loopback, which `--relay` allows: no internet
-/// needed, and nothing in the helper has to trust a self-signed relay.
-struct Relay {
-    url: String,
-    // Runs the server; dropping it stops the relay.
-    runtime: tokio::runtime::Runtime,
-}
-
-impl Relay {
-    fn start() -> Self {
-        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let url = runtime.block_on(async {
-            let mut config = ServerConfig::default();
-            config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
-            let server = Server::spawn(config).await.unwrap();
-            let url = format!("http://{}", server.http_addr().unwrap());
-            // The server stops when dropped; the runtime outlives the test.
-            std::mem::forget(server);
-            url
-        });
-        Self { url, runtime }
-    }
-}
 
 struct Node {
     child: Child,

@@ -4,8 +4,10 @@
 
 use crate::frame;
 use crate::handshake::{self, ALPN, HandshakeError};
-use crate::{Config, Limits, MeshAddr, Path, Peer, Pong, Relays, Status, TransportError};
-use iroh::endpoint::{Connection, QuicTransportConfig, presets};
+use crate::{
+    Config, Limits, MeshAddr, Path, Peer, Pong, Relays, ServiceStream, Status, TransportError,
+};
+use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, presets};
 use iroh::{Endpoint, RelayMap, RelayMode};
 use mesh_identity::{DeviceCert, DeviceKey};
 use std::collections::HashMap;
@@ -25,12 +27,18 @@ const LOCKED: u32 = 5;
 /// Newly accepted peers waiting to be read with `next_peer`; past this,
 /// the notice is dropped (the connection itself stays).
 const ACCEPTED_QUEUE: usize = 64;
+/// Service streams waiting for `next_stream`; past this, new ones are reset.
+const STREAM_QUEUE: usize = 64;
+/// Stream reset codes: an unknown service, and a busy one.
+const UNKNOWN_SERVICE: u32 = 1;
+const BUSY: u32 = 2;
 
 /// This device on the Mesh network, while the identity is unlocked (D7).
 pub struct Node {
     endpoint: Endpoint,
     shared: Arc<Shared>,
     accepted: tokio::sync::Mutex<mpsc::Receiver<Peer>>,
+    streams: tokio::sync::Mutex<mpsc::Receiver<ServiceStream>>,
 }
 
 /// What the node's tasks share.
@@ -43,6 +51,8 @@ struct Shared {
     pending: AtomicUsize,
     limits: Limits,
     accepted: mpsc::Sender<Peer>,
+    services: Vec<String>,
+    streams: mpsc::Sender<ServiceStream>,
 }
 
 impl Node {
@@ -77,18 +87,22 @@ impl Node {
             .await
             .map_err(|e| TransportError::Bind(e.to_string()))?;
         let (tx, rx) = mpsc::channel(ACCEPTED_QUEUE);
+        let (streams_tx, streams_rx) = mpsc::channel(STREAM_QUEUE);
         let shared = Arc::new(Shared {
             cert: cert.to_bytes(),
             conns: Mutex::new(HashMap::new()),
             pending: AtomicUsize::new(0),
             limits: config.limits,
             accepted: tx,
+            services: config.services,
+            streams: streams_tx,
         });
         tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Self {
             endpoint,
             shared,
             accepted: tokio::sync::Mutex::new(rx),
+            streams: tokio::sync::Mutex::new(streams_rx),
         })
     }
 
@@ -173,6 +187,29 @@ impl Node {
         })
     }
 
+    /// Opens a stream to a device for `service`, connecting first if needed;
+    /// the tag is already written.
+    pub async fn open(
+        &self,
+        addr: &MeshAddr,
+        service: &str,
+    ) -> Result<(Peer, SendStream, RecvStream), TransportError> {
+        let (peer, conn) = self.connection(addr).await?;
+        let (mut send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| TransportError::Unreachable(e.to_string()))?;
+        frame::write_tag(&mut send, service)
+            .await
+            .map_err(dropped)?;
+        Ok((peer, send, recv))
+    }
+
+    /// The next stream another device opened for one of `Config::services`.
+    pub async fn next_stream(&self) -> Option<ServiceStream> {
+        self.streams.lock().await.recv().await
+    }
+
     /// The next peer that connected to us and passed the handshake; `None`
     /// once the node is closed.
     pub async fn next_peer(&self) -> Option<Peer> {
@@ -238,7 +275,7 @@ impl Shared {
     /// Keeps an authenticated connection and starts answering its streams.
     fn add(self: &Arc<Self>, peer: Peer, conn: Connection) {
         lock(&self.conns).insert(peer.device, (peer.clone(), conn.clone()));
-        tokio::spawn(serve(self.clone(), peer.device, conn));
+        tokio::spawn(serve(self.clone(), peer, conn));
     }
 
     fn full(&self) -> bool {
@@ -289,10 +326,26 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
 }
 
 /// Answers a connection's streams until it closes, then forgets it.
-async fn serve(shared: Arc<Shared>, device: iroh::PublicKey, conn: Connection) {
+async fn serve(shared: Arc<Shared>, peer: Peer, conn: Connection) {
+    let device = peer.device;
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let (shared, peer, direct_ip) = (shared.clone(), peer.clone(), direct_ip(&conn));
         tokio::spawn(async move {
             match frame::read_tag(&mut recv).await.as_deref() {
+                Ok(tag) if shared.services.iter().any(|s| s == tag) => {
+                    let stream = ServiceStream {
+                        peer,
+                        service: tag.to_owned(),
+                        send,
+                        recv,
+                        direct_ip,
+                    };
+                    if let Err(mpsc::error::TrySendError::Full(mut stream)) =
+                        shared.streams.try_send(stream)
+                    {
+                        let _ = stream.send.reset(BUSY.into());
+                    }
+                }
                 Ok("ping") => {
                     if let Ok(Some(nonce)) = frame::read_frame(&mut recv).await
                         && nonce.len() == 8
@@ -303,7 +356,7 @@ async fn serve(shared: Arc<Shared>, device: iroh::PublicKey, conn: Connection) {
                 }
                 // Unknown services end the stream, not the connection.
                 _ => {
-                    let _ = send.reset(1u32.into());
+                    let _ = send.reset(UNKNOWN_SERVICE.into());
                 }
             }
         });
@@ -325,6 +378,17 @@ fn path(conn: &Connection) -> Path {
         .find(|p| p.is_selected())
         .is_none_or(|p| p.is_relay());
     if relayed { Path::Relay } else { Path::Direct }
+}
+
+/// The other side's IP if the connection's current path is direct.
+fn direct_ip(conn: &Connection) -> Option<std::net::IpAddr> {
+    conn.paths()
+        .iter()
+        .find(|p| p.is_selected())
+        .and_then(|p| match p.remote_addr() {
+            iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+            _ => None,
+        })
 }
 
 fn dropped(e: frame::FrameError) -> TransportError {

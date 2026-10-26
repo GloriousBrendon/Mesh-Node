@@ -36,6 +36,7 @@ impl Device {
         let config = Config {
             relays: Relays::Disabled,
             limits,
+            services: vec!["echo".into()],
             ..Config::default()
         };
         Node::start(&self.key, &self.cert(name), config)
@@ -302,4 +303,38 @@ async fn locking_closes_the_node() {
         matches!(a.ping(&addr).await, Err(TransportError::Unreachable(_))),
         "unreachable after lock"
     );
+}
+
+#[tokio::test]
+async fn service_streams_reach_the_node() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let (a, b) = (alice.node("laptop").await, bob.node("desktop").await);
+    let addr = addr_of(&b);
+    tokio::spawn(async move {
+        let mut stream = b.next_stream().await.expect("a stream");
+        assert_eq!(
+            (stream.service.as_str(), stream.peer.id),
+            ("echo", alice.id())
+        );
+        assert!(stream.direct_ip.is_some_and(|ip| ip.is_loopback()));
+        let got = frame::read_frame(&mut stream.recv).await.unwrap().unwrap();
+        frame::write_frame(&mut stream.send, &got).await.unwrap();
+        stream.send.finish().unwrap();
+        // Keep the node alive until Alice has read the answer.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let (peer, mut send, mut recv) = a.open(&addr, "echo").await.expect("open");
+    assert_eq!(peer.name, "desktop");
+    frame::write_frame(&mut send, b"hi").await.unwrap();
+    send.finish().unwrap();
+    assert_eq!(
+        frame::read_frame(&mut recv).await.unwrap().as_deref(),
+        Some(&b"hi"[..])
+    );
+
+    // A service the node doesn't offer is reset; the connection stays.
+    let (_, mut send, mut recv) = a.open(&addr, "nope").await.expect("open");
+    let _ = frame::write_frame(&mut send, b"x").await;
+    assert!(frame::read_frame(&mut recv).await.is_err());
+    a.ping(&addr).await.expect("still connected");
 }

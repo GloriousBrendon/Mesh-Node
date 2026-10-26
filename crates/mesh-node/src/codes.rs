@@ -5,9 +5,6 @@
 //!
 //! Pure: callers pass the time and who's asking, and save when `dirty`.
 
-// ponytail: seed mode (seed Task 2) is its user; drop this then.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use mesh_identity::{CodeRevoke, HeldCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,14 +47,36 @@ pub fn network(ip: IpAddr) -> [u8; 6] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
     /// Stored, or already held for the same owner (unchanged).
-    Ok,
+    Ok = 0,
     /// The owner's code was used up or revoked.
-    Gone,
+    Gone = 1,
     /// Another owner's code has this lookup ID.
-    Taken,
-    SlowDown,
-    Full,
-    Bad,
+    Taken = 2,
+    SlowDown = 3,
+    Full = 4,
+    Bad = 5,
+}
+
+impl Hold {
+    /// The answer byte on the wire.
+    pub fn byte(self) -> u8 {
+        self as u8
+    }
+
+    // ponytail: the helper reads answers with this from seed Task 3; drop the allow then.
+    #[allow(dead_code)]
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        [
+            Hold::Ok,
+            Hold::Gone,
+            Hold::Taken,
+            Hold::SlowDown,
+            Hold::Full,
+            Hold::Bad,
+        ]
+        .into_iter()
+        .find(|h| h.byte() == byte)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +85,28 @@ pub enum Get {
     /// Never held, expired, used up or revoked: all look the same.
     None,
     SlowDown,
+}
+
+impl Get {
+    /// On the wire: `0` and the record, `1`, or `3` (as `Hold::SlowDown`).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Get::Found(record) => [&[0][..], record].concat(),
+            Get::None => vec![1],
+            Get::SlowDown => vec![Hold::SlowDown.byte()],
+        }
+    }
+
+    // ponytail: the helper reads answers with this from seed Task 3; drop the allow then.
+    #[allow(dead_code)]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes.split_first()? {
+            (0, record) => Some(Get::Found(record.to_vec())),
+            (1, []) => Some(Get::None),
+            (3, []) => Some(Get::SlowDown),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +596,26 @@ mod tests {
             Hold::Ok,
             "an hour later"
         );
+    }
+
+    #[test]
+    fn answers_on_the_wire() {
+        for h in [
+            Hold::Ok,
+            Hold::Gone,
+            Hold::Taken,
+            Hold::SlowDown,
+            Hold::Full,
+            Hold::Bad,
+        ] {
+            assert_eq!(Hold::from_byte(h.byte()), Some(h));
+        }
+        assert_eq!(Hold::from_byte(9), None);
+        for g in [Get::Found(vec![7; 3]), Get::None, Get::SlowDown] {
+            assert_eq!(Get::from_bytes(&g.to_bytes()), Some(g));
+        }
+        assert_eq!(Get::from_bytes(&[]), None);
+        assert_eq!(Get::from_bytes(&[1, 2]), None);
     }
 
     #[test]

@@ -62,6 +62,9 @@ pub enum Relays {
 pub struct Config {
     pub relays: Relays,
     pub limits: Limits,
+    /// Service tags this node answers besides `ping`; their streams come out
+    /// of `Node::next_stream`.
+    pub services: Vec<String>,
     #[cfg(feature = "test-utils")]
     pub test: TestOptions,
 }
@@ -128,6 +131,19 @@ pub struct Status {
 pub enum Path {
     Direct,
     Relay,
+}
+
+/// A stream another device opened for one of `Config::services`, its tag
+/// already read.
+#[derive(Debug)]
+pub struct ServiceStream {
+    pub peer: Peer,
+    pub service: String,
+    pub send: iroh::endpoint::SendStream,
+    pub recv: iroh::endpoint::RecvStream,
+    /// The other side's IP while the connection is direct, for rate limits;
+    /// `None` through a relay. Never log it.
+    pub direct_ip: Option<std::net::IpAddr>,
 }
 
 /// A ping's answer.
