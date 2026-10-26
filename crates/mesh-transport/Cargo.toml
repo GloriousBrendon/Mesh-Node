@@ -12,5 +12,11 @@ iroh.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 
+[features]
+# In-process test relays and relay-only endpoints, for this crate's tests only.
+test-utils = ["iroh/test-utils"]
+
 [dev-dependencies]
-iroh.workspace = true
+iroh = { workspace = true, features = ["test-utils"] }
+# The crate's own tests turn its test-utils feature on.
+mesh-transport = { path = ".", features = ["test-utils"] }

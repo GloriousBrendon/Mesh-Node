@@ -36,6 +36,7 @@ impl Device {
         let config = Config {
             relays: Relays::Disabled,
             limits,
+            ..Config::default()
         };
         Node::start(&self.key, &self.cert(name), config)
             .await

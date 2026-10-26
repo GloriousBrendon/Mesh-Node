@@ -65,11 +65,14 @@ impl Node {
             .max_concurrent_bidi_streams(config.limits.streams.into())
             .max_concurrent_uni_streams(0u32.into())
             .build();
-        let endpoint = Endpoint::builder(presets::Minimal)
+        let builder = Endpoint::builder(presets::Minimal)
             .secret_key(crate::secret_key(device))
             .relay_mode(relay_mode)
             .transport_config(quic)
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec()]);
+        #[cfg(feature = "test-utils")]
+        let builder = config.test.apply(builder);
+        let endpoint = builder
             .bind()
             .await
             .map_err(|e| TransportError::Bind(e.to_string()))?;

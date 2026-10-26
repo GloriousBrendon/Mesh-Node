@@ -61,6 +61,32 @@ pub enum Relays {
 pub struct Config {
     pub relays: Relays,
     pub limits: Limits,
+    #[cfg(feature = "test-utils")]
+    pub test: TestOptions,
+}
+
+/// Settings only tests can reach: the `test-utils` feature is never on in
+/// `mesh-node`.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TestOptions {
+    /// Accept a relay's self-signed certificate (iroh's in-process test relay).
+    pub trust_any_relay: bool,
+    /// No direct paths at all, so traffic has to go through the relay.
+    pub relay_only: bool,
+}
+
+#[cfg(feature = "test-utils")]
+impl TestOptions {
+    fn apply(self, mut builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+        if self.trust_any_relay {
+            builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
+        }
+        if self.relay_only {
+            builder = builder.clear_ip_transports();
+        }
+        builder
+    }
 }
 
 /// Caps on what others can make this node hold (SPEC-transport D9). Who is
