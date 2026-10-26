@@ -3,14 +3,10 @@
 //! event, and that no password ever reaches stderr; then two helpers ping
 //! each other through a relay on loopback.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-
 use serde_json::{Value, json};
 
 mod common;
-use common::Relay;
+use common::{Helper as Node, Relay, temp_dir};
 
 const USER: &str = "Brendon";
 const PASSWORD: &str = "correct horse battery staple";
@@ -18,112 +14,6 @@ const NEW_PASSWORD: &str = "violet lantern drifts upriver";
 const BACKUP_PASSWORD: &str = "seventeen quiet harbour owls";
 /// Starts like an ID but is far too short.
 const SHORT_ID: &str = "mesh1";
-
-struct Node {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    /// The latest `meshNet`: it comes whenever the node's state changes, so
-    /// `event` sets it aside.
-    net: Option<Value>,
-}
-
-impl Node {
-    fn start(dir: &Path, relay: &Relay) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-node"))
-            .arg("--data")
-            .arg(dir)
-            .args(["--relay", &relay.url])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self {
-            child,
-            stdin,
-            stdout,
-            net: None,
-        }
-    }
-
-    /// The next line's binding and decoded payload.
-    fn line(&mut self) -> (String, Value) {
-        let mut line = String::new();
-        assert!(
-            self.stdout.read_line(&mut line).unwrap() > 0,
-            "mesh-node exited"
-        );
-        let frame: Value = serde_json::from_str(&line).unwrap();
-        let payload = serde_json::from_str(frame["payload"].as_str().unwrap()).unwrap();
-        (frame["binding"].as_str().unwrap().to_owned(), payload)
-    }
-
-    /// The next event other than `meshNet`.
-    fn event(&mut self) -> (String, Value) {
-        loop {
-            match self.line() {
-                (binding, payload) if binding == "meshNet" => self.net = Some(payload),
-                event => return event,
-            }
-        }
-    }
-
-    /// Waits for a `meshNet` that satisfies `done`; it may already have come.
-    fn net(&mut self, done: impl Fn(&Value) -> bool) -> Value {
-        loop {
-            if let Some(net) = self.net.as_ref().filter(|n| done(n)) {
-                return net.clone();
-            }
-            let (binding, payload) = self.line();
-            assert_eq!(binding, "meshNet", "unexpected {payload}");
-            self.net = Some(payload);
-        }
-    }
-
-    fn net_state(&mut self, state: &str) -> Value {
-        self.net(|n| n["state"] == state)
-    }
-
-    fn send(&mut self, func: &str, args: &[&str]) {
-        writeln!(self.stdin, "{}", json!({ "fn": func, "args": args })).unwrap();
-    }
-
-    /// Sends a command and returns the first event it answers with.
-    fn call(&mut self, func: &str, args: &[&str]) -> (String, Value) {
-        self.send(func, args);
-        self.event()
-    }
-
-    /// Sends a command that must answer with `binding`.
-    fn expect(&mut self, func: &str, args: &[&str], binding: &str) -> Value {
-        let (got, payload) = self.call(func, args);
-        assert_eq!(got, binding, "{func} answered {payload}");
-        payload
-    }
-
-    /// Closes stdin (Mesh quitting); the helper must exit. Returns its stderr.
-    fn quit(mut self) -> String {
-        drop(self.stdin);
-        assert!(self.child.wait().unwrap().success());
-        let mut err = String::new();
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
-        err
-    }
-}
-
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mesh-node-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
 
 #[test]
 fn identity_over_stdio() {

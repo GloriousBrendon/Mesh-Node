@@ -133,6 +133,12 @@ impl FriendCode {
         format!("mesh://code/{self}")
     }
 
+    /// What a holder files this code's record under. Runs the Argon2id
+    /// derivation (about 100 ms), so call it off any UI or async thread.
+    pub fn lookup_id(&self) -> [u8; 16] {
+        self.keys().0
+    }
+
     /// The lookup ID and record key (Argon2id, fixed settings).
     fn keys(&self) -> ([u8; 16], Zeroizing<[u8; 32]>) {
         let params = argon2::Params::new(KDF_M_KIB, KDF_T, 1, Some(48)).expect("valid settings");

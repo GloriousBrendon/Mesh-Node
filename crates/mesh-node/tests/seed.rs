@@ -1,6 +1,7 @@
 //! A `mesh-node seed` process on a loopback relay, and a client holding,
 //! fetching and revoking friend codes over a real connection. Then the seed
-//! stops on SIGTERM, starts again and still remembers.
+//! stops on SIGTERM, starts again and still remembers. Then two helpers
+//! share a friend code through it, as two Mesh installs do.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -12,7 +13,8 @@ use mesh_identity::{DeviceCert, DeviceKey, FriendCode, HeldCode, RootKey};
 use mesh_transport::{Config, MeshAddr, Node, Relays, frame};
 
 mod common;
-use common::Relay;
+use common::{Helper, Relay, temp_dir};
+use serde_json::Value;
 
 const WEEK: u64 = 7 * 86_400;
 
@@ -205,4 +207,125 @@ fn a_seed_holds_and_answers_codes() {
     }
     drop(relay.runtime);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+const PASSWORD: &str = "correct horse battery staple";
+
+impl Helper {
+    /// Reads events until a `meshCodes` that satisfies `done`.
+    fn codes_until(&mut self, done: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+        loop {
+            let (binding, payload) = self.event();
+            assert_eq!(binding, "meshCodes", "unexpected {payload}");
+            let codes = payload["codes"].as_array().unwrap().clone();
+            if done(&codes) {
+                return codes;
+            }
+        }
+    }
+
+    /// Makes a code and waits until a seed holds it.
+    fn held_code(&mut self, uses: &str) -> String {
+        let code = self.expect("codeCreate", &["", uses], "meshCodes")["created"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        self.codes_until(|codes| codes.iter().any(|c| c["code"] == code && c["held"] == true));
+        code
+    }
+}
+
+#[test]
+fn two_helpers_share_a_code_through_the_seed() {
+    let (dir_s, dir_a, dir_b) = (temp_dir("seed"), temp_dir("code-a"), temp_dir("code-b"));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dir_s, &relay);
+    let ticket = seed.ticket();
+    let with_seed = ["--seed", ticket.as_str()];
+    let mut a = Helper::start_with(&dir_a, &relay, &with_seed);
+    let mut b = Helper::start_with(&dir_b, &relay, &with_seed);
+    assert_eq!(a.event().0, "meshIdentity");
+    assert_eq!(b.event().0, "meshIdentity");
+    let id_a = a.expect("idCreate", &["alice", PASSWORD], "meshIdentity")["id"].clone();
+    assert_eq!(a.event().0, "meshCodes");
+    b.expect("idCreate", &["bob", PASSWORD], "meshIdentity");
+    assert_eq!(b.event().0, "meshCodes");
+
+    // A single-use code: Bob resolves it to Alice's ID once.
+    let once = a.held_code("1");
+    let resolved = b.expect("codeResolve", &[&once], "meshResolved");
+    assert_eq!(
+        (&resolved["id"], resolved["code"].as_str()),
+        (&id_a, Some(&*once))
+    );
+    let again = b.expect(
+        "codeResolve",
+        &[&format!("mesh://code/{once}")],
+        "meshError",
+    );
+    assert_eq!(
+        (again["fn"].as_str(), again["kind"].as_str()),
+        (Some("codeResolve"), Some("not-found"))
+    );
+
+    // Alice unlocks again: the seed says it's used, so it leaves her list.
+    a.expect("idLock", &[], "meshIdentity");
+    a.expect("idUnlock", &["alice", PASSWORD], "meshIdentity");
+    a.codes_until(|codes| codes.iter().all(|c| c["code"] != *once));
+
+    // Revoked: Bob finds nothing (the revoke goes out in the background).
+    let kept = a.held_code("unlimited");
+    assert_eq!(
+        b.expect("codeResolve", &[&kept], "meshResolved")["id"],
+        id_a
+    );
+    a.expect("codeRevoke", &[&kept], "meshCodes");
+    let mut gone = false;
+    for _ in 0..10 {
+        let (binding, payload) = b.call("codeResolve", &[&kept]);
+        if binding == "meshError" {
+            assert_eq!(payload["kind"], "not-found");
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(gone, "the revoke reached the seed");
+
+    // Guessing: Bob's lookups are capped.
+    let mut slowed = false;
+    for _ in 0..15 {
+        let (_, payload) = b.call("codeResolve", &["0000-0000"]);
+        if payload["kind"] == "slow-down" {
+            slowed = true;
+            break;
+        }
+        assert_eq!(payload["kind"], "not-found");
+    }
+    assert!(slowed, "the seed slowed Bob down");
+
+    // A code made while the seed is down is held once it's back.
+    let log = seed.stop();
+    let late = a.expect("codeCreate", &["", ""], "meshCodes")["created"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let codes = a.codes_until(|codes| codes.iter().any(|c| c["code"] == late));
+    assert!(codes.iter().all(|c| c["held"] == false), "nobody holds it");
+    let mut seed = Seed::start(&dir_s, &relay);
+    seed.ticket();
+    a.expect("idLock", &[], "meshIdentity");
+    a.expect("idUnlock", &["alice", PASSWORD], "meshIdentity");
+    a.codes_until(|codes| codes.iter().any(|c| c["code"] == late && c["held"] == true));
+
+    let stderr = a.quit() + &b.quit();
+    assert!(!stderr.contains(PASSWORD));
+    let log = [log, seed.stop()].concat().join("\n");
+    for secret in [id_a.as_str().unwrap(), &once, &kept, &late] {
+        assert!(!log.contains(secret), "{secret} reached the seed's log");
+    }
+    drop(relay.runtime);
+    for dir in [dir_s, dir_a, dir_b] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

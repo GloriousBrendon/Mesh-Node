@@ -3,18 +3,26 @@
 //! so the node's connections keep running while a command is handled. The
 //! node runs while the identity is unlocked (D7).
 //!
+//! Friend codes go to seeds (SPEC-seed) from a second node with a throwaway
+//! identity made at each unlock (D7b), so a seed can't tell whose codes it
+//! holds or who looks them up.
+//!
 //! Commands are never logged or echoed: passwords travel in them. Each
 //! command answers with one event; a failure is a `meshError` with a stable
 //! `kind` the UI switches on, the `fn` it answers, and a message to show.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::codes::{Get, Hold};
+use crate::seed;
 use mesh_identity::{
-    CodeError, DEFAULT_EXPIRY, DEFAULT_USES, FriendCode, IdError, Keystore, KeystoreError, Link,
-    MAX_DEVICE_NAME, SafetyNumber, check_password, is_kept, keyring_status,
+    CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey, FriendCode, HeldCode, IdError,
+    Keystore, KeystoreError, Link, MAX_DEVICE_NAME, RootKey, SafetyNumber, check_password, is_kept,
+    keyring_status,
 };
 use mesh_transport::{
     Config, HandshakeError, MeshAddr, Node, Path as NetPath, Relays, Status, TransportError,
@@ -26,6 +34,11 @@ use zeroize::Zeroize;
 const KEYSTORE_FILE: &str = "identity.mks";
 /// How often the node's state is checked for a change to report.
 const NET_POLL: Duration = Duration::from_secs(1);
+/// How often codes no seed holds yet are offered again.
+const HOLD_RETRY: Duration = Duration::from_secs(600);
+/// Seeds every install knows (SPEC-seed D6); `--seed` replaces them.
+// ponytail: empty until the homelab seed runs (seed Task 7).
+pub const SEEDS: &[&str] = &[];
 
 #[derive(Deserialize)]
 struct Cmd {
@@ -104,8 +117,9 @@ fn emit(binding: &str, payload: Value) {
 const QUEUED_COMMANDS: usize = 16;
 
 /// Reads commands until stdin closes (Mesh quit or restarted us).
-pub async fn run(dir: &Path, relays: Relays) {
-    let mut helper = Helper::new(dir.join(KEYSTORE_FILE), relays);
+pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>) {
+    let (back, mut answers) = tokio::sync::mpsc::unbounded_channel();
+    let mut helper = Helper::new(dir.join(KEYSTORE_FILE), relays, seeds, back);
     helper.emit_identity();
     // Kept unlocked: the identity is already open.
     helper.start_net().await;
@@ -118,7 +132,23 @@ pub async fn run(dir: &Path, relays: Relays) {
             }
         }
     });
-    while let Some(mut line) = lines.recv().await {
+    let mut retry = tokio::time::interval(HOLD_RETRY);
+    retry.tick().await;
+    loop {
+        let mut line = tokio::select! {
+            line = lines.recv() => match line {
+                Some(line) => line,
+                None => break,
+            },
+            Some(back) = answers.recv() => {
+                helper.answered(back);
+                continue;
+            }
+            _ = retry.tick() => {
+                helper.hold_codes(true);
+                continue;
+            }
+        };
         match serde_json::from_str::<Cmd>(line.trim()) {
             Ok(mut cmd) => {
                 if let Err(Fail(kind, message)) = helper.handle(&cmd.func, &cmd.args).await {
@@ -149,24 +179,45 @@ struct Helper {
     /// Why "keep unlocked" can't be used here, if it can't.
     keyring: Result<(), String>,
     relays: Relays,
+    seeds: Arc<Vec<MeshAddr>>,
     /// The node, while the identity is unlocked and networking started.
     net: Option<Net>,
+    /// Codes a seed confirmed holding since the node started.
+    held: HashSet<FriendCode>,
+    /// Where background seed requests report back to the loop.
+    back: tokio::sync::mpsc::UnboundedSender<Back>,
 }
 
 struct Net {
     node: Arc<Node>,
+    /// The throwaway identity's node, for seeds only (D7b).
+    anon: Arc<Node>,
     /// Reports the node's state as it changes.
     watch: tokio::task::JoinHandle<()>,
 }
 
+/// What a background request found out.
+enum Back {
+    /// Each code, and the best answer any seed gave (`None`: none answered).
+    Held(Vec<(FriendCode, Option<Hold>)>),
+}
+
 impl Helper {
-    fn new(path: PathBuf, relays: Relays) -> Self {
+    fn new(
+        path: PathBuf,
+        relays: Relays,
+        seeds: Vec<MeshAddr>,
+        back: tokio::sync::mpsc::UnboundedSender<Back>,
+    ) -> Self {
         let mut helper = Self {
             store: None,
             keyring: keyring_status(),
             path,
             relays,
+            seeds: Arc::new(seeds),
             net: None,
+            held: HashSet::new(),
+            back,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -264,14 +315,46 @@ impl Helper {
                     s => Some(s.parse().map_err(|_| CodeError::NotAChoice)?),
                 };
                 // The held record waits for `seed`, which will hold it; nothing takes it yet.
-                let (code, _held) = self.unlocked()?.create_code(expiry, uses)?;
+                let (code, _) = self.unlocked()?.create_code(expiry, uses)?;
                 self.emit_codes(Some(code));
+                self.hold_codes(true);
             }
             "codeRevoke" => {
                 let code = FriendCode::parse(arg(0)?)?;
-                // The revoke goes to the code's holder once `seed` exists.
-                self.unlocked()?.revoke_code(&code)?;
+                let revoke = self.unlocked()?.revoke_code(&code)?;
+                self.held.remove(&code);
                 self.emit_codes(None);
+                if let Some(net) = &self.net {
+                    let (anon, seeds) = (net.anon.clone(), self.seeds.clone());
+                    tokio::spawn(async move {
+                        for addr in seeds.iter() {
+                            let _ = seed::ask(&anon, addr, seed::REVOKE, &revoke.to_bytes()).await;
+                        }
+                    });
+                }
+            }
+            "codeResolve" => {
+                // A typed `K7QM-3XPA`, or a pasted `mesh://code/…` link.
+                let text = arg(0)?.trim();
+                let code = if text
+                    .get(..7)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("mesh://"))
+                {
+                    let Link::Code(code) = Link::parse(text)? else {
+                        return Err(Fail(
+                            "not-a-code",
+                            "that's an ID, not a friend code".to_owned(),
+                        ));
+                    };
+                    code
+                } else {
+                    FriendCode::parse(text)?
+                };
+                let anon = self.node().and(self.anon())?;
+                if self.seeds.is_empty() {
+                    return Err(Fail("offline", "no seed to ask".to_owned()));
+                }
+                tokio::spawn(resolve(anon, self.seeds.clone(), code));
             }
             "codeList" => {
                 self.unlocked()?;
@@ -369,6 +452,66 @@ impl Helper {
             .ok_or_else(|| Fail("offline", "networking didn't start".to_owned()))
     }
 
+    fn anon(&self) -> Result<Arc<Node>, Fail> {
+        self.net
+            .as_ref()
+            .map(|n| n.anon.clone())
+            .ok_or_else(|| Fail("offline", "networking didn't start".to_owned()))
+    }
+
+    /// Offers this device's codes to the seeds in the background: all of them,
+    /// or only those no seed has confirmed yet.
+    fn hold_codes(&self, only_missing: bool) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        if self.seeds.is_empty() {
+            return;
+        }
+        let codes: Vec<(FriendCode, HeldCode)> = store
+            .codes()
+            .iter()
+            .filter(|c| !only_missing || !self.held.contains(&c.code))
+            .filter_map(|c| Some((c.code, store.held_record(c).ok()?)))
+            .collect();
+        if codes.is_empty() {
+            return;
+        }
+        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        tokio::spawn(async move {
+            let mut answers = Vec::new();
+            for (code, held) in codes {
+                answers.push((code, hold(&anon, &seeds, &held).await));
+            }
+            let _ = back.send(Back::Held(answers));
+        });
+    }
+
+    /// A background request's answer, back on the loop.
+    fn answered(&mut self, back: Back) {
+        let Back::Held(answers) = back;
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        for (code, answer) in answers {
+            match answer {
+                Some(Hold::Ok) => {
+                    self.held.insert(code);
+                }
+                // Used up or revoked: it's no use any more, so it leaves the list.
+                Some(Hold::Gone) => {
+                    self.held.remove(&code);
+                    if let Err(e) = store.revoke_code(&code) {
+                        eprintln!("mesh-node: couldn't drop a used code: {e}");
+                    }
+                }
+                Some(Hold::Taken) => eprintln!("mesh-node: a friend code collided; make another"),
+                _ => {}
+            }
+        }
+        self.emit_codes(None);
+    }
+
     /// Starts this device's node for the open identity (replacing any running).
     async fn start_net(&mut self) {
         self.stop_net().await;
@@ -387,11 +530,22 @@ impl Helper {
             relays: self.relays.clone(),
             ..Config::default()
         };
-        match Node::start(store.device_key(), cert, config).await {
-            Ok(node) => {
+        let started = match Node::start(store.device_key(), cert, config).await {
+            Ok(node) => anon_node(self.relays.clone())
+                .await
+                .map(|anon| (node, anon)),
+            Err(e) => Err(e.to_string()),
+        };
+        match started {
+            Ok((node, anon)) => {
                 let node = Arc::new(node);
                 let watch = tokio::spawn(watch_net(node.clone()));
-                self.net = Some(Net { node, watch });
+                self.net = Some(Net {
+                    node,
+                    anon: Arc::new(anon),
+                    watch,
+                });
+                self.hold_codes(false);
             }
             Err(e) => eprintln!("mesh-node: networking didn't start: {e}"),
         }
@@ -401,7 +555,9 @@ impl Helper {
     async fn stop_net(&mut self) {
         if let Some(net) = self.net.take() {
             net.watch.abort();
+            net.anon.close().await;
             net.node.close().await;
+            self.held.clear();
             emit_net(None);
         }
     }
@@ -466,6 +622,7 @@ impl Helper {
                     "createdAt": c.created_at,
                     "expiresAt": c.expires_at,
                     "maxUses": c.max_uses,
+                    "held": self.held.contains(&c.code),
                 })
             })
             .collect();
@@ -474,6 +631,93 @@ impl Helper {
             json!({ "codes": codes, "created": created.map(|c| c.to_string()) }),
         );
     }
+}
+
+/// A node with a fresh identity nobody knows, for talking to seeds (D7b).
+async fn anon_node(relays: Relays) -> Result<Node, String> {
+    let (root, key) = RootKey::generate()
+        .and_then(|r| Ok((r, DeviceKey::generate()?)))
+        .map_err(|e| format!("no randomness: {e}"))?;
+    // A generic name and no date, so it says nothing about this device.
+    let cert = DeviceCert::issue(&root, &key.public(), "mesh", 0).map_err(|e| e.to_string())?;
+    let config = Config {
+        relays,
+        ..Config::default()
+    };
+    Node::start(&key, &cert, config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Offers one record to every seed. A seed that saw it used up or revoked
+/// wins over one that holds it.
+async fn hold(anon: &Node, seeds: &[MeshAddr], held: &HeldCode) -> Option<Hold> {
+    let mut best = None;
+    for addr in seeds {
+        let answer = seed::ask(anon, addr, seed::HOLD, held.as_bytes())
+            .await
+            .ok()
+            .and_then(|a| Hold::from_byte(*a.first()?));
+        best = match (best, answer) {
+            (_, Some(Hold::Gone)) | (Some(Hold::Gone), _) => Some(Hold::Gone),
+            (_, Some(Hold::Ok)) | (Some(Hold::Ok), _) => Some(Hold::Ok),
+            (best, answer) => answer.or(best),
+        };
+    }
+    best
+}
+
+/// Asks the seeds for a code's record and opens it: `meshResolved` with the
+/// ID it points to, or a `meshError` for `codeResolve`.
+async fn resolve(anon: Arc<Node>, seeds: Arc<Vec<MeshAddr>>, code: FriendCode) {
+    let fail = |kind: &str, message: &str| {
+        emit(
+            "meshError",
+            json!({ "fn": "codeResolve", "kind": kind, "message": message }),
+        );
+    };
+    let Ok(lookup_id) = tokio::task::spawn_blocking(move || code.lookup_id()).await else {
+        return fail("offline", "couldn't work the code out");
+    };
+    let (mut not_found, mut slowed) = (false, false);
+    for addr in seeds.iter() {
+        let Ok(answer) = seed::ask(&anon, addr, seed::GET, &lookup_id).await else {
+            continue;
+        };
+        match Get::from_bytes(&answer) {
+            Some(Get::Found(record)) => {
+                // Expired, forged or for another code: as good as not there.
+                match HeldCode::from_bytes(&record).and_then(|h| h.open(&code, unix_now())) {
+                    Ok(record) => {
+                        let id = record.root();
+                        return emit(
+                            "meshResolved",
+                            json!({ "code": code.to_string(), "id": id.to_string(), "link": id.link() }),
+                        );
+                    }
+                    Err(_) => not_found = true,
+                }
+            }
+            Some(Get::None) => not_found = true,
+            Some(Get::SlowDown) => slowed = true,
+            None => {}
+        }
+    }
+    match (slowed, not_found) {
+        (true, _) => fail("slow-down", "too many tries; wait a minute"),
+        (_, true) => fail(
+            "not-found",
+            "no such code: it may have expired, been used or been revoked",
+        ),
+        _ => fail("offline", "couldn't reach a seed"),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Sends `meshNet` whenever the node's state changes.

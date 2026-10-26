@@ -580,6 +580,19 @@ impl Keystore {
         Ok((code, held))
     }
 
+    /// The record for one of this device's codes, built again (same lookup
+    /// ID and revoke tag, a fresh nonce) to hand to a holder that missed it.
+    pub fn held_record(&self, code: &ActiveCode) -> Result<HeldCode, KeystoreError> {
+        let expiry = code.expires_at.map(|at| at.saturating_sub(code.created_at));
+        Ok(HeldCode::new(
+            &self.root,
+            &code.code,
+            code.created_at,
+            expiry,
+            code.max_uses,
+        )?)
+    }
+
     /// Codes made on this device that haven't expired.
     pub fn codes(&self) -> Vec<ActiveCode> {
         let now = unix_now();
@@ -948,6 +961,23 @@ mod tests {
         assert_eq!(listed, [code, other]);
         assert_eq!(store.codes()[0].max_uses, Some(5));
         assert_eq!(store.codes()[1].expires_at, None);
+        // Built again for a holder: the same handle and owner, the same limits.
+        let again = store.held_record(&store.codes()[0]).unwrap();
+        assert_eq!(
+            (
+                again.lookup_id(),
+                again.revoke_tag(),
+                again.expires_at(),
+                again.max_uses()
+            ),
+            (
+                held.lookup_id(),
+                held.revoke_tag(),
+                held.expires_at(),
+                held.max_uses()
+            )
+        );
+        assert_eq!(again.open(&code, unix_now()).unwrap().root(), store.id());
         let revoke = store.revoke_code(&code).unwrap();
         assert!(held.is_revoked_by(&revoke));
         drop(store);

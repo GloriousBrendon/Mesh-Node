@@ -63,8 +63,6 @@ impl Hold {
         self as u8
     }
 
-    // ponytail: the helper reads answers with this from seed Task 3; drop the allow then.
-    #[allow(dead_code)]
     pub fn from_byte(byte: u8) -> Option<Self> {
         [
             Hold::Ok,
@@ -97,8 +95,6 @@ impl Get {
         }
     }
 
-    // ponytail: the helper reads answers with this from seed Task 3; drop the allow then.
-    #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         match bytes.split_first()? {
             (0, record) => Some(Get::Found(record.to_vec())),

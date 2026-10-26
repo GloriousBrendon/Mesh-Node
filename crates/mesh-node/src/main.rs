@@ -2,7 +2,8 @@
 //! Mesh-Voice's helper: commands arrive on stdin as `{"fn":..,"args":[..]}`
 //! lines, events go out on stdout as `{"binding":..,"payload":"<json>"}`
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
-//! `--relay <url>` (repeatable) replaces n0's public relays.
+//! `--relay <url>` (repeatable) replaces n0's public relays; `--seed
+//! <ticket>` (repeatable) the built-in seeds.
 //!
 //! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed).
 
@@ -10,7 +11,7 @@ mod codes;
 mod helper;
 mod seed;
 
-use mesh_transport::{RelayUrl, Relays};
+use mesh_transport::{MeshAddr, RelayUrl, Relays};
 use std::path::PathBuf;
 
 fn main() {
@@ -43,6 +44,21 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let mut seeds: Vec<&str> = args
+        .windows(2)
+        .filter(|w| w[0] == "--seed")
+        .map(|w| w[1].as_str())
+        .collect();
+    if seeds.is_empty() {
+        seeds = helper::SEEDS.to_vec();
+    }
+    let seeds: Vec<MeshAddr> = match seeds.iter().map(|t| MeshAddr::from_ticket(t)).collect() {
+        Ok(seeds) => seeds,
+        Err(e) => {
+            eprintln!("mesh-node: bad --seed ticket: {e}");
+            std::process::exit(2);
+        }
+    };
     let relays = if relays.is_empty() {
         Relays::Default
     } else {
@@ -70,7 +86,7 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        runtime.block_on(helper::run(&dir, relays));
+        runtime.block_on(helper::run(&dir, relays, seeds));
     }
 }
 

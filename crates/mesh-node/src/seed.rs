@@ -6,7 +6,7 @@
 
 use crate::codes::{self, Caller, Get, Store};
 use mesh_identity::{DeviceCert, DeviceKey, RootKey};
-use mesh_transport::{Config, Node, Relays, ServiceStream, frame};
+use mesh_transport::{Config, MeshAddr, Node, Relays, ServiceStream, frame};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -207,6 +207,27 @@ async fn sweep_hourly(store: Arc<Mutex<Store>>, counts: Arc<Counts>) {
             take(&counts.revokes),
         );
     }
+}
+
+/// How long a client waits for a seed's answer, connecting included.
+const ASK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The client side: one request to a seed, one answer.
+pub async fn ask(
+    node: &Node,
+    seed: &MeshAddr,
+    service: &str,
+    request: &[u8],
+) -> Result<Vec<u8>, ()> {
+    let exchange = async {
+        let (_, mut send, mut recv) = node.open(seed, service).await.map_err(drop)?;
+        frame::write_frame(&mut send, request).await.map_err(drop)?;
+        send.finish().map_err(drop)?;
+        frame::read_frame(&mut recv).await.ok().flatten().ok_or(())
+    };
+    tokio::time::timeout(ASK_TIMEOUT, exchange)
+        .await
+        .map_err(drop)?
 }
 
 /// SIGTERM (Docker, systemd) or Ctrl-C.
