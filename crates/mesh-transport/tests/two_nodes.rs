@@ -5,8 +5,11 @@
 use iroh::endpoint::{Connection, ConnectionError, presets};
 use iroh::{Endpoint, RelayMode};
 use mesh_identity::{DeviceCert, DeviceKey, MeshId, RootKey};
-use mesh_transport::{ALPN, HandshakeError, MeshAddr, Node, Relays, TransportError, frame};
+use mesh_transport::{
+    ALPN, Config, HandshakeError, Limits, MeshAddr, Node, Path, Relays, TransportError, frame,
+};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 struct Device {
     root: RootKey,
@@ -27,7 +30,14 @@ impl Device {
         DeviceCert::issue(&self.root, &self.key.public(), name, 1).unwrap()
     }
     async fn node(&self, name: &str) -> Node {
-        Node::start(&self.key, &self.cert(name), Relays::Disabled)
+        self.node_with(name, Limits::default()).await
+    }
+    async fn node_with(&self, name: &str, limits: Limits) -> Node {
+        let config = Config {
+            relays: Relays::Disabled,
+            limits,
+        };
+        Node::start(&self.key, &self.cert(name), config)
             .await
             .unwrap()
     }
@@ -188,6 +198,107 @@ async fn a_key_alone_reaches_nothing() {
 #[tokio::test]
 async fn start_refuses_someone_elses_certificate() {
     let (mine, theirs) = (Device::new(), Device::new());
-    let result = Node::start(&mine.key, &theirs.cert("phone"), Relays::Disabled).await;
+    let result = Node::start(
+        &mine.key,
+        &theirs.cert("phone"),
+        Config {
+            relays: Relays::Disabled,
+            ..Config::default()
+        },
+    )
+    .await;
     assert!(matches!(result, Err(TransportError::CertNotOurs)));
+}
+
+#[tokio::test]
+async fn ping_reports_the_path_and_reuses_the_connection() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let (a, b) = (alice.node("laptop").await, bob.node("desktop").await);
+    let pong = a.ping(&addr_of(&b)).await.expect("ping");
+    assert_eq!(pong.peer.id, bob.id());
+    assert_eq!(pong.path, Path::Direct, "loopback is direct");
+    assert!(pong.rtt < Duration::from_secs(1), "{:?}", pong.rtt);
+
+    a.ping(&addr_of(&b)).await.expect("second ping");
+    a.dial(&addr_of(&b)).await.expect("dial");
+    assert_eq!(a.status().connections, 1, "one connection, reused");
+    assert!(a.status().direct);
+    assert!(!a.status().online, "no relay configured");
+    // Bob saw Alice connect once.
+    b.next_peer().await.expect("alice");
+    let again = tokio::time::timeout(Duration::from_millis(300), b.next_peer()).await;
+    assert!(again.is_err(), "no second connection");
+}
+
+#[tokio::test]
+async fn over_the_connection_limit_is_refused_and_others_keep_working() {
+    let bob = Device::new();
+    let limits = Limits {
+        connections: 1,
+        ..Limits::default()
+    };
+    let b = bob.node_with("desktop", limits).await;
+    let a = Device::new().node("laptop").await;
+    a.ping(&addr_of(&b)).await.expect("first fits");
+    let c = Device::new().node("phone").await;
+    assert!(
+        matches!(
+            c.ping(&addr_of(&b)).await,
+            Err(TransportError::Unreachable(_))
+        ),
+        "second refused"
+    );
+    a.ping(&addr_of(&b)).await.expect("the first still works");
+}
+
+#[tokio::test]
+async fn streams_per_connection_are_capped() {
+    let bob = Device::new();
+    let b = bob
+        .node_with(
+            "desktop",
+            Limits {
+                streams: 2,
+                ..Limits::default()
+            },
+        )
+        .await;
+    let me = Device::new();
+    let ep = raw(&me.key).await;
+    let conn = ep.connect(iroh_addr(&addr_of(&b)), ALPN).await.unwrap();
+    // Say hello properly, then hold streams open.
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    frame::write_tag(&mut send, "hello").await.unwrap();
+    frame::write_frame(&mut send, &me.cert("laptop").to_bytes())
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    frame::read_frame(&mut recv)
+        .await
+        .unwrap()
+        .expect("bob's hello");
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        // A ping tag with no nonce yet: Bob waits on it, keeping it open.
+        frame::write_tag(&mut send, "ping").await.unwrap();
+        held.push((send, recv));
+    }
+    let third = tokio::time::timeout(Duration::from_millis(500), conn.open_bi()).await;
+    assert!(third.is_err(), "a third stream waits for one to close");
+}
+
+#[tokio::test]
+async fn locking_closes_the_node() {
+    let (a, b) = (
+        Device::new().node("laptop").await,
+        Device::new().node("desktop").await,
+    );
+    let addr = addr_of(&b);
+    a.ping(&addr).await.expect("ping before");
+    b.close().await;
+    assert!(
+        matches!(a.ping(&addr).await, Err(TransportError::Unreachable(_))),
+        "unreachable after lock"
+    );
 }

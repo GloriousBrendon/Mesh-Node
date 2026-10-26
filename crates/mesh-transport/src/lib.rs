@@ -46,13 +46,69 @@ pub struct Peer {
 }
 
 /// Which relays the node uses (SPEC-transport D4).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum Relays {
     /// n0's public relays, until `seed` runs our own.
+    #[default]
     Default,
     Custom(Vec<iroh::RelayUrl>),
     /// None at all: direct addresses only (tests on one machine).
     Disabled,
+}
+
+/// How the node is set up.
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    pub relays: Relays,
+    pub limits: Limits,
+}
+
+/// Caps on what others can make this node hold (SPEC-transport D9). Who is
+/// *allowed* to connect is `social`'s decision; these only bound the cost.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Open connections; new incoming ones are refused past this.
+    pub connections: usize,
+    /// Incoming connections still in their handshake.
+    pub handshakes: usize,
+    /// Streams open at once on one connection.
+    pub streams: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            connections: 256,
+            handshakes: 32,
+            streams: 32,
+        }
+    }
+}
+
+/// What the node reports to the UI: no IP addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    /// A home relay is connected.
+    pub online: bool,
+    pub relay: Option<iroh::RelayUrl>,
+    /// At least one open connection is on a direct path.
+    pub direct: bool,
+    pub connections: usize,
+}
+
+/// A connection's current path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Path {
+    Direct,
+    Relay,
+}
+
+/// A ping's answer.
+#[derive(Debug, Clone)]
+pub struct Pong {
+    pub peer: Peer,
+    pub rtt: std::time::Duration,
+    pub path: Path,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -2,30 +2,47 @@
 //! `Minimal` preset so nothing about this device is published (D2), keyed by
 //! the device key, and accepting only connections that pass the handshake.
 
+use crate::frame;
 use crate::handshake::{self, ALPN, HandshakeError};
-use crate::{MeshAddr, Peer, Relays, TransportError};
-use iroh::endpoint::{Connection, presets};
+use crate::{Config, Limits, MeshAddr, Path, Peer, Pong, Relays, Status, TransportError};
+use iroh::endpoint::{Connection, QuicTransportConfig, presets};
 use iroh::{Endpoint, RelayMap, RelayMode};
 use mesh_identity::{DeviceCert, DeviceKey};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// How long a dial (connecting plus the handshake) may take.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a peer that connected has to finish its hello.
+/// How long reaching a device may take before it counts as unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long either side has to finish the hello once connected.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a ping may take once connected.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Close code for connections ended by locking (after the handshake codes).
+const LOCKED: u32 = 5;
+/// Newly accepted peers waiting to be read with `next_peer`; past this,
+/// the notice is dropped (the connection itself stays).
+const ACCEPTED_QUEUE: usize = 64;
 
 /// This device on the Mesh network, while the identity is unlocked (D7).
 pub struct Node {
     endpoint: Endpoint,
+    shared: Arc<Shared>,
+    accepted: tokio::sync::Mutex<mpsc::Receiver<Peer>>,
+}
+
+/// What the node's tasks share.
+struct Shared {
     /// Our certificate, as sent in every hello.
-    cert: Arc<[u8]>,
+    cert: Vec<u8>,
     /// Authenticated connections, by device.
-    conns: Arc<Mutex<HashMap<iroh::PublicKey, (Peer, Connection)>>>,
-    /// Peers that connected to us, as they pass the handshake.
-    accepted: tokio::sync::Mutex<mpsc::UnboundedReceiver<Peer>>,
+    conns: Mutex<HashMap<iroh::PublicKey, (Peer, Connection)>>,
+    /// Incoming connections still in their handshake.
+    pending: AtomicUsize,
+    limits: Limits,
+    accepted: mpsc::Sender<Peer>,
 }
 
 impl Node {
@@ -34,36 +51,40 @@ impl Node {
     pub async fn start(
         device: &DeviceKey,
         cert: &DeviceCert,
-        relays: Relays,
+        config: Config,
     ) -> Result<Self, TransportError> {
         if cert.device() != &device.public() {
             return Err(TransportError::CertNotOurs);
         }
-        let relay_mode = match relays {
+        let relay_mode = match config.relays {
             Relays::Default => RelayMode::Default,
             Relays::Custom(urls) => RelayMode::Custom(RelayMap::from_iter(urls)),
             Relays::Disabled => RelayMode::Disabled,
         };
+        let quic = QuicTransportConfig::builder()
+            .max_concurrent_bidi_streams(config.limits.streams.into())
+            .max_concurrent_uni_streams(0u32.into())
+            .build();
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(crate::secret_key(device))
             .relay_mode(relay_mode)
+            .transport_config(quic)
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await
             .map_err(|e| TransportError::Bind(e.to_string()))?;
-        let cert: Arc<[u8]> = cert.to_bytes().into();
-        let conns = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(accept_loop(
-            endpoint.clone(),
-            cert.clone(),
-            conns.clone(),
-            tx,
-        ));
+        let (tx, rx) = mpsc::channel(ACCEPTED_QUEUE);
+        let shared = Arc::new(Shared {
+            cert: cert.to_bytes(),
+            conns: Mutex::new(HashMap::new()),
+            pending: AtomicUsize::new(0),
+            limits: config.limits,
+            accepted: tx,
+        });
+        tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Self {
             endpoint,
-            cert,
-            conns,
+            shared,
             accepted: tokio::sync::Mutex::new(rx),
         })
     }
@@ -84,31 +105,69 @@ impl Node {
         self.endpoint.bound_sockets()
     }
 
-    /// Connects to a device and runs the handshake, or reuses the connection
-    /// already open to it.
-    pub async fn dial(&self, addr: &MeshAddr) -> Result<Peer, TransportError> {
-        if let Some(peer) = self.open(&addr.device) {
-            return Ok(peer);
+    /// Waits until a home relay is connected, for up to `wait`; false if it
+    /// isn't by then (or relays are disabled).
+    pub async fn online(&self, wait: Duration) -> bool {
+        tokio::time::timeout(wait, self.endpoint.online())
+            .await
+            .is_ok()
+    }
+
+    /// What the UI shows. Never includes IP addresses (spec "Endpoint").
+    pub fn status(&self) -> Status {
+        let relay = self.endpoint.addr().relay_urls().next().cloned();
+        let conns = lock(&self.shared.conns);
+        let open: Vec<_> = conns
+            .values()
+            .filter(|(_, c)| c.close_reason().is_none())
+            .collect();
+        Status {
+            online: relay.is_some(),
+            relay,
+            direct: open.iter().any(|(_, c)| path(c) == Path::Direct),
+            connections: open.len(),
         }
-        let attempt = async {
-            let conn = self
-                .endpoint
-                .connect(addr.endpoint_addr(), ALPN)
+    }
+
+    /// Connects to a device and runs the handshake, or reuses the connection
+    /// already open to it. Connections are made when asked; there's no retry
+    /// loop here, so callers that retry by themselves pace their retries.
+    pub async fn dial(&self, addr: &MeshAddr) -> Result<Peer, TransportError> {
+        Ok(self.connection(addr).await?.0)
+    }
+
+    /// Pings a device: who answered, the round-trip time, and whether the
+    /// connection is direct or through a relay.
+    pub async fn ping(&self, addr: &MeshAddr) -> Result<Pong, TransportError> {
+        let (peer, conn) = self.connection(addr).await?;
+        let nonce = rand_nonce();
+        let started = Instant::now();
+        let exchange = async {
+            let (mut send, mut recv) = conn
+                .open_bi()
                 .await
                 .map_err(|e| TransportError::Unreachable(e.to_string()))?;
-            match handshake::dial(&conn, &self.cert).await {
-                Ok(peer) => Ok((peer, conn)),
-                Err(e) => {
-                    e.close(&conn);
-                    Err(TransportError::Handshake(e))
-                }
+            frame::write_tag(&mut send, "ping").await.map_err(dropped)?;
+            frame::write_frame(&mut send, &nonce)
+                .await
+                .map_err(dropped)?;
+            send.finish()
+                .map_err(|e| TransportError::Unreachable(e.to_string()))?;
+            match frame::read_frame(&mut recv).await.map_err(dropped)? {
+                Some(echo) if echo == nonce => Ok(()),
+                _ => Err(TransportError::Unreachable(
+                    "the device didn't answer the ping".into(),
+                )),
             }
         };
-        let (peer, conn) = tokio::time::timeout(DIAL_TIMEOUT, attempt)
+        tokio::time::timeout(PING_TIMEOUT, exchange)
             .await
             .map_err(|_| TransportError::Timeout)??;
-        lock(&self.conns).insert(addr.device, (peer.clone(), conn));
-        Ok(peer)
+        Ok(Pong {
+            peer,
+            rtt: started.elapsed(),
+            path: path(&conn),
+        })
     }
 
     /// The next peer that connected to us and passed the handshake; `None`
@@ -117,23 +176,71 @@ impl Node {
         self.accepted.lock().await.recv().await
     }
 
-    /// Closes every connection, then the endpoint.
+    /// Closes every connection, saying it's locked, then the endpoint.
     pub async fn close(&self) {
-        lock(&self.conns).clear();
+        for (_, (_, conn)) in lock(&self.shared.conns).drain() {
+            conn.close(LOCKED.into(), b"locked");
+        }
         self.endpoint.close().await;
     }
 
-    /// The open, authenticated connection to a device, if there is one.
-    fn open(&self, device: &iroh::PublicKey) -> Option<Peer> {
+    /// The open connection to a device, or a new one through the handshake.
+    async fn connection(&self, addr: &MeshAddr) -> Result<(Peer, Connection), TransportError> {
+        if let Some(open) = self.shared.open(&addr.device) {
+            return Ok(open);
+        }
+        let conn = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.endpoint.connect(addr.endpoint_addr(), ALPN),
+        )
+        .await
+        .map_err(|_| TransportError::Unreachable("no answer".into()))?
+        .map_err(|e| TransportError::Unreachable(e.to_string()))?;
+        let peer = match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake::dial(&conn, &self.shared.cert),
+        )
+        .await
+        {
+            Ok(Ok(peer)) => peer,
+            Ok(Err(e)) => {
+                e.close(&conn);
+                return Err(e.into());
+            }
+            Err(_) => {
+                HandshakeError::Timeout.close(&conn);
+                return Err(TransportError::Timeout);
+            }
+        };
+        self.shared.add(peer.clone(), conn.clone());
+        Ok((peer, conn))
+    }
+}
+
+impl Shared {
+    fn open(&self, device: &iroh::PublicKey) -> Option<(Peer, Connection)> {
         let mut conns = lock(&self.conns);
         match conns.get(device) {
-            Some((peer, conn)) if conn.close_reason().is_none() => Some(peer.clone()),
+            Some((peer, conn)) if conn.close_reason().is_none() => {
+                Some((peer.clone(), conn.clone()))
+            }
             Some(_) => {
                 conns.remove(device);
                 None
             }
             None => None,
         }
+    }
+
+    /// Keeps an authenticated connection and starts answering its streams.
+    fn add(self: &Arc<Self>, peer: Peer, conn: Connection) {
+        lock(&self.conns).insert(peer.device, (peer.clone(), conn.clone()));
+        tokio::spawn(serve(self.clone(), peer.device, conn));
+    }
+
+    fn full(&self) -> bool {
+        lock(&self.conns).len() >= self.limits.connections
+            || self.pending.load(Ordering::Relaxed) >= self.limits.handshakes
     }
 }
 
@@ -143,28 +250,89 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Accepts connections and runs the handshake on each, without letting one
-/// slow peer hold up the others.
-async fn accept_loop(
-    endpoint: Endpoint,
-    cert: Arc<[u8]>,
-    conns: Arc<Mutex<HashMap<iroh::PublicKey, (Peer, Connection)>>>,
-    accepted: mpsc::UnboundedSender<Peer>,
-) {
+/// Accepts connections and runs the handshake on each, refusing new ones
+/// while the limits are reached (D9).
+async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
     while let Some(incoming) = endpoint.accept().await {
-        let (cert, conns, accepted) = (cert.clone(), conns.clone(), accepted.clone());
+        if shared.full() {
+            incoming.refuse();
+            continue;
+        }
+        shared.pending.fetch_add(1, Ordering::Relaxed);
+        let shared = shared.clone();
         tokio::spawn(async move {
-            let Ok(conn) = incoming.await else { return };
-            let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake::accept(&conn, &cert))
-                .await
-                .unwrap_or(Err(HandshakeError::Timeout));
-            match result {
-                Ok(peer) => {
-                    lock(&conns).insert(peer.device, (peer.clone(), conn));
-                    let _ = accepted.send(peer);
+            let accepted = async {
+                let conn = incoming.await.ok()?;
+                let result =
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake::accept(&conn, &shared.cert))
+                        .await
+                        .unwrap_or(Err(HandshakeError::Timeout));
+                match result {
+                    Ok(peer) => Some((peer, conn)),
+                    Err(e) => {
+                        e.close(&conn);
+                        None
+                    }
                 }
-                Err(e) => e.close(&conn),
+            };
+            let accepted = accepted.await;
+            shared.pending.fetch_sub(1, Ordering::Relaxed);
+            if let Some((peer, conn)) = accepted {
+                shared.add(peer.clone(), conn);
+                let _ = shared.accepted.try_send(peer);
             }
         });
     }
+}
+
+/// Answers a connection's streams until it closes, then forgets it.
+async fn serve(shared: Arc<Shared>, device: iroh::PublicKey, conn: Connection) {
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        tokio::spawn(async move {
+            match frame::read_tag(&mut recv).await.as_deref() {
+                Ok("ping") => {
+                    if let Ok(Some(nonce)) = frame::read_frame(&mut recv).await
+                        && nonce.len() == 8
+                        && frame::write_frame(&mut send, &nonce).await.is_ok()
+                    {
+                        let _ = send.finish();
+                    }
+                }
+                // Unknown services end the stream, not the connection.
+                _ => {
+                    let _ = send.reset(1u32.into());
+                }
+            }
+        });
+    }
+    let mut conns = lock(&shared.conns);
+    if conns
+        .get(&device)
+        .is_some_and(|(_, c)| c.stable_id() == conn.stable_id())
+    {
+        conns.remove(&device);
+    }
+}
+
+/// Whether the connection's current path is direct or through a relay.
+fn path(conn: &Connection) -> Path {
+    let paths = conn.paths();
+    let relayed = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .is_none_or(|p| p.is_relay());
+    if relayed { Path::Relay } else { Path::Direct }
+}
+
+fn dropped(e: frame::FrameError) -> TransportError {
+    TransportError::Unreachable(e.to_string())
+}
+
+fn rand_nonce() -> [u8; 8] {
+    // Only has to differ between pings, not be secret.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (nanos as u64).to_be_bytes()
 }
