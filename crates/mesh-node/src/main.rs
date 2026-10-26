@@ -2,9 +2,11 @@
 //! Mesh-Voice's helper: commands arrive on stdin as `{"fn":..,"args":[..]}`
 //! lines, events go out on stdout as `{"binding":..,"payload":"<json>"}`
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
+//! `--relay <url>` (repeatable) replaces n0's public relays.
 
 mod helper;
 
+use mesh_transport::{RelayUrl, Relays};
 use std::path::PathBuf;
 
 fn main() {
@@ -23,6 +25,23 @@ fn main() {
         eprintln!("mesh-node: no data directory; pass --data <dir>");
         std::process::exit(2);
     };
+    let relays: Vec<RelayUrl> = match args
+        .windows(2)
+        .filter(|w| w[0] == "--relay")
+        .map(|w| relay(&w[1]))
+        .collect()
+    {
+        Ok(relays) => relays,
+        Err(e) => {
+            eprintln!("mesh-node: {e}");
+            std::process::exit(2);
+        }
+    };
+    let relays = if relays.is_empty() {
+        Relays::Default
+    } else {
+        Relays::Custom(relays)
+    };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("mesh-node: can't create {}: {e}", dir.display());
         std::process::exit(1);
@@ -39,7 +58,24 @@ fn main() {
             std::process::exit(1);
         }
     };
-    runtime.block_on(helper::run(&dir));
+    runtime.block_on(helper::run(&dir, relays));
+}
+
+/// A relay from `--relay`: https, or plain http only on this machine (a
+/// local test relay), so the relay link is never readable on the network.
+fn relay(url: &str) -> Result<RelayUrl, String> {
+    let parsed: RelayUrl = url.parse().map_err(|_| format!("bad relay URL {url}"))?;
+    let host = parsed.host_str().unwrap_or("");
+    let local = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" if local => Ok(parsed),
+        _ => Err(format!("relay {url} must use https")),
+    }
 }
 
 /// `%APPDATA%\mesh\node` on Windows, `$XDG_DATA_HOME/mesh/node` (or

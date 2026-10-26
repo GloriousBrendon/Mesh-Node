@@ -2383,7 +2383,9 @@ dependencies = [
 name = "mesh-node"
 version = "0.1.0"
 dependencies = [
+ "iroh-relay",
  "mesh-identity",
+ "mesh-transport",
  "serde",
  "serde_json",
  "tokio",

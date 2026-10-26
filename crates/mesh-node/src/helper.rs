@@ -1,6 +1,7 @@
-//! Helper mode: identity commands over JSON lines on stdio. stdin is read on
-//! its own thread and fed into the async loop (SPEC-transport D8), so the
-//! node's connections keep running while a command is handled.
+//! Helper mode: identity and network commands over JSON lines on stdio. stdin
+//! is read on its own thread and fed into the async loop (SPEC-transport D8),
+//! so the node's connections keep running while a command is handled. The
+//! node runs while the identity is unlocked (D7).
 //!
 //! Commands are never logged or echoed: passwords travel in them. Each
 //! command answers with one event; a failure is a `meshError` with a stable
@@ -8,16 +9,23 @@
 
 use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use mesh_identity::{
     CodeError, DEFAULT_EXPIRY, DEFAULT_USES, FriendCode, IdError, Keystore, KeystoreError, Link,
     MAX_DEVICE_NAME, SafetyNumber, check_password, is_kept, keyring_status,
+};
+use mesh_transport::{
+    Config, HandshakeError, MeshAddr, Node, Path as NetPath, Relays, Status, TransportError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
 const KEYSTORE_FILE: &str = "identity.mks";
+/// How often the node's state is checked for a change to report.
+const NET_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 struct Cmd {
@@ -96,9 +104,11 @@ fn emit(binding: &str, payload: Value) {
 const QUEUED_COMMANDS: usize = 16;
 
 /// Reads commands until stdin closes (Mesh quit or restarted us).
-pub async fn run(dir: &Path) {
-    let mut helper = Helper::new(dir.join(KEYSTORE_FILE));
+pub async fn run(dir: &Path, relays: Relays) {
+    let mut helper = Helper::new(dir.join(KEYSTORE_FILE), relays);
     helper.emit_identity();
+    // Kept unlocked: the identity is already open.
+    helper.start_net().await;
     let (tx, mut lines) = tokio::sync::mpsc::channel::<String>(QUEUED_COMMANDS);
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -111,7 +121,7 @@ pub async fn run(dir: &Path) {
     while let Some(mut line) = lines.recv().await {
         match serde_json::from_str::<Cmd>(line.trim()) {
             Ok(mut cmd) => {
-                if let Err(Fail(kind, message)) = helper.handle(&cmd.func, &cmd.args) {
+                if let Err(Fail(kind, message)) = helper.handle(&cmd.func, &cmd.args).await {
                     emit(
                         "meshError",
                         json!({ "fn": cmd.func, "kind": kind, "message": message }),
@@ -130,6 +140,7 @@ pub async fn run(dir: &Path) {
         }
         line.zeroize();
     }
+    helper.stop_net().await;
 }
 
 struct Helper {
@@ -137,14 +148,25 @@ struct Helper {
     store: Option<Keystore>,
     /// Why "keep unlocked" can't be used here, if it can't.
     keyring: Result<(), String>,
+    relays: Relays,
+    /// The node, while the identity is unlocked and networking started.
+    net: Option<Net>,
+}
+
+struct Net {
+    node: Arc<Node>,
+    /// Reports the node's state as it changes.
+    watch: tokio::task::JoinHandle<()>,
 }
 
 impl Helper {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, relays: Relays) -> Self {
         let mut helper = Self {
             store: None,
             keyring: keyring_status(),
             path,
+            relays,
+            net: None,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -155,7 +177,7 @@ impl Helper {
         helper
     }
 
-    fn handle(&mut self, func: &str, args: &[String]) -> Result<(), Fail> {
+    async fn handle(&mut self, func: &str, args: &[String]) -> Result<(), Fail> {
         let arg = |i: usize| {
             args.get(i)
                 .map(String::as_str)
@@ -171,13 +193,16 @@ impl Helper {
                     &device_name(),
                 )?);
                 self.emit_unlocked();
+                self.start_net().await;
             }
             "idUnlock" => {
                 self.store = Some(Keystore::unlock(&self.path, arg(0)?, arg(1)?)?);
                 self.emit_unlocked();
+                self.start_net().await;
             }
             "idLock" => {
                 self.store = None;
+                self.stop_net().await;
                 self.emit_identity();
             }
             "idChangePassword" => {
@@ -225,6 +250,7 @@ impl Helper {
                     &device_name(),
                 )?);
                 self.emit_unlocked();
+                self.start_net().await;
             }
             "codeCreate" => {
                 let expiry = match arg(0).unwrap_or("") {
@@ -279,6 +305,47 @@ impl Helper {
                 };
                 emit("meshParsed", parsed);
             }
+            "netStatus" => emit_net(self.net.as_ref().map(|n| n.node.status()).as_ref()),
+            "netTicket" => {
+                let ticket = self
+                    .node()?
+                    .addr()
+                    .ticket()
+                    .map_err(|_| Fail("offline", "not connected to a relay yet".to_owned()))?;
+                emit("meshTicket", json!({ "ticket": ticket }));
+            }
+            "netPing" => {
+                let addr = MeshAddr::from_ticket(arg(0)?.trim())
+                    .map_err(|e| Fail("bad-ticket", e.to_string()))?;
+                let node = self.node()?;
+                if !node.status().online {
+                    return Err(Fail("offline", "not connected to a relay yet".to_owned()));
+                }
+                // Up to 20 s: answered when done, while other commands carry on.
+                tokio::spawn(async move {
+                    match node.ping(&addr).await {
+                        Ok(pong) => emit(
+                            "meshPing",
+                            json!({
+                                "id": pong.peer.id.to_string(),
+                                "name": pong.peer.name,
+                                "path": match pong.path {
+                                    NetPath::Direct => "direct",
+                                    NetPath::Relay => "relay",
+                                },
+                                "ms": (pong.rtt.as_secs_f64() * 10_000.0).round() / 10.0,
+                            }),
+                        ),
+                        Err(e) => {
+                            let Fail(kind, message) = ping_fail(e);
+                            emit(
+                                "meshError",
+                                json!({ "fn": "netPing", "kind": kind, "message": message }),
+                            );
+                        }
+                    }
+                });
+            }
             _ => {
                 eprintln!("mesh-node: unknown command {func}");
                 return Err(Fail("unknown-fn", format!("unknown command {func}")));
@@ -291,6 +358,52 @@ impl Helper {
         self.store
             .as_mut()
             .ok_or_else(|| Fail("locked", "unlock Mesh first".to_owned()))
+    }
+
+    /// The running node; the identity must be unlocked.
+    fn node(&mut self) -> Result<Arc<Node>, Fail> {
+        self.unlocked()?;
+        self.net
+            .as_ref()
+            .map(|n| n.node.clone())
+            .ok_or_else(|| Fail("offline", "networking didn't start".to_owned()))
+    }
+
+    /// Starts this device's node for the open identity (replacing any running).
+    async fn start_net(&mut self) {
+        self.stop_net().await;
+        let Some(store) = &self.store else { return };
+        let this = store.device_key().public();
+        let Some(cert) = store
+            .devices()
+            .devices()
+            .iter()
+            .find(|d| *d.device() == this)
+        else {
+            eprintln!("mesh-node: this device isn't in its identity's device list");
+            return;
+        };
+        let config = Config {
+            relays: self.relays.clone(),
+            ..Config::default()
+        };
+        match Node::start(store.device_key(), cert, config).await {
+            Ok(node) => {
+                let node = Arc::new(node);
+                let watch = tokio::spawn(watch_net(node.clone()));
+                self.net = Some(Net { node, watch });
+            }
+            Err(e) => eprintln!("mesh-node: networking didn't start: {e}"),
+        }
+    }
+
+    /// Closes every connection (they're told it's locked) and the node.
+    async fn stop_net(&mut self) {
+        if let Some(net) = self.net.take() {
+            net.watch.abort();
+            net.node.close().await;
+            emit_net(None);
+        }
     }
 
     fn emit_unlocked(&self) {
@@ -361,6 +474,51 @@ impl Helper {
             json!({ "codes": codes, "created": created.map(|c| c.to_string()) }),
         );
     }
+}
+
+/// Sends `meshNet` whenever the node's state changes.
+// ponytail: polls once a second; switch to iroh's watchers if idle CPU says so.
+async fn watch_net(node: Arc<Node>) {
+    let mut last = None;
+    loop {
+        let status = node.status();
+        if last.as_ref() != Some(&status) {
+            emit_net(Some(&status));
+            last = Some(status);
+        }
+        tokio::time::sleep(NET_POLL).await;
+    }
+}
+
+/// `meshNet`: never any IP address (SPEC-transport "Endpoint").
+fn emit_net(status: Option<&Status>) {
+    let payload = match status {
+        None => json!({ "state": "off", "relay": null, "direct": false, "connections": 0 }),
+        Some(s) => json!({
+            "state": if s.online { "online" } else { "connecting" },
+            "relay": s.relay.as_ref().map(ToString::to_string),
+            "direct": s.direct,
+            "connections": s.connections,
+        }),
+    };
+    emit("meshNet", payload);
+}
+
+/// A failed ping's kind. The messages are fixed: iroh's own errors can
+/// name addresses, which stay out of the UI.
+fn ping_fail(e: TransportError) -> Fail {
+    let kind = match e {
+        TransportError::Timeout | TransportError::Handshake(HandshakeError::Timeout) => "timeout",
+        TransportError::Handshake(HandshakeError::BadCert) => "bad-cert",
+        TransportError::Handshake(HandshakeError::KeyMismatch) => "key-mismatch",
+        _ => "unreachable",
+    };
+    let message = match kind {
+        "timeout" => "that device didn't answer in time".to_owned(),
+        "unreachable" => "couldn't reach that device".to_owned(),
+        _ => e.to_string(),
+    };
+    Fail(kind, message)
 }
 
 /// This machine's name, for its device certificate.

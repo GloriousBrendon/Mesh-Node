@@ -8,7 +8,14 @@ publish.workspace = true
 
 [dependencies]
 mesh-identity.workspace = true
+mesh-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+# A plain-http relay on loopback for the two-helper test, so the helper never
+# needs to trust a self-signed relay. Same crate and version iroh already uses.
+iroh-relay = { version = "=1.4.1", default-features = false, features = ["server", "tls-ring"] }
+tokio.workspace = true

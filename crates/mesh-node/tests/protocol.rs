@@ -1,6 +1,7 @@
 //! Drives the `mesh-node` binary over stdio, as Mesh-Voice does: create →
 //! lock → unlock → codes → safety number → export/import, checking each
-//! event, and that no password ever reaches stderr.
+//! event, and that no password ever reaches stderr; then two helpers ping
+//! each other through a relay on loopback.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -15,17 +16,46 @@ const BACKUP_PASSWORD: &str = "seventeen quiet harbour owls";
 /// Starts like an ID but is far too short.
 const SHORT_ID: &str = "mesh1";
 
+/// A plain-http relay on loopback, which `--relay` allows: no internet
+/// needed, and nothing in the helper has to trust a self-signed relay.
+struct Relay {
+    url: String,
+    // Runs the server; dropping it stops the relay.
+    runtime: tokio::runtime::Runtime,
+}
+
+impl Relay {
+    fn start() -> Self {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = runtime.block_on(async {
+            let mut config = ServerConfig::default();
+            config.relay = Some(RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0)));
+            let server = Server::spawn(config).await.unwrap();
+            let url = format!("http://{}", server.http_addr().unwrap());
+            // The server stops when dropped; the runtime outlives the test.
+            std::mem::forget(server);
+            url
+        });
+        Self { url, runtime }
+    }
+}
+
 struct Node {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// The latest `meshNet`: it comes whenever the node's state changes, so
+    /// `event` sets it aside.
+    net: Option<Value>,
 }
 
 impl Node {
-    fn start(dir: &Path) -> Self {
+    fn start(dir: &Path, relay: &Relay) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-node"))
             .arg("--data")
             .arg(dir)
+            .args(["--relay", &relay.url])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -37,11 +67,12 @@ impl Node {
             child,
             stdin,
             stdout,
+            net: None,
         }
     }
 
-    /// The next event: its binding and decoded payload.
-    fn event(&mut self) -> (String, Value) {
+    /// The next line's binding and decoded payload.
+    fn line(&mut self) -> (String, Value) {
         let mut line = String::new();
         assert!(
             self.stdout.read_line(&mut line).unwrap() > 0,
@@ -52,9 +83,39 @@ impl Node {
         (frame["binding"].as_str().unwrap().to_owned(), payload)
     }
 
+    /// The next event other than `meshNet`.
+    fn event(&mut self) -> (String, Value) {
+        loop {
+            match self.line() {
+                (binding, payload) if binding == "meshNet" => self.net = Some(payload),
+                event => return event,
+            }
+        }
+    }
+
+    /// Waits for a `meshNet` that satisfies `done`; it may already have come.
+    fn net(&mut self, done: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            if let Some(net) = self.net.as_ref().filter(|n| done(n)) {
+                return net.clone();
+            }
+            let (binding, payload) = self.line();
+            assert_eq!(binding, "meshNet", "unexpected {payload}");
+            self.net = Some(payload);
+        }
+    }
+
+    fn net_state(&mut self, state: &str) -> Value {
+        self.net(|n| n["state"] == state)
+    }
+
+    fn send(&mut self, func: &str, args: &[&str]) {
+        writeln!(self.stdin, "{}", json!({ "fn": func, "args": args })).unwrap();
+    }
+
     /// Sends a command and returns the first event it answers with.
     fn call(&mut self, func: &str, args: &[&str]) -> (String, Value) {
-        writeln!(self.stdin, "{}", json!({ "fn": func, "args": args })).unwrap();
+        self.send(func, args);
         self.event()
     }
 
@@ -90,8 +151,9 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 fn identity_over_stdio() {
     let (dir_a, dir_b) = (temp_dir("a"), temp_dir("b"));
     let backup = dir_a.join("backup.mks");
+    let relay = Relay::start();
 
-    let mut a = Node::start(&dir_a);
+    let mut a = Node::start(&dir_a, &relay);
     assert_eq!(
         a.event(),
         (
@@ -188,7 +250,7 @@ fn identity_over_stdio() {
     assert_eq!(a.expect("bogus", &[], "meshError")["kind"], "unknown-fn");
 
     // The restored device: same ID, a new device key, its own password.
-    let mut b = Node::start(&dir_b);
+    let mut b = Node::start(&dir_b, &relay);
     assert_eq!(b.event().1["state"], "none");
     let restored = b.expect(
         "idImport",
@@ -222,6 +284,74 @@ fn identity_over_stdio() {
     for secret in [PASSWORD, NEW_PASSWORD, BACKUP_PASSWORD] {
         assert!(!stderr.contains(secret), "a password reached stderr");
     }
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
+}
+
+#[test]
+fn two_helpers_ping_through_a_relay() {
+    let (dir_a, dir_b) = (temp_dir("ping-a"), temp_dir("ping-b"));
+    let relay = Relay::start();
+    let (mut a, mut b) = (Node::start(&dir_a, &relay), Node::start(&dir_b, &relay));
+    assert_eq!(a.event().0, "meshIdentity");
+    assert_eq!(b.event().0, "meshIdentity");
+
+    // Locked: no networking.
+    assert_eq!(a.expect("netTicket", &[], "meshError")["kind"], "locked");
+    a.send("netStatus", &[]);
+    assert_eq!(a.net_state("off")["connections"], 0);
+
+    let id_a = a.expect("idCreate", &["alice", PASSWORD], "meshIdentity")["id"].clone();
+    let id_b = b.expect("idCreate", &["bob", NEW_PASSWORD], "meshIdentity")["id"].clone();
+    assert_eq!(a.event().0, "meshCodes");
+    assert_eq!(b.event().0, "meshCodes");
+    let online = a.net_state("online");
+    b.net_state("online");
+    // What the UI sees: the relay, and no IP address of this device.
+    assert_eq!(online["relay"].as_str(), Some(&*format!("{}/", relay.url)));
+    let mut keys: Vec<_> = online.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["connections", "direct", "relay", "state"]);
+
+    let ticket_a = a.expect("netTicket", &[], "meshTicket")["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ticket_b = b.expect("netTicket", &[], "meshTicket")["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(ticket_a.starts_with("mesh://node/"), "{ticket_a}");
+
+    let pong = b.expect("netPing", &[&ticket_a], "meshPing");
+    assert_eq!(pong["id"], id_a);
+    assert!(pong["ms"].as_f64().unwrap() >= 0.0);
+    assert!(["direct", "relay"].contains(&pong["path"].as_str().unwrap()));
+    let pong = a.expect("netPing", &[&ticket_b], "meshPing");
+    assert_eq!(pong["id"], id_b);
+    // One connection between them, reused both ways.
+    a.net(|n| n["connections"] == 1);
+    b.net(|n| n["connections"] == 1);
+
+    assert_eq!(
+        b.expect("netPing", &["mesh://node/nope"], "meshError")["kind"],
+        "bad-ticket"
+    );
+
+    // Alice locks: her node closes, and Bob can't reach her any more.
+    assert_eq!(a.expect("idLock", &[], "meshIdentity")["state"], "locked");
+    a.net_state("off");
+    let err = b.expect("netPing", &[&ticket_a], "meshError");
+    assert_eq!(
+        (err["fn"].as_str(), err["kind"].as_str()),
+        (Some("netPing"), Some("unreachable"))
+    );
+
+    let stderr = a.quit() + &b.quit();
+    for secret in [PASSWORD, NEW_PASSWORD] {
+        assert!(!stderr.contains(secret), "a password reached stderr");
+    }
+    drop(relay.runtime);
     let _ = std::fs::remove_dir_all(dir_a);
     let _ = std::fs::remove_dir_all(dir_b);
 }
