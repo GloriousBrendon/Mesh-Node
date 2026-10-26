@@ -11,3 +11,6 @@ mesh-identity.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+iroh.workspace = true
