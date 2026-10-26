@@ -270,11 +270,17 @@ impl HeldCode {
         (uses != 0).then_some(uses)
     }
 
+    /// The hash of the owner's revoke secret: the same for every record the
+    /// owner makes for this code, so a holder can tell a repeat hold by the
+    /// owner from someone else's record under the same lookup ID.
+    pub fn revoke_tag(&self) -> [u8; 32] {
+        self.0[28..OUTER_LEN].try_into().expect("32 bytes")
+    }
+
     /// Whether `revoke` is the owner revoking this record.
     pub fn is_revoked_by(&self, revoke: &CodeRevoke) -> bool {
-        let tag: [u8; 32] = self.0[28..OUTER_LEN].try_into().expect("32 bytes");
         // blake3::Hash compares in constant time.
-        revoke.lookup_id == self.lookup_id() && blake3::hash(&revoke.secret) == tag
+        revoke.lookup_id == self.lookup_id() && blake3::hash(&revoke.secret) == self.revoke_tag()
     }
 
     /// Decrypts and verifies the record with the code someone typed, refusing

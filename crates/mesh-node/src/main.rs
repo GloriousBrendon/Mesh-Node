@@ -4,6 +4,7 @@
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
 //! `--relay <url>` (repeatable) replaces n0's public relays.
 
+mod codes;
 mod helper;
 
 use mesh_transport::{RelayUrl, Relays};
