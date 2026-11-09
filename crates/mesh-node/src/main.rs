@@ -3,12 +3,15 @@
 //! lines, events go out on stdout as `{"binding":..,"payload":"<json>"}`
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
 //! `--relay <url>` (repeatable) replaces n0's public relays; `--seed
-//! <ticket>` (repeatable) the built-in seeds.
+//! <ticket>` (repeatable) the built-in seeds. `--record-ttl <secs>` shortens
+//! how long address records last, for tests.
 //!
 //! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed).
 
+mod addrs;
 mod codes;
 mod helper;
+mod routing;
 mod seed;
 
 use mesh_transport::{MeshAddr, RelayUrl, Relays};
@@ -59,6 +62,20 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Tests shorten how long address records last (SPEC-routing D4).
+    let record_ttl = match args.windows(2).find(|w| w[0] == "--record-ttl") {
+        None => routing::RECORD_TTL,
+        Some(w) => match w[1].parse::<u64>() {
+            Ok(ttl) if (4..=routing::RECORD_TTL).contains(&ttl) => ttl,
+            _ => {
+                eprintln!(
+                    "mesh-node: --record-ttl takes 4 to {} seconds",
+                    routing::RECORD_TTL
+                );
+                std::process::exit(2);
+            }
+        },
+    };
     let relays = if relays.is_empty() {
         Relays::Default
     } else {
@@ -86,7 +103,7 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        runtime.block_on(helper::run(&dir, relays, seeds));
+        runtime.block_on(helper::run(&dir, relays, seeds, record_ttl));
     }
 }
 

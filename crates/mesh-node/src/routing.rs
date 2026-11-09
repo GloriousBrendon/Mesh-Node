@@ -1,0 +1,196 @@
+//! Routing (SPEC-routing): reaching a contact by ID. Each device leaves an
+//! encrypted address record per contact on the seeds (D2–D4), and finds a
+//! contact by trying the address that last worked, then the seeds' records
+//! for them (D8). Seed requests go from the throwaway node (seed D7b).
+
+use std::cmp::Reverse;
+use std::sync::Arc;
+
+use crate::addrs::{Get, Put};
+use crate::seed;
+use mesh_identity::{
+    AddrRecord, DeviceList, Keystore, LastAddr, MeshId, PairKeys, day_of, open_addr, seal_addr,
+};
+use mesh_transport::{MeshAddr, Node, Pong, RelayUrl};
+
+/// How long a record lasts (D4); `--record-ttl` shortens it for tests.
+pub const RECORD_TTL: u64 = 2 * 3600;
+/// How often records are refreshed, at most (D4).
+pub const REFRESH_EVERY: u64 = 30 * 60;
+
+/// This device's record for each contact, on `relay`.
+pub fn records(store: &Keystore, relay: &RelayUrl, now: u64, ttl: u64) -> Vec<Vec<u8>> {
+    store
+        .contacts()
+        .iter()
+        .filter_map(|c| {
+            let keys = store.pair_keys(&c.id())?;
+            let sealed = seal_addr(
+                &keys,
+                store.device_key(),
+                store.devices(),
+                relay.as_str(),
+                now,
+                ttl,
+            );
+            sealed
+                .inspect_err(|e| eprintln!("mesh-node: couldn't make an address record: {e}"))
+                .ok()
+        })
+        .collect()
+}
+
+/// Puts the records on every seed: true when a seed took all of them.
+pub async fn publish(anon: &Node, seeds: &[MeshAddr], records: &[Vec<u8>]) -> bool {
+    let mut published = false;
+    for addr in seeds {
+        if let Ok(answers) = seed::ask_many(anon, addr, seed::ADDR_PUT, records).await {
+            let took = |a: &Vec<u8>| a.first().copied().and_then(Put::from_byte) == Some(Put::Ok);
+            published |= answers.iter().all(took);
+        }
+    }
+    published
+}
+
+/// What the helper knows about a contact, taken from the keystore so the
+/// search can run off the main loop.
+pub struct Target {
+    pub id: MeshId,
+    pub keys: PairKeys,
+    pub last: Option<LastAddr>,
+    pub known: Option<DeviceList>,
+}
+
+impl Target {
+    pub fn of(store: &Keystore, id: &MeshId) -> Option<Self> {
+        let contact = store.contact(id)?;
+        Some(Self {
+            id: *id,
+            keys: store.pair_keys(id)?,
+            last: contact.last.clone(),
+            known: contact.devices(),
+        })
+    }
+}
+
+pub struct Reached {
+    pub pong: Pong,
+    pub last: LastAddr,
+    /// Their device list, when the seeds gave a newer one.
+    pub list: Option<DeviceList>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReachError {
+    /// No record, or no device answered.
+    Unreachable,
+    /// Records came back, but only for devices their newest list removed.
+    RevokedDevice,
+}
+
+/// Pings one of the contact's devices: the cached address first, then every
+/// device the seeds know of, together; the first to answer wins.
+pub async fn reach(
+    node: Arc<Node>,
+    anon: &Node,
+    seeds: &[MeshAddr],
+    target: Target,
+    now: u64,
+) -> Result<Reached, ReachError> {
+    let current = |list: &Option<DeviceList>, device: &[u8; 32]| {
+        list.as_ref()
+            .is_none_or(|l| l.devices().iter().any(|c| c.device().as_bytes() == device))
+    };
+    if let Some(last) = &target.last
+        && current(&target.known, &last.device)
+        && let Some(addr) = MeshAddr::from_parts(&last.device, &last.relay)
+        && let Ok(pong) = node.ping(&addr).await
+        && pong.peer.id == target.id
+    {
+        return Ok(Reached {
+            pong,
+            last: last.clone(),
+            list: None,
+        });
+    }
+
+    let (records, newest) = find(anon, seeds, &target, now).await?;
+    let mut pings = tokio::task::JoinSet::new();
+    for record in records {
+        let device = *record.device.as_bytes();
+        let Some(addr) = MeshAddr::from_parts(&device, &record.relay) else {
+            continue;
+        };
+        let node = node.clone();
+        pings.spawn(async move {
+            let last = LastAddr {
+                device,
+                relay: record.relay,
+            };
+            node.ping(&addr).await.map(|pong| (pong, last))
+        });
+    }
+    while let Some(done) = pings.join_next().await {
+        if let Ok(Ok((pong, last))) = done
+            && pong.peer.id == target.id
+        {
+            return Ok(Reached {
+                pong,
+                last,
+                list: newest,
+            });
+        }
+    }
+    Err(ReachError::Unreachable)
+}
+
+/// The contact's records on the seeds for today and yesterday (midnight, and
+/// clocks that disagree), opened and checked: one per device, newest first,
+/// only devices their newest known list still has. Also that list.
+async fn find(
+    anon: &Node,
+    seeds: &[MeshAddr],
+    target: &Target,
+    now: u64,
+) -> Result<(Vec<AddrRecord>, Option<DeviceList>), ReachError> {
+    let today = day_of(now);
+    let lookups =
+        [today, today.saturating_sub(1)].map(|day| target.keys.lookup(&target.id, day).to_vec());
+    let mut found: Vec<AddrRecord> = Vec::new();
+    for addr in seeds {
+        let Ok(answers) = seed::ask_many(anon, addr, seed::ADDR_GET, &lookups).await else {
+            continue;
+        };
+        for answer in answers {
+            if let Some(Get::Found(sealed)) = Get::from_bytes(&answer) {
+                // Anything that doesn't open is someone else's, or junk.
+                found.extend(
+                    sealed
+                        .iter()
+                        .filter_map(|r| open_addr(&target.keys, &target.id, r, now).ok()),
+                );
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(ReachError::Unreachable);
+    }
+    let newest = found
+        .iter()
+        .map(|r| &r.devices)
+        .chain(&target.known)
+        .max_by_key(|l| l.seq())
+        .cloned();
+    if let Some(list) = &newest {
+        found.retain(|r| list.is_current(&r.device));
+    }
+    if found.is_empty() {
+        return Err(ReachError::RevokedDevice);
+    }
+    found.sort_by_key(|r| (*r.device.as_bytes(), Reverse(r.created_at)));
+    found.dedup_by_key(|r| *r.device.as_bytes());
+    found.sort_by_key(|r| Reverse(r.created_at));
+    // A newer list than the one already known goes back to the keystore.
+    let newer = newest.filter(|l| target.known.as_ref().is_none_or(|k| l.seq() > k.seq()));
+    Ok((found, newer))
+}

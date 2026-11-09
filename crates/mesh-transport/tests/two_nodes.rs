@@ -338,3 +338,30 @@ async fn service_streams_reach_the_node() {
     assert!(frame::read_frame(&mut recv).await.is_err());
     a.ping(&addr).await.expect("still connected");
 }
+
+#[tokio::test]
+async fn only_allowed_identities_get_in() {
+    let (alice, bob, eve) = (Device::new(), Device::new(), Device::new());
+    let allowed = alice.id();
+    let config = Config {
+        relays: Relays::Disabled,
+        allow: mesh_transport::Allow::only(move |id| *id == allowed),
+        ..Config::default()
+    };
+    let b = Node::start(&bob.key, &bob.cert("desktop"), config)
+        .await
+        .unwrap();
+    let (a, e) = (alice.node("laptop").await, eve.node("pc").await);
+
+    let err = e.dial(&addr_of(&b)).await.unwrap_err();
+    assert!(
+        matches!(err, TransportError::Handshake(HandshakeError::NotAllowed)),
+        "{err:?}"
+    );
+    assert!(a.ping(&addr_of(&b)).await.is_ok());
+
+    // Dropping a peer closes its connection; the next ping has to reconnect.
+    b.disconnect(&alice.id());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(b.status().connections, 0);
+}

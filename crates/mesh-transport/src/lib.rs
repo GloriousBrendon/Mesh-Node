@@ -14,6 +14,7 @@ pub use iroh::RelayUrl;
 
 use mesh_identity::{DeviceKey, MeshId};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Where to reach one device (SPEC-transport D3): its key, the relay it's
 /// connected to, and any direct addresses. A relay alone is enough; direct
@@ -26,6 +27,16 @@ pub struct MeshAddr {
 }
 
 impl MeshAddr {
+    /// A device key and its relay, as an address record carries them
+    /// (SPEC-routing D3). `None` if either isn't valid.
+    pub fn from_parts(device: &[u8; 32], relay: &str) -> Option<Self> {
+        Some(Self {
+            device: iroh::PublicKey::from_bytes(device).ok()?,
+            relay: Some(relay.parse().ok()?),
+            direct: Vec::new(),
+        })
+    }
+
     fn endpoint_addr(&self) -> iroh::EndpointAddr {
         let mut addr = iroh::EndpointAddr::new(self.device);
         if let Some(relay) = &self.relay {
@@ -65,6 +76,8 @@ pub struct Config {
     /// Service tags this node answers besides `ping`; their streams come out
     /// of `Node::next_stream`.
     pub services: Vec<String>,
+    /// Whose devices may connect to this node; everyone by default.
+    pub allow: Allow,
     #[cfg(feature = "test-utils")]
     pub test: TestOptions,
 }
@@ -90,6 +103,33 @@ impl TestOptions {
             builder = builder.clear_ip_transports();
         }
         builder
+    }
+}
+
+/// Who may connect: checked in the handshake, before this node shows its
+/// certificate (SPEC-routing D9: only contacts and your own devices).
+#[derive(Clone, Default)]
+pub struct Allow(Option<Arc<AllowFn>>);
+
+type AllowFn = dyn Fn(&MeshId) -> bool + Send + Sync;
+
+impl Allow {
+    pub fn only(check: impl Fn(&MeshId) -> bool + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(check)))
+    }
+
+    pub fn allows(&self, id: &MeshId) -> bool {
+        self.0.as_ref().is_none_or(|check| check(id))
+    }
+}
+
+impl std::fmt::Debug for Allow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Allow(only)"
+        } else {
+            "Allow(anyone)"
+        })
     }
 }
 

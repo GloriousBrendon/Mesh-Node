@@ -161,7 +161,7 @@ struct Saved {
 
 /// Counts per key within a fixed window, reset when the window passes.
 #[derive(Default)]
-struct Window {
+pub(crate) struct Window {
     started: u64,
     counts: HashMap<Vec<u8>, u32>,
 }
@@ -169,7 +169,7 @@ struct Window {
 impl Window {
     /// Counts one for every key if each is still under its limit; otherwise
     /// counts nothing.
-    fn allow(&mut self, now: u64, length: u64, keys: &[(Vec<u8>, u32)]) -> bool {
+    pub(crate) fn allow(&mut self, now: u64, length: u64, keys: &[(Vec<u8>, u32)]) -> bool {
         if now >= self.started + length {
             self.started = now;
             self.counts.clear();

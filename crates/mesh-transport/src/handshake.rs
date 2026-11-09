@@ -21,16 +21,21 @@ pub enum HandshakeError {
     Timeout,
     #[error("the connection dropped during the handshake")]
     Dropped,
+    /// The listener only takes connections from people it chose (`Config::allow`).
+    #[error("that device doesn't take connections from this identity")]
+    NotAllowed,
 }
 
 impl HandshakeError {
     /// The close code that tells the other side why.
-    fn code(self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         match self {
             HandshakeError::BadCert => 1,
             HandshakeError::KeyMismatch => 2,
             HandshakeError::Timeout => 3,
             HandshakeError::Dropped => 4,
+            // 5 is the endpoint's "locked".
+            HandshakeError::NotAllowed => 6,
         }
     }
 
@@ -40,6 +45,7 @@ impl HandshakeError {
             2 => HandshakeError::KeyMismatch,
             3 => HandshakeError::Timeout,
             4 => HandshakeError::Dropped,
+            6 => HandshakeError::NotAllowed,
             _ => return None,
         })
     }
@@ -88,8 +94,12 @@ pub(crate) async fn dial(conn: &Connection, ours: &[u8]) -> Result<Peer, Handsha
 }
 
 /// The accepting side: check theirs before showing ours, so a peer that
-/// fails the check learns nothing about whose device this is.
-pub(crate) async fn accept(conn: &Connection, ours: &[u8]) -> Result<Peer, HandshakeError> {
+/// fails the check, or isn't allowed, learns nothing about whose device this is.
+pub(crate) async fn accept(
+    conn: &Connection,
+    ours: &[u8],
+    allow: &crate::Allow,
+) -> Result<Peer, HandshakeError> {
     let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| closed(&e))?;
     if frame::read_tag(&mut recv).await.ok().as_deref() != Some(HELLO) {
         return Err(HandshakeError::BadCert);
@@ -100,6 +110,9 @@ pub(crate) async fn accept(conn: &Connection, ours: &[u8]) -> Result<Peer, Hands
         .flatten()
         .ok_or(HandshakeError::BadCert)?;
     let peer = check_hello(&theirs, &conn.remote_id())?;
+    if !allow.allows(&peer.id) {
+        return Err(HandshakeError::NotAllowed);
+    }
     frame::write_frame(&mut send, ours)
         .await
         .map_err(|e| io(conn, e))?;

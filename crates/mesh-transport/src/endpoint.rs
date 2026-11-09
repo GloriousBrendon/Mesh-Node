@@ -9,7 +9,7 @@ use crate::{
 };
 use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, presets};
 use iroh::{Endpoint, RelayMap, RelayMode};
-use mesh_identity::{DeviceCert, DeviceKey};
+use mesh_identity::{DeviceCert, DeviceKey, MeshId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,7 @@ struct Shared {
     accepted: mpsc::Sender<Peer>,
     services: Vec<String>,
     streams: mpsc::Sender<ServiceStream>,
+    allow: crate::Allow,
 }
 
 impl Node {
@@ -96,6 +97,7 @@ impl Node {
             accepted: tx,
             services: config.services,
             streams: streams_tx,
+            allow: config.allow,
         });
         tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Self {
@@ -216,6 +218,16 @@ impl Node {
         self.accepted.lock().await.recv().await
     }
 
+    /// Closes every connection with `id`'s devices (they were removed).
+    pub fn disconnect(&self, id: &MeshId) {
+        lock(&self.shared.conns).retain(|_, (peer, conn)| {
+            if peer.id == *id {
+                conn.close(HandshakeError::NotAllowed.code().into(), b"not-allowed");
+            }
+            peer.id != *id
+        });
+    }
+
     /// Closes every connection, saying it's locked, then the endpoint.
     pub async fn close(&self) {
         for (_, (_, conn)) in lock(&self.shared.conns).drain() {
@@ -303,10 +315,12 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
         tokio::spawn(async move {
             let accepted = async {
                 let conn = incoming.await.ok()?;
-                let result =
-                    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake::accept(&conn, &shared.cert))
-                        .await
-                        .unwrap_or(Err(HandshakeError::Timeout));
+                let result = tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    handshake::accept(&conn, &shared.cert, &shared.allow),
+                )
+                .await
+                .unwrap_or(Err(HandshakeError::Timeout));
                 match result {
                     Ok(peer) => Some((peer, conn)),
                     Err(e) => {

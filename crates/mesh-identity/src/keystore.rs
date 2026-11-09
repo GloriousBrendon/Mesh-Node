@@ -698,7 +698,7 @@ impl Keystore {
         &mut self,
         id: &MeshId,
         last: LastAddr,
-        list: &DeviceList,
+        list: Option<&DeviceList>,
     ) -> Result<(), KeystoreError> {
         self.contact_mut(id)?.reached(last, list, unix_now());
         self.save()
@@ -1090,7 +1090,9 @@ mod tests {
             device: *device.public().as_bytes(),
             relay: "https://r/".into(),
         };
-        store.contact_reached(&other, last.clone(), &list).unwrap();
+        store
+            .contact_reached(&other, last.clone(), Some(&list))
+            .unwrap();
         assert!(store.pair_keys(&other).is_some());
 
         let mut store = {

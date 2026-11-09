@@ -66,8 +66,8 @@ impl Contact {
 
     /// Records a successful handshake through `last`, keeping `list` if it's
     /// newer.
-    pub(crate) fn reached(&mut self, last: LastAddr, list: &DeviceList, now: u64) {
-        if self.accepts(list) {
+    pub(crate) fn reached(&mut self, last: LastAddr, list: Option<&DeviceList>, now: u64) {
+        if let Some(list) = list.filter(|l| self.accepts(l)) {
             self.devices = Some(list.to_bytes());
         }
         self.seen = Some(now);

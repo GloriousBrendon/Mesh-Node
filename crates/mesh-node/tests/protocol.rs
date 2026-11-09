@@ -179,7 +179,12 @@ fn two_helpers_ping_through_a_relay() {
     assert_eq!(online["relay"].as_str(), Some(&*format!("{}/", relay.url)));
     let mut keys: Vec<_> = online.as_object().unwrap().keys().collect();
     keys.sort();
-    assert_eq!(keys, ["connections", "direct", "relay", "state"]);
+    assert_eq!(
+        keys,
+        ["connections", "direct", "published", "relay", "state"]
+    );
+
+    // Only contacts get in (SPEC-routing D9): a stranger's ping is refused.
 
     let ticket_a = a.expect("netTicket", &[], "meshTicket")["ticket"]
         .as_str()
@@ -190,6 +195,13 @@ fn two_helpers_ping_through_a_relay() {
         .unwrap()
         .to_owned();
     assert!(ticket_a.starts_with("mesh://node/"), "{ticket_a}");
+
+    let refused = b.expect("netPing", &[&ticket_a], "meshError");
+    assert_eq!(refused["kind"], "unreachable");
+    let (sa, sb) = (id_a.as_str().unwrap(), id_b.as_str().unwrap());
+    let contacts = a.expect("contactAdd", &[sb, "Bob"], "meshContacts");
+    assert_eq!(contacts["contacts"][0]["name"], "Bob");
+    b.expect("contactAdd", &[sa, "Alice"], "meshContacts");
 
     let pong = b.expect("netPing", &[&ticket_a], "meshPing");
     assert_eq!(pong["id"], id_a);
