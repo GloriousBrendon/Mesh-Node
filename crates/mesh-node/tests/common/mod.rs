@@ -5,6 +5,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -142,4 +144,75 @@ pub fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("mesh-node-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// A `mesh-node seed` process on the test relay.
+pub struct Seed {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    log: Vec<String>,
+}
+
+impl Seed {
+    pub fn start(dir: &Path, relay: &Relay) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-node"))
+            .args(["seed", "--data"])
+            .arg(dir)
+            .args(["--relay", &relay.url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            stderr
+                .lines()
+                .map_while(Result::ok)
+                .for_each(|l| drop(tx.send(l)))
+        });
+        Self {
+            child,
+            lines,
+            log: Vec::new(),
+        }
+    }
+
+    /// Waits for the ticket the seed logs once it's online.
+    pub fn ticket(&mut self) -> String {
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the seed went quiet");
+            self.log.push(line.clone());
+            if let Some(ticket) = line.strip_prefix("mesh-node seed: ticket ") {
+                return ticket.to_owned();
+            }
+        }
+    }
+
+    /// SIGTERM, as Docker and systemd stop it; returns the whole log.
+    pub fn stop(mut self) -> Vec<String> {
+        let pid = self.child.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(self.child.wait().unwrap().success(), "exits cleanly");
+        self.log.extend(self.lines.try_iter());
+        std::mem::take(&mut self.log)
+    }
+}
+
+/// A failing test mustn't leave a seed running: it doesn't exit with us.
+impl Drop for Seed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
