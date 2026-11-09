@@ -18,6 +18,10 @@
 //! The magic is `MKS1` for a keystore and `MKB1` for a backup. A backup holds
 //! the username, the root key and the device list, but no device key: each
 //! install needs its own, so a restored device makes a new one.
+//!
+//! Contacts (routing) follow the contents as a second postcard value, only
+//! when there are any: a file without them is exactly the earlier format,
+//! and postcard ignores what follows a value, so older Mesh still opens it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -30,9 +34,11 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::code::{ActiveCode, CodeError, CodeRevoke, FriendCode, HeldCode};
+use crate::contacts::{Contact, LastAddr, MAX_CONTACTS, clean_name};
 use crate::device::{DeviceCert, DeviceList};
 use crate::id::{DeviceKey, MeshId, RootKey};
 use crate::link::{LinkError, LinkedIdentity};
+use crate::pair::PairKeys;
 use crate::password::{PasswordVerdict, check_password, normalize_username, valid_username};
 
 const KEYSTORE_MAGIC: &[u8; 4] = b"MKS1";
@@ -106,6 +112,16 @@ pub enum KeystoreError {
     Code(#[from] CodeError),
     #[error("{0}")]
     Link(#[from] LinkError),
+    #[error("that's your own ID")]
+    OwnId,
+    #[error("that ID is already a contact")]
+    AlreadyContact,
+    #[error("that ID isn't a contact")]
+    NotAContact,
+    #[error("a contact name is 1 to 64 characters")]
+    BadContactName,
+    #[error("you can have at most {MAX_CONTACTS} contacts")]
+    TooManyContacts,
     #[error("couldn't use the system keyring: {0}")]
     Keyring(String),
     #[error("couldn't get randomness from the system: {0}")]
@@ -284,6 +300,7 @@ pub struct Keystore {
     device: DeviceKey,
     devices: DeviceList,
     codes: Vec<ActiveCode>,
+    contacts: Vec<Contact>,
 }
 
 impl Keystore {
@@ -345,6 +362,7 @@ impl Keystore {
             device,
             devices,
             codes: Vec::new(),
+            contacts: Vec::new(),
         };
         store.save()?;
         Ok(store)
@@ -370,8 +388,7 @@ impl Keystore {
     }
 
     fn decode(path: &Path, sealed: Sealed, plain: &[u8]) -> Result<Self, KeystoreError> {
-        let contents: Contents =
-            postcard::from_bytes(plain).map_err(|_| KeystoreError::CannotUnlock)?;
+        let (contents, contacts) = decode_with_contacts::<Contents>(plain)?;
         let root = RootKey::from_secret_bytes(contents.root_secret);
         let devices = DeviceList::from_bytes(&contents.device_list)
             .map_err(|_| KeystoreError::CannotUnlock)?;
@@ -386,6 +403,7 @@ impl Keystore {
             device: DeviceKey::from_secret_bytes(contents.device_secret),
             devices,
             codes: contents.codes.clone(),
+            contacts,
         })
     }
 
@@ -434,9 +452,7 @@ impl Keystore {
             root_secret: *self.root.secret_bytes(),
             device_list: self.devices.to_bytes(),
         };
-        let plain = Zeroizing::new(
-            postcard::to_allocvec(&contents).map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
+        let plain = encode_with_contacts(&contents, &self.contacts)?;
         Sealed::new(BACKUP_MAGIC, params, &self.username, password)?.save(path, &plain)
     }
 
@@ -478,8 +494,7 @@ impl Keystore {
                 password: backup_password,
             },
         )?;
-        let contents: BackupContents =
-            postcard::from_bytes(&plain).map_err(|_| KeystoreError::CannotUnlock)?;
+        let (contents, contacts) = decode_with_contacts::<BackupContents>(&plain)?;
         let root = RootKey::from_secret_bytes(contents.root_secret);
         let backed_up = DeviceList::from_bytes(&contents.device_list)
             .map_err(|_| KeystoreError::CannotUnlock)?;
@@ -490,7 +505,7 @@ impl Keystore {
         let cert = DeviceCert::issue(&root, &device.public(), device_name, unix_now())?;
         let devices = backed_up.with_device(&root, cert)?;
         // The username as typed at onboarding, not as typed now.
-        Self::save_new(
+        let mut store = Self::save_new(
             path,
             &contents.username,
             new_password,
@@ -498,7 +513,12 @@ impl Keystore {
             root,
             device,
             devices,
-        )
+        )?;
+        if !contacts.is_empty() {
+            store.contacts = contacts;
+            store.save()?;
+        }
+        Ok(store)
     }
 
     /// Saves an identity received by linking as this device's keystore.
@@ -627,11 +647,103 @@ impl Keystore {
             device_list: self.devices.to_bytes(),
             codes: self.codes.clone(),
         };
-        let plain = Zeroizing::new(
-            postcard::to_allocvec(&contents).map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
+        let plain = encode_with_contacts(&contents, &self.contacts)?;
         self.sealed.save(&self.path, &plain)
     }
+
+    pub fn contacts(&self) -> &[Contact] {
+        &self.contacts
+    }
+
+    pub fn contact(&self, id: &MeshId) -> Option<&Contact> {
+        self.contacts.iter().find(|c| c.id() == *id)
+    }
+
+    pub fn add_contact(&mut self, id: MeshId, name: &str) -> Result<(), KeystoreError> {
+        if id == self.id() {
+            return Err(KeystoreError::OwnId);
+        }
+        if self.contact(&id).is_some() {
+            return Err(KeystoreError::AlreadyContact);
+        }
+        if self.contacts.len() >= MAX_CONTACTS {
+            return Err(KeystoreError::TooManyContacts);
+        }
+        let name = clean_name(name).ok_or(KeystoreError::BadContactName)?;
+        // A weak key could never be reached; refuse it up front.
+        PairKeys::new(&self.root, &id).ok_or(KeystoreError::BadContactName)?;
+        self.contacts.push(Contact::new(id, name, unix_now()));
+        self.save()
+    }
+
+    pub fn remove_contact(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
+        let before = self.contacts.len();
+        self.contacts.retain(|c| c.id() != *id);
+        if self.contacts.len() == before {
+            return Err(KeystoreError::NotAContact);
+        }
+        self.save()
+    }
+
+    pub fn rename_contact(&mut self, id: &MeshId, name: &str) -> Result<(), KeystoreError> {
+        let name = clean_name(name).ok_or(KeystoreError::BadContactName)?;
+        let contact = self.contact_mut(id)?;
+        contact.name = name;
+        self.save()
+    }
+
+    /// A handshake with `id`'s device worked through `last`: cache it, and
+    /// keep `list` if it's their newest.
+    pub fn contact_reached(
+        &mut self,
+        id: &MeshId,
+        last: LastAddr,
+        list: &DeviceList,
+    ) -> Result<(), KeystoreError> {
+        self.contact_mut(id)?.reached(last, list, unix_now());
+        self.save()
+    }
+
+    /// The keys this identity shares with `id` (routing's pair keys).
+    pub fn pair_keys(&self, id: &MeshId) -> Option<PairKeys> {
+        PairKeys::new(&self.root, id)
+    }
+
+    fn contact_mut(&mut self, id: &MeshId) -> Result<&mut Contact, KeystoreError> {
+        self.contacts
+            .iter_mut()
+            .find(|c| c.id() == *id)
+            .ok_or(KeystoreError::NotAContact)
+    }
+}
+
+/// `value`, then the contacts if there are any (see the module docs).
+fn encode_with_contacts<T: Serialize>(
+    value: &T,
+    contacts: &[Contact],
+) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
+    let to_io = |e: postcard::Error| std::io::Error::other(e.to_string());
+    let mut plain = Zeroizing::new(postcard::to_allocvec(value).map_err(to_io)?);
+    if !contacts.is_empty() {
+        plain.extend_from_slice(&postcard::to_allocvec(contacts).map_err(to_io)?);
+    }
+    Ok(plain)
+}
+
+fn decode_with_contacts<T: serde::de::DeserializeOwned>(
+    plain: &[u8],
+) -> Result<(T, Vec<Contact>), KeystoreError> {
+    let (value, rest) =
+        postcard::take_from_bytes::<T>(plain).map_err(|_| KeystoreError::CannotUnlock)?;
+    let contacts: Vec<Contact> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        postcard::from_bytes(rest).map_err(|_| KeystoreError::CannotUnlock)?
+    };
+    if !contacts.iter().all(Contact::valid) {
+        return Err(KeystoreError::CannotUnlock);
+    }
+    Ok((value, contacts))
 }
 
 /// Argon2id over `normalize(username) || 0 || password`.
@@ -942,6 +1054,82 @@ mod tests {
         )));
         drop(restored);
         assert!(Keystore::unlock(&laptop, "Brendon", PASSWORD).is_ok());
+    }
+
+    #[test]
+    fn contacts_are_kept_changed_and_backed_up() {
+        let path = temp_path("contacts");
+        let mut store = create(&path);
+        // No contacts: the file is the earlier format, byte for byte.
+        let before = fs::read(&path).unwrap();
+        assert!(before.len() < HEADER_LEN + 400);
+
+        let friend = RootKey::generate().unwrap().id();
+        assert!(matches!(
+            store.add_contact(store.id(), "me"),
+            Err(KeystoreError::OwnId)
+        ));
+        assert!(matches!(
+            store.add_contact(friend, "  "),
+            Err(KeystoreError::BadContactName)
+        ));
+        store.add_contact(friend, " Alex ").unwrap();
+        assert!(matches!(
+            store.add_contact(friend, "Alex"),
+            Err(KeystoreError::AlreadyContact)
+        ));
+        store.rename_contact(&friend, "Alex P").unwrap();
+
+        let device = DeviceKey::generate().unwrap();
+        let friend_root = RootKey::generate().unwrap();
+        let cert = DeviceCert::issue(&friend_root, &device.public(), "pc", 1).unwrap();
+        let list = DeviceList::first(&friend_root, cert).unwrap();
+        let other = friend_root.id();
+        store.add_contact(other, "Sam").unwrap();
+        let last = LastAddr {
+            device: *device.public().as_bytes(),
+            relay: "https://r/".into(),
+        };
+        store.contact_reached(&other, last.clone(), &list).unwrap();
+        assert!(store.pair_keys(&other).is_some());
+
+        let mut store = {
+            drop(store);
+            Keystore::unlock(&path, "Brendon", PASSWORD).unwrap()
+        };
+        assert_eq!(store.contacts().len(), 2);
+        assert_eq!(store.contact(&friend).unwrap().name, "Alex P");
+        let sam = store.contact(&other).unwrap();
+        assert_eq!(sam.last.as_ref(), Some(&last));
+        assert!(sam.seen.is_some());
+        assert_eq!(sam.devices().unwrap().seq(), 1);
+
+        store
+            .change_password("Brendon", PASSWORD, OTHER_PASSWORD)
+            .unwrap();
+        let backup = path.with_file_name("backup.mkb");
+        store.export_with(&backup, OTHER_PASSWORD, FAST).unwrap();
+        let laptop = path.with_file_name("laptop.mks");
+        let restored = Keystore::import_with(
+            &backup,
+            &laptop,
+            "Brendon",
+            OTHER_PASSWORD,
+            PASSWORD,
+            "Laptop",
+            FAST,
+        )
+        .unwrap();
+        assert_eq!(restored.contacts(), store.contacts());
+
+        store.remove_contact(&friend).unwrap();
+        assert!(matches!(
+            store.remove_contact(&friend),
+            Err(KeystoreError::NotAContact)
+        ));
+        drop(store);
+        let store = Keystore::unlock(&path, "Brendon", OTHER_PASSWORD).unwrap();
+        assert_eq!(store.contacts().len(), 1);
     }
 
     #[test]

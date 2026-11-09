@@ -3,25 +3,33 @@
 //! safety numbers and device linking. See `design/mesh/SPEC-identity.md` in
 //! Mesh-Voice. No networking here.
 
+mod addr;
 mod code;
+mod contacts;
 mod device;
 mod id;
 mod keystore;
 mod link;
+mod pair;
 mod password;
 mod remember;
 mod safety;
 
+pub use addr::{
+    AddrError, AddrRecord, MAX_RECORD_LEN, MAX_RELAY_LEN, addr_outer, open_addr, seal_addr,
+};
 pub use code::{
     ActiveCode, CodeError, CodeRecord, CodeRevoke, DEFAULT_EXPIRY, DEFAULT_USES, EXPIRY_CHOICES,
     FriendCode, HeldCode, USE_CHOICES,
 };
+pub use contacts::{Contact, LastAddr, MAX_CONTACT_NAME, MAX_CONTACTS};
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
 pub use id::{DeviceKey, IdError, Link, MeshId, RootKey};
 pub use keystore::{KdfParams, Keystore, KeystoreError};
 pub use link::{
     LINK_CODE_LIFETIME, LinkError, LinkInitiator, LinkResponder, LinkedIdentity, PendingDevice,
 };
+pub use pair::{PairKeys, day_of};
 pub use password::{
     MAX_USERNAME_LEN, MIN_PASSWORD_LEN, PasswordVerdict, check_password, normalize_username,
     valid_username,

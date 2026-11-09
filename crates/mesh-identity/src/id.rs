@@ -66,6 +66,13 @@ impl RootKey {
     pub fn sign(&self, domain: &str, body: &[u8]) -> Signature {
         self.0.sign(&signed_bytes(domain, body))
     }
+
+    /// X25519 between this root key and `their` ID (routing's pair secret).
+    /// `None` for a weak key, whose result would be predictable.
+    pub(crate) fn diffie_hellman(&self, their: &MeshId) -> Option<Zeroizing<[u8; 32]>> {
+        let shared = Zeroizing::new((their.0.to_montgomery() * self.0.to_scalar()).to_bytes());
+        (*shared != [0; 32]).then_some(shared)
+    }
 }
 
 impl DeviceKey {
@@ -86,6 +93,23 @@ impl DeviceKey {
     pub fn public(&self) -> VerifyingKey {
         self.0.verifying_key()
     }
+
+    /// Signs `body` under a domain string, as [`RootKey::sign`].
+    pub fn sign(&self, domain: &str, body: &[u8]) -> Signature {
+        self.0.sign(&signed_bytes(domain, body))
+    }
+}
+
+/// Whether `signature` is `device` signing `body` under `domain` (strict).
+pub(crate) fn verify_device(
+    device: &VerifyingKey,
+    domain: &str,
+    body: &[u8],
+    signature: &Signature,
+) -> bool {
+    device
+        .verify_strict(&signed_bytes(domain, body), signature)
+        .is_ok()
 }
 
 fn random_signing_key() -> Result<SigningKey, getrandom::Error> {
