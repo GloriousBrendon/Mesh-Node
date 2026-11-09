@@ -4,7 +4,8 @@
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
 //! `--relay <url>` (repeatable) replaces n0's public relays; `--seed
 //! <ticket>` (repeatable) the built-in seeds. `--record-ttl <secs>` shortens
-//! how long address records last, for tests.
+//! how long address records last, for tests. Without `--seed`, the
+//! `MESH_SEEDS` environment variable (space-separated tickets) is used.
 //!
 //! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed).
 
@@ -52,6 +53,12 @@ fn main() {
         .filter(|w| w[0] == "--seed")
         .map(|w| w[1].as_str())
         .collect();
+    // `MESH_SEEDS` (space-separated tickets) reaches the helper through
+    // Mesh-Voice, which passes no flags: for trying a local seed by hand.
+    let from_env = std::env::var("MESH_SEEDS").unwrap_or_default();
+    if seeds.is_empty() {
+        seeds = from_env.split_whitespace().collect();
+    }
     if seeds.is_empty() {
         seeds = helper::SEEDS.to_vec();
     }
