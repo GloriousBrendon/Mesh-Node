@@ -199,9 +199,9 @@ fn two_helpers_ping_through_a_relay() {
     let refused = b.expect("netPing", &[&ticket_a], "meshError");
     assert_eq!(refused["kind"], "unreachable");
     let (sa, sb) = (id_a.as_str().unwrap(), id_b.as_str().unwrap());
-    let contacts = a.expect("contactAdd", &[sb, "Bob"], "meshContacts");
-    assert_eq!(contacts["contacts"][0]["name"], "Bob");
-    b.expect("contactAdd", &[sa, "Alice"], "meshContacts");
+    let social = a.expect("friendAdd", &[sb, "Bob"], "meshSocial");
+    assert_eq!(social["outgoing"][0]["nick"], "Bob");
+    b.expect("friendAdd", &[sa, "Alice"], "meshSocial");
 
     let pong = b.expect("netPing", &[&ticket_a], "meshPing");
     assert_eq!(pong["id"], id_a);

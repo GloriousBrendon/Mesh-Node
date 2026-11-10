@@ -42,6 +42,9 @@ pub struct Helper {
     /// The latest `meshNet`: it comes whenever the node's state changes, so
     /// `event` sets it aside.
     pub net: Option<Value>,
+    /// The latest `meshSocial` that answered no command (something changed
+    /// by itself), set aside the same way.
+    pub social: Option<Value>,
 }
 
 impl Helper {
@@ -67,6 +70,7 @@ impl Helper {
             stdin,
             stdout,
             net: None,
+            social: None,
         }
     }
 
@@ -82,12 +86,31 @@ impl Helper {
         (frame["binding"].as_str().unwrap().to_owned(), payload)
     }
 
-    /// The next event other than `meshNet`.
+    /// The next event other than `meshNet` or a `meshSocial` nobody asked for.
     pub fn event(&mut self) -> (String, Value) {
         loop {
             match self.line() {
                 (binding, payload) if binding == "meshNet" => self.net = Some(payload),
+                (binding, payload) if binding == "meshSocial" && payload["fn"].is_null() => {
+                    self.social = Some(payload)
+                }
                 event => return event,
+            }
+        }
+    }
+
+    /// Waits for a `meshSocial` that satisfies `done`; it may already have
+    /// come. Codes lists that come meanwhile are skipped.
+    pub fn social_until(&mut self, done: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            if let Some(social) = self.social.as_ref().filter(|s| done(s)) {
+                return social.clone();
+            }
+            match self.line() {
+                (binding, payload) if binding == "meshSocial" => self.social = Some(payload),
+                (binding, payload) if binding == "meshNet" => self.net = Some(payload),
+                (binding, _) if binding == "meshCodes" => {}
+                (binding, payload) => panic!("unexpected {binding} {payload}"),
             }
         }
     }
@@ -98,9 +121,13 @@ impl Helper {
             if let Some(net) = self.net.as_ref().filter(|n| done(n)) {
                 return net.clone();
             }
-            let (binding, payload) = self.line();
-            assert_eq!(binding, "meshNet", "unexpected {payload}");
-            self.net = Some(payload);
+            match self.line() {
+                (binding, payload) if binding == "meshNet" => self.net = Some(payload),
+                (binding, payload) if binding == "meshSocial" && payload["fn"].is_null() => {
+                    self.social = Some(payload)
+                }
+                (binding, payload) => panic!("unexpected {binding} {payload}"),
+            }
         }
     }
 
@@ -119,8 +146,13 @@ impl Helper {
     }
 
     /// Sends a command that must answer with `binding`.
+    /// A `meshCodes` from a background seed answer may come first; it's
+    /// skipped unless that's what's expected.
     pub fn expect(&mut self, func: &str, args: &[&str], binding: &str) -> Value {
-        let (got, payload) = self.call(func, args);
+        let (mut got, mut payload) = self.call(func, args);
+        while got == "meshCodes" && binding != "meshCodes" {
+            (got, payload) = self.event();
+        }
         assert_eq!(got, binding, "{func} answered {payload}");
         payload
     }

@@ -11,6 +11,10 @@
 //! to the seeds from the same throwaway node, and only contacts and our own
 //! devices may connect to us (D9).
 //!
+//! Social (SPEC-social): friend requests go through a live friend code and
+//! wait on the seeds until the code's owner collects them; a connection with
+//! someone you've added means they added you too, so you're friends.
+//!
 //! Commands are never logged or echoed: passwords travel in them. Each
 //! command answers with one event; a failure is a `meshError` with a stable
 //! `kind` the UI switches on, the `fn` it answers, and a message to show.
@@ -25,11 +29,12 @@ use std::time::Duration;
 
 use crate::codes::{Get, Hold};
 use crate::routing::{self, ReachError, Reached, Target};
-use crate::seed;
+use crate::{knocks, seed};
 use mesh_identity::{
     CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey, DeviceList, FriendCode,
-    HeldCode, IdError, Keystore, KeystoreError, LastAddr, Link, MAX_DEVICE_NAME, MeshId, RootKey,
-    SafetyNumber, check_password, is_kept, keyring_status,
+    HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr, Link, MAX_DEVICE_NAME,
+    MAX_NOTE, MeshId, RootKey, SafetyNumber, check_password, is_kept, keyring_status, open_knock,
+    seal_knock,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -46,6 +51,8 @@ const NET_POLL: Duration = Duration::from_secs(1);
 const HOLD_RETRY: Duration = Duration::from_secs(600);
 /// A failed publish is tried again after this, doubling up to the refresh.
 const PUBLISH_RETRY: Duration = Duration::from_secs(60);
+/// How often friend requests left with our codes are collected (D7).
+const COLLECT_EVERY: Duration = Duration::from_secs(300);
 /// Seeds every install knows (SPEC-seed D6); `--seed` replaces them.
 // ponytail: empty until the homelab seed runs (seed Task 7).
 pub const SEEDS: &[&str] = &[];
@@ -157,6 +164,8 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
         routing::REFRESH_EVERY.min(record_ttl / 4).max(1),
     ));
     refresh.tick().await;
+    let mut collect = tokio::time::interval(COLLECT_EVERY);
+    collect.tick().await;
     loop {
         let mut line = tokio::select! {
             line = lines.recv() => match line {
@@ -173,6 +182,11 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             }
             _ = refresh.tick() => {
                 helper.publish();
+                helper.dial_contacts();
+                continue;
+            }
+            _ = collect.tick() => {
+                helper.collect();
                 continue;
             }
         };
@@ -227,6 +241,8 @@ struct Net {
     anon: Arc<Node>,
     /// Reports the node's state as it changes.
     watch: tokio::task::JoinHandle<()>,
+    /// Reports who connected to us.
+    peers: tokio::task::JoinHandle<()>,
     /// Every contact's record is on a seed (`meshNet`'s `published`).
     published: Arc<AtomicBool>,
 }
@@ -240,7 +256,27 @@ enum Back {
     Published(bool),
     Republish,
     /// A contact answered through this address.
-    Reached(Box<(MeshId, LastAddr, Option<DeviceList>)>),
+    Reached(Box<(MeshId, Option<LastAddr>, Option<DeviceList>)>),
+    /// Someone's device connected to us and passed the handshake.
+    Connected(MeshId),
+    /// A friend code resolved to its owner and lookup ID, for a request with
+    /// this note.
+    Resolved(Box<(MeshId, [u8; 16], String)>),
+    /// A seed took our request to them.
+    Requested(MeshId),
+    /// What the seeds hold for our codes.
+    Collected(Vec<Collected>),
+}
+
+/// One code's requests, from every seed that answered.
+struct Collected {
+    code: FriendCode,
+    lookup_id: [u8; 16],
+    /// A seed says the code is still live.
+    live: bool,
+    /// A seed knows the code and says it's gone.
+    gone: bool,
+    knocks: Vec<Vec<u8>>,
 }
 
 impl Helper {
@@ -378,27 +414,89 @@ impl Helper {
                 }
             }
             "codeResolve" => {
-                // A typed `K7QM-3XPA`, or a pasted `mesh://code/…` link.
-                let text = arg(0)?.trim();
-                let code = if text
-                    .get(..7)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("mesh://"))
-                {
-                    let Link::Code(code) = Link::parse(text)? else {
-                        return Err(Fail(
-                            "not-a-code",
-                            "that's an ID, not a friend code".to_owned(),
-                        ));
-                    };
-                    code
-                } else {
-                    FriendCode::parse(text)?
-                };
-                let anon = self.node().and(self.anon())?;
-                if self.seeds.is_empty() {
-                    return Err(Fail("offline", "no seed to ask".to_owned()));
+                let code = parse_code(arg(0)?)?;
+                let (anon, seeds) = self.seed_node()?;
+                tokio::spawn(async move {
+                    match find_code(&anon, &seeds, code).await {
+                        Ok((id, _)) => emit(
+                            "meshResolved",
+                            json!({ "code": code.to_string(), "id": id.to_string(), "link": id.link() }),
+                        ),
+                        Err((kind, message)) => emit_fail("codeResolve", kind, message),
+                    }
+                });
+            }
+            "friendRequest" => {
+                let code = parse_code(arg(0)?)?;
+                let note = arg(1).unwrap_or("").trim().to_owned();
+                if note.len() > MAX_NOTE {
+                    return Err(Fail(
+                        "bad-note",
+                        format!("a note is at most {MAX_NOTE} bytes"),
+                    ));
                 }
-                tokio::spawn(resolve(anon, self.seeds.clone(), code));
+                let (anon, seeds) = self.seed_node()?;
+                let back = self.back.clone();
+                tokio::spawn(async move {
+                    match find_code(&anon, &seeds, code).await {
+                        Ok((id, lookup_id)) => {
+                            let _ = back.send(Back::Resolved(Box::new((id, lookup_id, note))));
+                        }
+                        Err((kind, message)) => emit_fail("friendRequest", kind, message),
+                    }
+                });
+            }
+            "friendAdd" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.add_contact(id, arg(1).unwrap_or(""))?;
+                self.contacts_changed();
+                self.dial(&id);
+                self.emit_social(Some(func));
+            }
+            "friendAccept" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.accept(&id)?;
+                self.contacts_changed();
+                // Their device lets us in (they asked), so this connection
+                // makes us friends on their side too (D8, D9).
+                self.dial(&id);
+                self.emit_social(Some(func));
+            }
+            "friendDecline" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.decline(&id)?;
+                self.emit_social(Some(func));
+            }
+            "friendCancel" | "friendRemove" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.remove_contact(&id)?;
+                self.cut_off(&id);
+                self.emit_social(Some(func));
+            }
+            "friendRename" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.rename_contact(&id, arg(1)?)?;
+                self.emit_social(Some(func));
+            }
+            "friendVerify" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.verify(&id, arg(1)? == "true")?;
+                self.emit_social(Some(func));
+            }
+            "block" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.block(&id)?;
+                self.cut_off(&id);
+                self.emit_social(Some(func));
+            }
+            "unblock" => {
+                let id = parse_id(arg(0)?)?;
+                self.unlocked()?.unblock(&id)?;
+                self.emit_social(Some(func));
+            }
+            "socialList" => {
+                self.unlocked()?;
+                self.emit_social(Some(func));
             }
             "codeList" => {
                 self.unlocked()?;
@@ -432,36 +530,10 @@ impl Helper {
                 };
                 emit("meshParsed", parsed);
             }
-            "contactAdd" => {
-                let id = parse_id(arg(0)?)?;
-                self.unlocked()?.add_contact(id, arg(1)?)?;
-                self.allow_contacts();
-                self.emit_contacts();
-                self.publish();
-            }
-            "contactRemove" => {
-                let id = parse_id(arg(0)?)?;
-                self.unlocked()?.remove_contact(&id)?;
-                self.allow_contacts();
-                if let Some(net) = &self.net {
-                    net.node.disconnect(&id);
-                }
-                // Their records aren't refreshed again, so they lapse (D4).
-                self.emit_contacts();
-            }
-            "contactRename" => {
-                let id = parse_id(arg(0)?)?;
-                self.unlocked()?.rename_contact(&id, arg(1)?)?;
-                self.emit_contacts();
-            }
-            "contactList" => {
-                self.unlocked()?;
-                self.emit_contacts();
-            }
             "netPingId" => {
                 let id = parse_id(arg(0)?)?;
                 let target = Target::of(self.unlocked()?, &id).ok_or_else(|| {
-                    Fail("not-a-contact", "add them as a contact first".to_owned())
+                    Fail("not-a-contact", "add them as a friend first".to_owned())
                 })?;
                 let (node, anon) = (self.node()?, self.anon()?);
                 if !node.status().online {
@@ -508,9 +580,13 @@ impl Helper {
                     return Err(Fail("offline", "not connected to a relay yet".to_owned()));
                 }
                 // Up to 20 s: answered when done, while other commands carry on.
+                let back = self.back.clone();
                 tokio::spawn(async move {
                     match node.ping(&addr).await {
-                        Ok(pong) => emit_pong(&pong),
+                        Ok(pong) => {
+                            emit_pong(&pong);
+                            let _ = back.send(Back::Connected(pong.peer.id));
+                        }
                         Err(e) => {
                             let Fail(kind, message) = ping_fail(e);
                             emit(
@@ -551,6 +627,163 @@ impl Helper {
             .ok_or_else(|| Fail("offline", "networking didn't start".to_owned()))
     }
 
+    /// The throwaway node and the seeds, for a request to them.
+    fn seed_node(&mut self) -> Result<(Arc<Node>, Arc<Vec<MeshAddr>>), Fail> {
+        let anon = self.node().and(self.anon())?;
+        if self.seeds.is_empty() {
+            return Err(Fail("offline", "no seed to ask".to_owned()));
+        }
+        Ok((anon, self.seeds.clone()))
+    }
+
+    /// The contacts changed: let in exactly them, and leave records for them.
+    fn contacts_changed(&self) {
+        self.allow_contacts();
+        self.publish();
+    }
+
+    /// They're no longer let in; their records lapse (routing D4).
+    fn cut_off(&self, id: &MeshId) {
+        self.allow_contacts();
+        if let Some(net) = &self.net {
+            net.node.disconnect(id);
+        }
+    }
+
+    /// Tries every friend and `outgoing` contact in the background (D12): a
+    /// connection with one we asked makes them a friend.
+    fn dial_contacts(&self) {
+        let Some(store) = &self.store else { return };
+        for contact in store.contacts() {
+            self.dial(&contact.id());
+        }
+    }
+
+    fn dial(&self, id: &MeshId) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        let Some(target) = Target::of(store, id) else {
+            return;
+        };
+        let (node, anon) = (net.node.clone(), net.anon.clone());
+        let (seeds, back, id) = (self.seeds.clone(), self.back.clone(), *id);
+        tokio::spawn(async move {
+            if let Ok(Reached { last, list, .. }) =
+                routing::reach(node, &anon, &seeds, target, unix_now()).await
+            {
+                let _ = back.send(Back::Reached(Box::new((id, last, list))));
+            }
+        });
+    }
+
+    /// Collects the friend requests left with our codes, in the background.
+    fn collect(&self) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        if self.seeds.is_empty() || store.collect_codes().is_empty() {
+            return;
+        }
+        let codes: Vec<_> = store
+            .collect_codes()
+            .iter()
+            .map(|c| (c.code, store.code_revoke(&c.code)))
+            .collect();
+        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        tokio::spawn(async move {
+            let requests: Vec<Vec<u8>> = codes.iter().map(|(_, r)| r.to_bytes().to_vec()).collect();
+            let mut found: Vec<Collected> = codes
+                .iter()
+                .map(|(code, revoke)| Collected {
+                    code: *code,
+                    lookup_id: revoke.lookup_id(),
+                    live: false,
+                    gone: false,
+                    knocks: Vec::new(),
+                })
+                .collect();
+            for addr in seeds.iter() {
+                let Ok(answers) = seed::ask_many(&anon, addr, seed::KNOCK_GET, &requests).await
+                else {
+                    continue;
+                };
+                for (got, answer) in found.iter_mut().zip(answers) {
+                    if let Some(knocks::Get::Found { live, knocks }) =
+                        knocks::Get::from_bytes(&answer)
+                    {
+                        got.live |= live;
+                        got.gone |= !live;
+                        got.knocks.extend(knocks);
+                    }
+                }
+            }
+            let _ = back.send(Back::Collected(found));
+        });
+    }
+
+    /// Seals our request to the owner of a code we resolved, and puts it on
+    /// every seed.
+    fn request(&mut self, id: MeshId, lookup_id: [u8; 16], note: &str) -> Result<(), Fail> {
+        let store = self.unlocked()?;
+        if id == store.id() {
+            return Err(Fail("self", "that's your own code".to_owned()));
+        }
+        match store.account().kind(&id) {
+            Some(Kind::Blocked) => {
+                return Err(Fail(
+                    "blocked",
+                    "you've blocked them; unblock them first".to_owned(),
+                ));
+            }
+            Some(Kind::Friend) => {
+                return Err(Fail("already-friend", "you're already friends".to_owned()));
+            }
+            _ => {}
+        }
+        let from = KnockFrom {
+            root: store.root_key(),
+            device: store.device_key(),
+            devices: store.devices(),
+            name: store.username(),
+        };
+        let knock = seal_knock(&from, &id, &lookup_id, note, unix_now())
+            .map_err(|e| Fail("bad-request", e.to_string()))?;
+        let (anon, seeds) = self.seed_node()?;
+        let back = self.back.clone();
+        tokio::spawn(async move {
+            let mut best = None;
+            for addr in seeds.iter() {
+                let answer =
+                    seed::ask_many(&anon, addr, seed::KNOCK_PUT, std::slice::from_ref(&knock))
+                        .await
+                        .ok()
+                        .and_then(|a| knocks::Put::from_byte(*a.first()?.first()?));
+                best = match (best, answer) {
+                    (_, Some(knocks::Put::Ok)) | (Some(knocks::Put::Ok), _) => {
+                        Some(knocks::Put::Ok)
+                    }
+                    (best, answer) => answer.or(best),
+                };
+            }
+            match best {
+                Some(knocks::Put::Ok) => drop(back.send(Back::Requested(id))),
+                Some(knocks::Put::Gone) => emit_fail(
+                    "friendRequest",
+                    "not-found",
+                    "no such code: it may have expired, been used or been revoked",
+                ),
+                Some(knocks::Put::SlowDown) => emit_fail(
+                    "friendRequest",
+                    "slow-down",
+                    "too many requests; wait a while",
+                ),
+                _ => emit_fail("friendRequest", "offline", "couldn't reach a seed"),
+            }
+        });
+        Ok(())
+    }
+
     /// Offers this device's codes to the seeds in the background: all of them,
     /// or only those no seed has confirmed yet.
     fn hold_codes(&self, only_missing: bool) {
@@ -583,7 +816,10 @@ impl Helper {
     fn answered(&mut self, back: Back) {
         let answers = match back {
             Back::Held(answers) => answers,
-            Back::Relay => return self.publish(),
+            Back::Relay => {
+                self.publish();
+                return self.dial_contacts();
+            }
             Back::Republish => return self.publish(),
             Back::Published(ok) => {
                 if let Some(net) = &self.net {
@@ -605,33 +841,116 @@ impl Helper {
             Back::Reached(reached) => {
                 let (id, last, list) = *reached;
                 if let Some(store) = self.store.as_mut()
+                    && let Some(last) = last
                     && let Err(e) = store.contact_reached(&id, last, list.as_ref())
                 {
                     eprintln!("mesh-node: couldn't save a contact's address: {e}");
                 }
-                return self.emit_contacts();
+                self.connected(&id);
+                return self.emit_social(None);
             }
+            Back::Connected(id) => {
+                if self.connected(&id) {
+                    self.emit_social(None);
+                }
+                return;
+            }
+            Back::Resolved(resolved) => {
+                let (id, lookup_id, note) = *resolved;
+                if let Err(Fail(kind, message)) = self.request(id, lookup_id, &note) {
+                    emit_fail("friendRequest", kind, &message);
+                }
+                return;
+            }
+            Back::Requested(id) => {
+                let Some(store) = self.store.as_mut() else {
+                    return;
+                };
+                match store.add_contact(id, "") {
+                    // A resend, or they'd asked us (then this accepted).
+                    Ok(()) | Err(KeystoreError::AlreadyContact) => {}
+                    Err(e) => {
+                        let Fail(kind, message) = e.into();
+                        return emit_fail("friendRequest", kind, &message);
+                    }
+                }
+                self.contacts_changed();
+                self.dial(&id);
+                return self.emit_social(Some("friendRequest"));
+            }
+            Back::Collected(found) => return self.collected(found),
         };
-        let Some(store) = self.store.as_mut() else {
-            return;
-        };
+        let mut gone = false;
         for (code, answer) in answers {
             match answer {
                 Some(Hold::Ok) => {
                     self.held.insert(code);
                 }
-                // Used up or revoked: it's no use any more, so it leaves the list.
+                // Used up or revoked: it leaves the list once the requests
+                // left with it are collected (D7).
                 Some(Hold::Gone) => {
                     self.held.remove(&code);
-                    if let Err(e) = store.revoke_code(&code) {
-                        eprintln!("mesh-node: couldn't drop a used code: {e}");
-                    }
+                    gone = true;
                 }
                 Some(Hold::Taken) => eprintln!("mesh-node: a friend code collided; make another"),
                 _ => {}
             }
         }
         self.emit_codes(None);
+        if gone {
+            self.collect();
+        }
+    }
+
+    /// Takes in the requests left with our codes, and drops codes that are
+    /// gone once their requests are in.
+    fn collected(&mut self, found: Vec<Collected>) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        let (now, mut changed, mut dropped) = (unix_now(), false, false);
+        for got in found {
+            for bytes in &got.knocks {
+                // Anything that doesn't open is junk: the seed can't make one.
+                let Ok(knock) = open_knock(store.root_key(), &got.lookup_id, bytes, now) else {
+                    continue;
+                };
+                match store.knocked(&knock) {
+                    Ok(c) => changed |= c,
+                    Err(e) => eprintln!("mesh-node: couldn't save a friend request: {e}"),
+                }
+            }
+            if got.gone && !got.live {
+                dropped = true;
+                if let Err(e) = store.drop_code(&got.code) {
+                    eprintln!("mesh-node: couldn't drop a used code: {e}");
+                }
+            }
+        }
+        if changed {
+            // A request from someone we'd asked made them a friend.
+            self.contacts_changed();
+            self.dial_contacts();
+            self.emit_social(None);
+        }
+        if dropped {
+            self.emit_codes(None);
+        }
+    }
+
+    /// Someone we know connected: an `outgoing` contact becomes a friend (D8).
+    /// True if that changed anything.
+    fn connected(&mut self, id: &MeshId) -> bool {
+        let Some(store) = self.store.as_mut() else {
+            return false;
+        };
+        match store.connected(id) {
+            Ok(changed) => changed,
+            Err(e) => {
+                eprintln!("mesh-node: couldn't save a new friend: {e}");
+                false
+            }
+        }
     }
 
     /// Starts this device's node for the open identity (replacing any running).
@@ -676,13 +995,16 @@ impl Helper {
                     published.clone(),
                     self.back.clone(),
                 ));
+                let peers = tokio::spawn(watch_peers(node.clone(), self.back.clone()));
                 self.net = Some(Net {
                     node,
                     anon: Arc::new(anon),
                     watch,
+                    peers,
                     published,
                 });
                 self.hold_codes(false);
+                self.collect();
             }
             Err(e) => eprintln!("mesh-node: networking didn't start: {e}"),
         }
@@ -692,6 +1014,7 @@ impl Helper {
     async fn stop_net(&mut self) {
         if let Some(net) = self.net.take() {
             net.watch.abort();
+            net.peers.abort();
             net.anon.close().await;
             net.node.close().await;
             self.held.clear();
@@ -748,22 +1071,47 @@ impl Helper {
         }
     }
 
-    /// `meshContacts`: every contact, and when one of their devices last answered.
-    fn emit_contacts(&self) {
+    /// `meshSocial`: friends, requests both ways, blocks and our status.
+    /// `answers` names the command it answers; `None` when something changed
+    /// by itself (a request came, someone connected).
+    fn emit_social(&self, answers: Option<&str>) {
         let Some(store) = &self.store else { return };
-        let contacts: Vec<Value> = store
-            .contacts()
-            .iter()
-            .map(|c| {
-                json!({
-                    "id": c.id().to_string(),
-                    "name": c.name,
-                    "added": c.added,
-                    "seen": c.seen,
-                })
-            })
-            .collect();
-        emit("meshContacts", json!({ "contacts": contacts }));
+        let (mut friends, mut incoming, mut outgoing, mut blocked) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for e in store.account().entries() {
+            let id = e.id();
+            match e.kind {
+                Kind::Friend => friends.push(json!({
+                    "id": id.to_string(),
+                    "name": e.name,
+                    "nick": e.nick,
+                    "verified": e.verified,
+                    "presence": "offline",
+                    "seen": store.contact(&id).and_then(|c| c.seen),
+                })),
+                Kind::Incoming => incoming.push(json!({
+                    "id": id.to_string(), "name": e.name, "note": e.note, "at": e.at,
+                })),
+                Kind::Outgoing => outgoing.push(json!({
+                    "id": id.to_string(), "nick": e.nick, "at": e.at,
+                })),
+                Kind::Blocked => blocked.push(json!({
+                    "id": id.to_string(), "nick": e.nick, "at": e.at,
+                })),
+                Kind::Removed => {}
+            }
+        }
+        emit(
+            "meshSocial",
+            json!({
+                "fn": answers,
+                "friends": friends,
+                "incoming": incoming,
+                "outgoing": outgoing,
+                "blocked": blocked,
+                "status": store.account().status().as_str(),
+            }),
+        );
     }
 
     /// `meshIdentity`: nothing about the identity unless it's unlocked.
@@ -866,34 +1214,26 @@ async fn hold(anon: &Node, seeds: &[MeshAddr], held: &HeldCode) -> Option<Hold> 
     best
 }
 
-/// Asks the seeds for a code's record and opens it: `meshResolved` with the
-/// ID it points to, or a `meshError` for `codeResolve`.
-async fn resolve(anon: Arc<Node>, seeds: Arc<Vec<MeshAddr>>, code: FriendCode) {
-    let fail = |kind: &str, message: &str| {
-        emit(
-            "meshError",
-            json!({ "fn": "codeResolve", "kind": kind, "message": message }),
-        );
-    };
+/// Asks the seeds for a code's record and opens it: the ID it points to and
+/// its lookup ID, or a failure's kind and message.
+async fn find_code(
+    anon: &Node,
+    seeds: &[MeshAddr],
+    code: FriendCode,
+) -> Result<(MeshId, [u8; 16]), (&'static str, &'static str)> {
     let Ok(lookup_id) = tokio::task::spawn_blocking(move || code.lookup_id()).await else {
-        return fail("offline", "couldn't work the code out");
+        return Err(("offline", "couldn't work the code out"));
     };
     let (mut not_found, mut slowed) = (false, false);
-    for addr in seeds.iter() {
-        let Ok(answer) = seed::ask(&anon, addr, seed::GET, &lookup_id).await else {
+    for addr in seeds {
+        let Ok(answer) = seed::ask(anon, addr, seed::GET, &lookup_id).await else {
             continue;
         };
         match Get::from_bytes(&answer) {
             Some(Get::Found(record)) => {
                 // Expired, forged or for another code: as good as not there.
                 match HeldCode::from_bytes(&record).and_then(|h| h.open(&code, unix_now())) {
-                    Ok(record) => {
-                        let id = record.root();
-                        return emit(
-                            "meshResolved",
-                            json!({ "code": code.to_string(), "id": id.to_string(), "link": id.link() }),
-                        );
-                    }
+                    Ok(record) => return Ok((record.root(), lookup_id)),
                     Err(_) => not_found = true,
                 }
             }
@@ -902,13 +1242,46 @@ async fn resolve(anon: Arc<Node>, seeds: Arc<Vec<MeshAddr>>, code: FriendCode) {
             None => {}
         }
     }
-    match (slowed, not_found) {
-        (true, _) => fail("slow-down", "too many tries; wait a minute"),
-        (_, true) => fail(
+    Err(match (slowed, not_found) {
+        (true, _) => ("slow-down", "too many tries; wait a minute"),
+        (_, true) => (
             "not-found",
             "no such code: it may have expired, been used or been revoked",
         ),
-        _ => fail("offline", "couldn't reach a seed"),
+        _ => ("offline", "couldn't reach a seed"),
+    })
+}
+
+/// A typed `K7QM-3XPA`, or a pasted `mesh://code/…` link.
+fn parse_code(text: &str) -> Result<FriendCode, Fail> {
+    let text = text.trim();
+    if !text
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("mesh://"))
+    {
+        return Ok(FriendCode::parse(text)?);
+    }
+    match Link::parse(text)? {
+        Link::Code(code) => Ok(code),
+        Link::Id(_) => Err(Fail(
+            "not-a-code",
+            "that's an ID, not a friend code".to_owned(),
+        )),
+    }
+}
+
+/// A `meshError` for a command answered in the background.
+fn emit_fail(func: &str, kind: &str, message: &str) {
+    emit(
+        "meshError",
+        json!({ "fn": func, "kind": kind, "message": message }),
+    );
+}
+
+/// Reports every device that connects to us and passes the handshake.
+async fn watch_peers(node: Arc<Node>, back: tokio::sync::mpsc::UnboundedSender<Back>) {
+    while let Some(peer) = node.next_peer().await {
+        let _ = back.send(Back::Connected(peer.id));
     }
 }
 

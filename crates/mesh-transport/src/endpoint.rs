@@ -218,6 +218,19 @@ impl Node {
         self.accepted.lock().await.recv().await
     }
 
+    /// `id`'s devices we have an open connection with.
+    pub fn connected(&self, id: &MeshId) -> Vec<MeshAddr> {
+        lock(&self.shared.conns)
+            .values()
+            .filter(|(peer, conn)| peer.id == *id && conn.close_reason().is_none())
+            .map(|(peer, _)| MeshAddr {
+                device: peer.device,
+                relay: None,
+                direct: Vec::new(),
+            })
+            .collect()
+    }
+
     /// Closes every connection with `id`'s devices (they were removed).
     pub fn disconnect(&self, id: &MeshId) {
         lock(&self.shared.conns).retain(|_, (peer, conn)| {

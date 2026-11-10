@@ -75,7 +75,8 @@ impl Target {
 
 pub struct Reached {
     pub pong: Pong,
-    pub last: LastAddr,
+    /// The address that worked; `None` through an already open connection.
+    pub last: Option<LastAddr>,
     /// Their device list, when the seeds gave a newer one.
     pub list: Option<DeviceList>,
 }
@@ -88,8 +89,9 @@ pub enum ReachError {
     RevokedDevice,
 }
 
-/// Pings one of the contact's devices: the cached address first, then every
-/// device the seeds know of, together; the first to answer wins.
+/// Pings one of the contact's devices: an open connection first, then the
+/// cached address, then every device the seeds know of, together; the first
+/// to answer wins (D8).
 pub async fn reach(
     node: Arc<Node>,
     anon: &Node,
@@ -101,6 +103,17 @@ pub async fn reach(
         list.as_ref()
             .is_none_or(|l| l.devices().iter().any(|c| c.device().as_bytes() == device))
     };
+    for addr in node.connected(&target.id) {
+        if let Ok(pong) = node.ping(&addr).await {
+            // An open connection has no relay to remember; the cache keeps
+            // what it had.
+            return Ok(Reached {
+                pong,
+                last: None,
+                list: None,
+            });
+        }
+    }
     if let Some(last) = &target.last
         && current(&target.known, &last.device)
         && let Some(addr) = MeshAddr::from_parts(&last.device, &last.relay)
@@ -109,7 +122,7 @@ pub async fn reach(
     {
         return Ok(Reached {
             pong,
-            last: last.clone(),
+            last: Some(last.clone()),
             list: None,
         });
     }
@@ -136,7 +149,7 @@ pub async fn reach(
         {
             return Ok(Reached {
                 pong,
-                last,
+                last: Some(last),
                 list: newest,
             });
         }

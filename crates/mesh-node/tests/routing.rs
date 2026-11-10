@@ -29,16 +29,18 @@ fn helper(dir: &std::path::Path, relay: &Relay, seed: &str, name: &str) -> (Help
 }
 
 impl Helper {
-    /// Adds a contact; the answer lists them.
+    /// Adds someone by ID; the answer lists them as asked (or as a friend,
+    /// if they'd connected already).
     fn add(&mut self, id: &str, name: &str) {
-        let contacts = self.expect("contactAdd", &[id, name], "meshContacts");
-        assert!(
-            contacts["contacts"]
+        let social = self.expect("friendAdd", &[id, name], "meshSocial");
+        let listed = |list: &str| {
+            social[list]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|c| c["id"] == id)
-        );
+        };
+        assert!(listed("outgoing") || listed("friends"), "{social}");
     }
 
     fn published(&mut self) {
@@ -52,7 +54,13 @@ impl Helper {
             let (binding, payload) = self.call("netPingId", &[id]);
             if binding == "meshPing" {
                 // The contact's new address and "seen" are saved, then listed.
-                assert_eq!(self.event().0, "meshContacts");
+                self.social_until(|s| {
+                    s["friends"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f["id"] == id)
+                });
                 return payload;
             }
             assert_eq!(binding, "meshError", "{payload}");
@@ -96,8 +104,9 @@ fn contacts_reach_each_other_by_id() {
     a.published();
     let pong = b.ping_id(&id_a);
     assert_eq!(pong["id"], id_a);
-    let contacts = b.expect("contactList", &[], "meshContacts");
-    assert!(contacts["contacts"][0]["seen"].is_u64(), "{contacts}");
+    // Reached: Alice is Bob's friend now, seen just now.
+    let social = b.expect("socialList", &[], "meshSocial");
+    assert!(social["friends"][0]["seen"].is_u64(), "{social}");
     // And the other way, by ID too.
     b.published();
     assert_eq!(a.ping_id(&id_b)["id"], id_b);
@@ -109,7 +118,7 @@ fn contacts_reach_each_other_by_id() {
 
     // Alice removes Bob: his cached address is refused at once, and the
     // records he could still find lead to the same refusal.
-    a.expect("contactRemove", &[&id_b], "meshContacts");
+    a.expect("friendRemove", &[&id_b], "meshSocial");
     b.unreachable(&id_a);
     std::thread::sleep(Duration::from_secs(9));
     b.unreachable(&id_a);

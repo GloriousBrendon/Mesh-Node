@@ -45,10 +45,6 @@ impl Put {
         self as u8
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the helper's side comes in Task 6")
-    )]
     pub fn from_byte(byte: u8) -> Option<Self> {
         [Put::Ok, Put::Gone, Put::SlowDown, Put::Full, Put::Bad]
             .into_iter()
@@ -86,10 +82,6 @@ impl Get {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the helper's side comes in Task 6")
-    )]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         match bytes {
             [1] => Some(Get::None),
