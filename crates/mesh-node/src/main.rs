@@ -16,6 +16,7 @@ mod e2ee;
 mod helper;
 mod knocks;
 mod routing;
+mod saved;
 mod seed;
 
 use mesh_transport::{MeshAddr, RelayUrl, Relays};

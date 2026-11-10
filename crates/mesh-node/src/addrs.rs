@@ -6,6 +6,7 @@
 //! when `dirty`.
 
 use crate::codes::{Caller, Window};
+use crate::saved::{self, StoreError};
 use mesh_identity::{MAX_RECORD_LEN, addr_outer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,7 +27,8 @@ pub const MAX_AHEAD: u64 = 3 * HOUR;
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 3600;
-const FORMAT_V1: u8 = 1;
+/// The store's name in errors.
+const WHAT: &str = "address";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Put {
@@ -99,20 +101,6 @@ struct Slot {
     record: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Saved {
-    format: u8,
-    entries: Vec<([u8; 16], Vec<Slot>)>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    #[error("the address store {0} is damaged; move it aside to start empty")]
-    Corrupt(PathBuf),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
 pub struct Store {
     path: PathBuf,
     entries: HashMap<[u8; 16], Vec<Slot>>,
@@ -126,25 +114,12 @@ impl Store {
     /// Loads the store at `path`, or starts empty. A damaged file is an
     /// error, never silently replaced.
     pub fn load(path: &Path) -> Result<Self, StoreError> {
-        let entries: HashMap<_, Vec<Slot>> = match std::fs::read(path) {
-            Ok(bytes) => {
-                let corrupt = || StoreError::Corrupt(path.to_owned());
-                let saved: Saved = postcard::from_bytes(&bytes).map_err(|_| corrupt())?;
-                let valid = saved.format == FORMAT_V1
-                    && saved.entries.iter().all(|(lookup, slots)| {
-                        slots.len() <= SLOTS_PER_LOOKUP
-                            && slots.iter().all(|s| {
-                                addr_outer(&s.record) == Some((*lookup, s.slot, s.expires_at))
-                            })
-                    });
-                if !valid {
-                    return Err(corrupt());
-                }
-                saved.entries.into_iter().collect()
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => return Err(e.into()),
-        };
+        let entries = saved::load(path, WHAT, |(lookup, slots): &([u8; 16], Vec<Slot>)| {
+            slots.len() <= SLOTS_PER_LOOKUP
+                && (slots.iter())
+                    .all(|s| addr_outer(&s.record) == Some((*lookup, s.slot, s.expires_at)))
+        })?;
+        let entries: HashMap<_, Vec<Slot>> = entries.into_iter().collect();
         Ok(Self {
             path: path.to_owned(),
             records: entries.values().map(Vec::len).sum(),
@@ -157,12 +132,8 @@ impl Store {
 
     /// Writes the store so that a crash leaves the old file or the new one.
     pub fn save(&mut self) -> Result<(), StoreError> {
-        let saved = Saved {
-            format: FORMAT_V1,
-            entries: self.entries.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        };
-        let bytes = postcard::to_stdvec(&saved).expect("serialising to memory");
-        mesh_identity::write_atomically(&self.path, &bytes)?;
+        let bytes = saved::encode(self.entries.iter().collect());
+        saved::write(&self.path, WHAT, &bytes)?;
         self.dirty = false;
         Ok(())
     }
@@ -395,7 +366,7 @@ mod tests {
         let mut back = Store::load(&s.path).unwrap();
         assert_eq!(found(back.get(&caller(2), &[1; 16], NOW)), vec![a]);
         std::fs::write(&s.path, b"not a store").unwrap();
-        assert!(matches!(Store::load(&s.path), Err(StoreError::Corrupt(_))));
+        assert!(matches!(Store::load(&s.path), Err(StoreError::Corrupt(..))));
         let _ = std::fs::remove_dir_all(s.path.parent().unwrap());
     }
 }

@@ -5,6 +5,7 @@
 //!
 //! Pure: callers pass the time and who's asking, and save when `dirty`.
 
+use crate::saved::{self, StoreError};
 use mesh_identity::{CodeRevoke, HeldCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,7 +25,8 @@ pub const MAX_ENTRIES: usize = 100_000;
 
 const MINUTE: u64 = 60;
 const HOUR: u64 = 3600;
-const FORMAT_V1: u8 = 1;
+/// The store's name in errors.
+const WHAT: &str = "code";
 
 /// Who's asking: their (throwaway) device key, and their network when the
 /// connection is direct.
@@ -153,12 +155,6 @@ fn held_code(bytes: &[u8]) -> HeldCode {
     HeldCode::from_bytes(bytes).expect("checked when stored")
 }
 
-#[derive(Serialize, Deserialize)]
-struct Saved {
-    format: u8,
-    entries: Vec<([u8; 16], Entry)>,
-}
-
 /// Counts per key within a fixed window, reset when the window passes.
 #[derive(Default)]
 pub(crate) struct Window {
@@ -187,14 +183,6 @@ impl Window {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    #[error("the code store {0} is damaged; move it aside to start empty")]
-    Corrupt(PathBuf),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
 pub struct Store {
     path: PathBuf,
     entries: HashMap<[u8; 16], Entry>,
@@ -208,23 +196,11 @@ impl Store {
     /// Loads the store at `path`, or starts empty if there's none. A damaged
     /// file is an error, never silently replaced.
     pub fn load(path: &Path) -> Result<Self, StoreError> {
-        let entries = match std::fs::read(path) {
-            Ok(bytes) => {
-                let saved: Saved = postcard::from_bytes(&bytes)
-                    .map_err(|_| StoreError::Corrupt(path.to_owned()))?;
-                let valid = saved.format == FORMAT_V1
-                    && saved.entries.iter().all(|(_, e)| match e {
-                        Entry::Live { held, .. } => HeldCode::from_bytes(held).is_ok(),
-                        Entry::Gone { .. } => true,
-                    });
-                if !valid {
-                    return Err(StoreError::Corrupt(path.to_owned()));
-                }
-                saved.entries.into_iter().collect()
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => return Err(e.into()),
-        };
+        let entries = saved::load(path, WHAT, |(_, e): &([u8; 16], Entry)| match e {
+            Entry::Live { held, .. } => HeldCode::from_bytes(held).is_ok(),
+            Entry::Gone { .. } => true,
+        })?;
+        let entries = entries.into_iter().collect();
         Ok(Self {
             path: path.to_owned(),
             entries,
@@ -236,12 +212,8 @@ impl Store {
 
     /// Writes the store so that a crash leaves the old file or the new one.
     pub fn save(&mut self) -> Result<(), StoreError> {
-        let saved = Saved {
-            format: FORMAT_V1,
-            entries: self.entries.iter().map(|(k, e)| (*k, e.clone())).collect(),
-        };
-        let bytes = postcard::to_stdvec(&saved).expect("serialising to memory");
-        mesh_identity::write_atomically(&self.path, &bytes)?;
+        let bytes = saved::encode(self.entries.iter().collect());
+        saved::write(&self.path, WHAT, &bytes)?;
         self.dirty = false;
         Ok(())
     }
@@ -676,7 +648,7 @@ mod tests {
         );
 
         std::fs::write(&s.path, b"not a store").unwrap();
-        assert!(matches!(Store::load(&s.path), Err(StoreError::Corrupt(_))));
+        assert!(matches!(Store::load(&s.path), Err(StoreError::Corrupt(..))));
         let _ = std::fs::remove_dir_all(s.path.parent().unwrap());
     }
 }

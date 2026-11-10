@@ -8,8 +8,9 @@
 //! answered in turn (`addrs::Put`/`addrs::Get`, `knocks::Put`/`knocks::Get`).
 
 use crate::codes::{self, Caller, Get, Store};
+use crate::saved::StoreError;
 use crate::{addrs, knocks};
-use mesh_identity::{DeviceCert, DeviceKey, RootKey};
+use mesh_identity::{DeviceCert, DeviceKey, RootKey, unix_now};
 use mesh_transport::{Config, MeshAddr, Node, Relays, ServiceStream, frame};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,7 +113,7 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
 /// rather than stopping the seed for good. The other stores still refuse.
 fn load_addrs(path: &Path) -> Result<addrs::Store, String> {
     match addrs::Store::load(path) {
-        Err(addrs::StoreError::Corrupt(_)) => {
+        Err(crate::saved::StoreError::Corrupt(..)) => {
             eprintln!("mesh-node seed: the address records were damaged; starting empty");
             let mut aside = path.as_os_str().to_owned();
             aside.push(".damaged");
@@ -282,27 +283,18 @@ async fn answer(mut stream: ServiceStream, store: Arc<Mutex<Store>>, counts: Arc
     }
 }
 
-/// The two stores, as saving and sweeping see them.
+/// The stores, as saving sees them.
 trait Saved {
     fn dirty(&self) -> bool;
-    fn save(&mut self) -> Result<(), String>;
+    fn save(&mut self) -> Result<(), StoreError>;
 }
 
 impl Saved for Store {
     fn dirty(&self) -> bool {
         self.dirty
     }
-    fn save(&mut self) -> Result<(), String> {
-        Store::save(self).map_err(|e| format!("couldn't save the codes: {e}"))
-    }
-}
-
-impl Saved for knocks::Store {
-    fn dirty(&self) -> bool {
-        self.dirty
-    }
-    fn save(&mut self) -> Result<(), String> {
-        knocks::Store::save(self).map_err(|e| format!("couldn't save the friend requests: {e}"))
+    fn save(&mut self) -> Result<(), StoreError> {
+        Store::save(self)
     }
 }
 
@@ -310,8 +302,17 @@ impl Saved for addrs::Store {
     fn dirty(&self) -> bool {
         self.dirty
     }
-    fn save(&mut self) -> Result<(), String> {
-        addrs::Store::save(self).map_err(|e| format!("couldn't save the address records: {e}"))
+    fn save(&mut self) -> Result<(), StoreError> {
+        addrs::Store::save(self)
+    }
+}
+
+impl Saved for knocks::Store {
+    fn dirty(&self) -> bool {
+        self.dirty
+    }
+    fn save(&mut self) -> Result<(), StoreError> {
+        knocks::Store::save(self)
     }
 }
 
@@ -455,11 +456,4 @@ fn lock<S>(store: &Mutex<S>) -> std::sync::MutexGuard<'_, S> {
     store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

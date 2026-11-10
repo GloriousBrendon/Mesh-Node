@@ -1076,14 +1076,13 @@ fn expired(code: &ActiveCode, now: u64) -> bool {
     code.expires_at.is_some_and(|at| at <= now)
 }
 
-fn unix_now() -> u64 {
+/// Seconds since 1970 (0 if the clock is before it).
+pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// Temporary file beside `path`, owner-only, synced, then renamed over it:
-/// a crash leaves the old file or the new one, never half of one.
 /// Writes `bytes` to a temporary file beside `path` (owner-only), syncs
 /// it, renames it over `path`, then syncs the folder: after a crash or a
 /// power cut there's the old file or the new one, never half of either.

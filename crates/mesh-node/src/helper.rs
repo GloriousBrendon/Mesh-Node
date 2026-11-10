@@ -40,7 +40,7 @@ use mesh_identity::{
     Account, AddrRecord, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey,
     DeviceList, FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr,
     Link, MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, Status as Chosen,
-    check_password, is_kept, keyring_status, open_knock, seal_knock,
+    check_password, is_kept, keyring_status, open_knock, seal_knock, unix_now,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -2084,13 +2084,6 @@ async fn watch_peers(node: Arc<Node>, back: tokio::sync::mpsc::UnboundedSender<B
     while let Some(peer) = node.next_peer().await {
         let _ = back.send(Back::Connected(peer.id));
     }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Sends `meshNet` whenever the node's state changes.
