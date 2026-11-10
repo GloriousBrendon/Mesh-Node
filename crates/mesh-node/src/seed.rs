@@ -382,7 +382,7 @@ pub async fn ask_many(
         .map_err(drop)?
 }
 
-/// SIGTERM (Docker, systemd) or Ctrl-C.
+/// SIGTERM (Docker, systemd), Ctrl-C, or Ctrl-Break on Windows.
 async fn shutdown() {
     #[cfg(unix)]
     {
@@ -394,6 +394,14 @@ async fn shutdown() {
             }
             return;
         }
+    }
+    #[cfg(windows)]
+    if let Ok(mut brk) = tokio::signal::windows::ctrl_break() {
+        tokio::select! {
+            _ = brk.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        return;
     }
     let _ = tokio::signal::ctrl_c().await;
 }

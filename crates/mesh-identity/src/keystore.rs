@@ -23,7 +23,7 @@
 //! when there are any: a file without them is exactly the earlier format,
 //! and postcard ignores what follows a value, so older Mesh still opens it.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -828,7 +828,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)?;
     // The rename itself is durable only once the directory is synced (Unix).
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 

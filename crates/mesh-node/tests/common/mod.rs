@@ -155,15 +155,18 @@ pub struct Seed {
 
 impl Seed {
     pub fn start(dir: &Path, relay: &Relay) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-node"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mesh-node"));
+        command
             .args(["seed", "--data"])
             .arg(dir)
             .args(["--relay", &relay.url])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        // Its own process group, so `stop`'s Ctrl-Break reaches only the seed.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x200);
+        let mut child = command.spawn().unwrap();
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
@@ -193,16 +196,25 @@ impl Seed {
         }
     }
 
-    /// SIGTERM, as Docker and systemd stop it; returns the whole log.
+    /// SIGTERM, as Docker and systemd stop it (Ctrl-Break on Windows);
+    /// returns the whole log.
     pub fn stop(mut self) -> Vec<String> {
-        let pid = self.child.id().to_string();
+        #[cfg(unix)]
         assert!(
             Command::new("kill")
-                .args(["-TERM", &pid])
+                .args(["-TERM", &self.child.id().to_string()])
                 .status()
                 .unwrap()
                 .success()
         );
+        #[cfg(windows)]
+        {
+            unsafe extern "system" {
+                fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+            }
+            // CTRL_BREAK_EVENT to the seed's process group.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(1, self.child.id()) }, 0);
+        }
         assert!(self.child.wait().unwrap().success(), "exits cleanly");
         self.log.extend(self.lines.try_iter());
         std::mem::take(&mut self.log)
