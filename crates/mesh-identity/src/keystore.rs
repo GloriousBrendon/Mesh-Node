@@ -597,6 +597,36 @@ impl Keystore {
         self.save()
     }
 
+    /// Takes a newer list of our own devices, from another of them (a
+    /// device restored from a backup adds itself). True if it was newer. A
+    /// list that drops this device is left alone: it's for that device's
+    /// other devices to act on.
+    pub fn own_list_seen(&mut self, list: &DeviceList) -> Result<bool, KeystoreError> {
+        if list.root() != self.id()
+            || list.replaces(&self.devices).is_err()
+            || list.seq() <= self.devices.seq()
+            || !list.is_current(&self.device.public())
+        {
+            return Ok(false);
+        }
+        self.devices = list.clone();
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Removes another of our devices (SPEC-identity, "Remove a device"): a
+    /// new list, `seq + 1`, with it revoked. Not this device itself.
+    pub fn remove_device(
+        &mut self,
+        device: &ed25519_dalek::VerifyingKey,
+    ) -> Result<(), KeystoreError> {
+        if *device == self.device.public() {
+            return Err(KeystoreError::Device(crate::device::DeviceError::NotLinked));
+        }
+        self.devices = self.devices.without_device(&self.root, device)?;
+        self.save()
+    }
+
     pub fn id(&self) -> MeshId {
         self.root.id()
     }
@@ -1081,6 +1111,45 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_devices_learn_and_remove_each_other() {
+        let (desk_path, backup, laptop_path) = (
+            temp_path("own-desk"),
+            temp_path("own-backup"),
+            temp_path("own-laptop"),
+        );
+        let mut desk = create(&desk_path);
+        desk.export(&backup, PASSWORD).unwrap();
+        let laptop = Keystore::import_with(
+            &backup,
+            &laptop_path,
+            "Brendon",
+            PASSWORD,
+            PASSWORD,
+            "Laptop",
+            FAST,
+        )
+        .unwrap();
+        let laptop_key = laptop.device_key().public();
+        // The desk can't remove what it doesn't know of yet.
+        assert!(desk.remove_device(&laptop_key).is_err());
+        assert!(desk.own_list_seen(laptop.devices()).unwrap());
+        assert!(!desk.own_list_seen(laptop.devices()).unwrap());
+        desk.remove_device(&laptop_key).unwrap();
+        assert!(!desk.devices().is_current(&laptop_key));
+        assert_eq!(desk.devices().seq(), laptop.devices().seq() + 1);
+        // An older list doesn't bring it back, and a device can't remove itself.
+        assert!(!desk.own_list_seen(laptop.devices()).unwrap());
+        let this = desk.device_key().public();
+        assert!(desk.remove_device(&this).is_err());
+        // The change was saved.
+        let reopened = Keystore::unlock(&desk_path, "Brendon", PASSWORD).unwrap();
+        assert!(!reopened.devices().is_current(&laptop_key));
+        for p in [desk_path, backup, laptop_path] {
+            let _ = fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
 
     const PASSWORD: &str = "Tundra-Gravel-Mosaic-41";
     const OTHER_PASSWORD: &str = "copper lantern drifts sideways";
