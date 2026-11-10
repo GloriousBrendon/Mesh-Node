@@ -23,8 +23,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ed25519_dalek::VerifyingKey;
 use mesh_identity::MeshId;
+use serde::{Deserialize, Serialize};
 use vodozemac::megolm::{
-    ExportedSessionKey, GroupSession, InboundGroupSession, MegolmMessage, SessionConfig, SessionKey,
+    ExportedSessionKey, GroupSession, GroupSessionPickle, InboundGroupSession,
+    InboundGroupSessionPickle, MegolmMessage, SessionConfig, SessionKey,
 };
 
 use crate::E2eeError;
@@ -89,8 +91,89 @@ pub(crate) struct Groups {
     /// By chain ID and conversation: a share naming the wrong conversation
     /// can't shut out the right one.
     chains: HashMap<(Key, [u8; 16]), Chain>,
-    waiting: Vec<(u64, Vec<u8>)>,
-    requested: HashSet<Key>,
+    pub(crate) waiting: Vec<(u64, Vec<u8>)>,
+    pub(crate) requested: HashSet<Key>,
+}
+
+/// Our chain as stored: the chain, when it started, who has its key.
+type OutboundFile = (GroupSessionPickle, u64, Vec<(Key, Key)>);
+
+/// A group as stored: its members, our chain and every chain we can read.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GroupFile {
+    members: Vec<Key>,
+    changed: u64,
+    outbound: Option<OutboundFile>,
+    chains: Vec<(Key, bool, InboundGroupSessionPickle, Vec<u32>)>,
+}
+
+impl Groups {
+    pub(crate) fn conversations(&self) -> Vec<[u8; 16]> {
+        self.groups.keys().copied().collect()
+    }
+
+    pub(crate) fn file(&self, conversation: &[u8; 16]) -> Option<GroupFile> {
+        let group = self.groups.get(conversation)?;
+        let outbound = group.outbound.as_ref().map(|out| {
+            let shared = out
+                .shared
+                .iter()
+                .map(|(id, d)| (id.to_bytes(), *d))
+                .collect();
+            (out.session.pickle(), out.created, shared)
+        });
+        let chains = (self.chains.iter())
+            .filter(|((_, c), _)| c == conversation)
+            .map(|((id, _), chain)| {
+                let seen = chain.seen.iter().copied().collect();
+                (*id, chain.ours, chain.session.pickle(), seen)
+            })
+            .collect();
+        Some(GroupFile {
+            members: group.members.iter().map(MeshId::to_bytes).collect(),
+            changed: group.changed,
+            outbound,
+            chains,
+        })
+    }
+
+    pub(crate) fn load(
+        &mut self,
+        conversation: [u8; 16],
+        file: GroupFile,
+    ) -> Result<(), E2eeError> {
+        let id = |bytes: &Key| MeshId::from_bytes(bytes).map_err(|_| E2eeError::Store);
+        let members = file.members.iter().map(id).collect::<Result<_, _>>()?;
+        let outbound = match file.outbound {
+            Some((pickle, created, shared)) => Some(Outbound {
+                session: GroupSession::from_pickle(pickle),
+                created,
+                shared: (shared.iter())
+                    .map(|(m, d)| Ok((id(m)?, *d)))
+                    .collect::<Result<_, E2eeError>>()?,
+            }),
+            None => None,
+        };
+        let group = Group {
+            members,
+            changed: file.changed,
+            outbound,
+        };
+        self.groups.insert(conversation, group);
+        for (chain, ours, pickle, seen) in file.chains {
+            let session = InboundGroupSession::from_pickle(pickle);
+            let seen = seen.into_iter().collect();
+            self.chains.insert(
+                (chain, conversation),
+                Chain {
+                    ours,
+                    session,
+                    seen,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 impl E2ee {
@@ -125,7 +208,9 @@ impl E2ee {
             .or_insert_with(Group::empty);
         group.members = members;
         group.changed = now.max(group.changed + 1);
-        Ok(())
+        self.dirty.account = true;
+        self.dirty.groups.insert(conversation);
+        self.save()
     }
 
     /// A group's members, if we're in it.
@@ -227,6 +312,8 @@ impl E2ee {
             envelopes.push(message.clone());
             deliveries.push((key, envelopes));
         }
+        self.dirty.groups.insert(conversation);
+        self.save()?;
         Ok(deliveries)
     }
 
@@ -305,6 +392,7 @@ impl E2ee {
             first += 1;
         }
         chain.session.advance_to(first);
+        self.dirty.groups.insert(conversation);
         out.opened.push(Opened {
             conversation: Conversation::Group(conversation),
             sender,
@@ -333,6 +421,7 @@ impl E2ee {
             return Err(E2eeError::TooLong);
         }
         self.groups.waiting.push((now, bytes.to_vec()));
+        self.dirty.account = true;
         if self.groups.requested.insert(chain_key) {
             let mut request = chain_key.to_vec();
             request.extend_from_slice(&index.to_be_bytes());
@@ -371,6 +460,8 @@ impl E2ee {
         if share.changed > group.changed {
             group.members = share.members;
             group.changed = share.changed;
+            self.dirty.account = true;
+            self.dirty.groups.insert(conversation);
         }
         if !group.members.contains(&sender) {
             return Err(E2eeError::NotMember);
@@ -396,6 +487,8 @@ impl E2ee {
         };
         self.groups.chains.insert(at, chain);
         self.groups.requested.remove(&chain_key);
+        self.dirty.account = true;
+        self.dirty.groups.insert(conversation);
         // Messages that were waiting for this key.
         let waiting = std::mem::take(&mut self.groups.waiting);
         for (at, bytes) in waiting {
@@ -447,6 +540,7 @@ impl E2ee {
         let Some(exported) = chain.and_then(|c| c.session.export_at(index)) else {
             return Ok(());
         };
+        self.dirty.groups.insert(conversation);
         let share = share_body(FORM_EXPORTED, &exported.to_bytes(), changed, &members);
         let inside = self.inside(conversation, Kind::KeyShare, &share)?;
         let env = self.encrypt_to(&sender, &device, &inside)?;
@@ -786,7 +880,7 @@ mod tests {
             let list = list.with_device(&root, second).unwrap();
             for k in &keys {
                 let mut theirs = E2ee::new(&root, k, &list, NOW).unwrap();
-                let field = theirs.record_field(&id(&alice), NOW);
+                let field = theirs.record_field(&id(&alice), NOW).unwrap();
                 alice
                     .e2ee
                     .learn(&root.id(), &list, &k.public(), &field)

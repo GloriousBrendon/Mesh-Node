@@ -7,6 +7,7 @@ mod bundle;
 mod envelope;
 mod group;
 mod session;
+mod store;
 
 pub use bundle::{Bundle, MAX_BUNDLE_LEN};
 pub use envelope::{
@@ -29,6 +30,8 @@ pub enum E2eeError {
     BadSignature,
     #[error("that isn't for this device")]
     NotForUs,
+    #[error("the e2ee store is damaged or can't be written")]
+    Store,
     #[error("the message is too long")]
     TooLong,
     #[error("no keys have been seen for that person yet")]

@@ -17,19 +17,23 @@
 //! the holder of the curve key can make that, so a bundle that copies
 //! someone else's curve key can't pass their messages off as its own.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use ed25519_dalek::VerifyingKey;
 use mesh_identity::{DeviceKey, DeviceList, MeshId, PairKeys, RootKey};
+use serde::{Deserialize, Serialize};
 use vodozemac::Curve25519PublicKey;
 use vodozemac::olm::{
-    Account, DecryptionError, Message, OlmMessage, PreKeyMessage, Session, SessionConfig,
+    Account, AccountPickle, DecryptionError, Message, OlmMessage, PreKeyMessage, Session,
+    SessionConfig, SessionPickle,
 };
 
 use crate::E2eeError;
 use crate::bundle::{Bundle, MAX_BUNDLE_LEN};
 use crate::envelope::{Envelope, EnvelopeType, Inside, Kind};
-use crate::group::Groups;
+use crate::group::{GroupFile, Groups};
+use crate::store::{ACCOUNT, Store};
 
 /// One-time keys kept reserved for contacts, at most (D4).
 pub const MAX_ONE_TIME_KEYS: usize = 200;
@@ -91,6 +95,63 @@ pub(crate) struct Person {
 }
 
 impl Person {
+    fn to_file(&self) -> PersonFile {
+        PersonFile {
+            devices: self.devices.to_bytes(),
+            keys: (self.keys.iter())
+                .map(|(device, k)| {
+                    let file = KeysFile {
+                        curve: k.bundle.curve,
+                        ed25519: k.bundle.ed25519,
+                        created_at: k.bundle.created_at,
+                        fallback: k.fallback,
+                        one_time: k.one_time,
+                        used: k.used,
+                    };
+                    (*device, file)
+                })
+                .collect(),
+            sessions: (self.sessions.iter())
+                .map(|(d, s)| (*d, s.iter().map(Session::pickle).collect()))
+                .collect(),
+            revoked: self.revoked.clone(),
+            first_messages: self.first_messages.iter().cloned().collect(),
+        }
+    }
+
+    fn from_file(file: PersonFile) -> Result<Self, E2eeError> {
+        let bad = E2eeError::Store;
+        let mut keys = HashMap::new();
+        for (device, k) in file.keys {
+            let bundle = Bundle {
+                device: VerifyingKey::from_bytes(&device).map_err(|_| bad)?,
+                curve: k.curve,
+                ed25519: k.ed25519,
+                created_at: k.created_at,
+            };
+            let (fallback, one_time, used) = (k.fallback, k.one_time, k.used);
+            keys.insert(
+                device,
+                Keys {
+                    bundle,
+                    fallback,
+                    one_time,
+                    used,
+                },
+            );
+        }
+        let sessions = (file.sessions.into_iter())
+            .map(|(d, s)| (d, s.into_iter().map(Session::from_pickle).collect()))
+            .collect();
+        Ok(Self {
+            devices: DeviceList::from_bytes(&file.devices).map_err(|_| bad)?,
+            keys,
+            sessions,
+            revoked: file.revoked,
+            first_messages: file.first_messages.into(),
+        })
+    }
+
     fn new(devices: DeviceList) -> Self {
         Self {
             devices,
@@ -101,7 +162,6 @@ impl Person {
         }
     }
 
-    /// Current devices we can encrypt to: with a session or keys.
     /// Current devices we can encrypt to (a session or keys), as bytes and
     /// as keys: decompressing a key costs more than encrypting a message.
     fn reachable(&self) -> Vec<(Key, VerifyingKey)> {
@@ -129,6 +189,50 @@ pub struct E2ee {
     /// 1:1 conversation IDs, to place our own devices' copies.
     direct: HashMap<[u8; 16], MeshId>,
     pub(crate) groups: Groups,
+    /// `None` keeps everything in memory (tests).
+    store: Option<Store>,
+    pub(crate) dirty: Dirty,
+}
+
+/// What changed since the last save (D12).
+#[derive(Default)]
+pub(crate) struct Dirty {
+    pub(crate) account: bool,
+    pub(crate) people: HashSet<MeshId>,
+    pub(crate) groups: HashSet<[u8; 16]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountFile {
+    device: Key,
+    account: AccountPickle,
+    bundle: Vec<u8>,
+    fallback: Key,
+    fallback_at: u64,
+    reserved: Vec<(Key, Key)>,
+    people: Vec<Key>,
+    groups: Vec<[u8; 16]>,
+    waiting: Vec<(u64, Vec<u8>)>,
+    requested: Vec<Key>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeysFile {
+    curve: Key,
+    ed25519: Key,
+    created_at: u64,
+    fallback: Key,
+    one_time: Option<Key>,
+    used: Option<Key>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersonFile {
+    devices: Vec<u8>,
+    keys: Vec<(Key, KeysFile)>,
+    sessions: Vec<(Key, Vec<SessionPickle>)>,
+    revoked: Vec<Key>,
+    first_messages: Vec<String>,
 }
 
 impl E2ee {
@@ -159,10 +263,133 @@ impl E2ee {
             people: HashMap::new(),
             direct: HashMap::new(),
             groups: Groups::default(),
+            store: None,
+            dirty: Dirty::default(),
         };
         e2ee.renew_fallback(now);
-        e2ee.learn_devices(&root.id(), devices);
+        e2ee.take_devices(&root.id(), devices);
         Ok(e2ee)
+    }
+
+    /// Opens this device's state from `<data>/e2ee/`, or starts it there.
+    /// State left by another device key (a restored backup gets a new one)
+    /// is cleared: sessions never come back from a backup (Q5).
+    pub fn open(
+        data: &Path,
+        data_key: &[u8; 32],
+        root: &RootKey,
+        device: &DeviceKey,
+        devices: &DeviceList,
+        now: u64,
+    ) -> Result<Self, E2eeError> {
+        let store = Store::new(&data.join("e2ee"), data_key);
+        let file: Option<AccountFile> = store.read(ACCOUNT)?;
+        let mut e2ee = match file {
+            Some(file) if file.device == device.public().to_bytes() => {
+                Self::load(store, file, root, device)?
+            }
+            _ => {
+                store.clear()?;
+                let mut e2ee = Self::new(root, device, devices, now)?;
+                e2ee.store = Some(store);
+                e2ee.dirty.account = true;
+                e2ee.dirty.people.insert(root.id());
+                e2ee
+            }
+        };
+        e2ee.take_devices(&root.id(), devices);
+        e2ee.save()?;
+        Ok(e2ee)
+    }
+
+    fn load(
+        store: Store,
+        file: AccountFile,
+        root: &RootKey,
+        device: &DeviceKey,
+    ) -> Result<Self, E2eeError> {
+        let mut people = HashMap::new();
+        let mut direct = HashMap::new();
+        for id in &file.people {
+            let id = MeshId::from_bytes(id).map_err(|_| E2eeError::Store)?;
+            let person: PersonFile = store
+                .read(&store.name(b"person", &id.to_bytes()))?
+                .ok_or(E2eeError::Store)?;
+            if id != root.id()
+                && let Some(keys) = PairKeys::new(root, &id)
+            {
+                direct.insert(keys.conversation(), id);
+            }
+            people.insert(id, Person::from_file(person)?);
+        }
+        let mut groups = Groups::default();
+        for conversation in &file.groups {
+            let group: GroupFile = store
+                .read(&store.name(b"group", conversation))?
+                .ok_or(E2eeError::Store)?;
+            groups.load(*conversation, group)?;
+        }
+        groups.waiting = file.waiting;
+        groups.requested = file.requested.into_iter().collect();
+        let reserved = file.reserved.iter().map(|(id, key)| {
+            MeshId::from_bytes(id)
+                .map(|id| (id, *key))
+                .map_err(|_| E2eeError::Store)
+        });
+        Ok(Self {
+            root: RootKey::from_secret_bytes(*root.secret_bytes()),
+            device: DeviceKey::from_secret_bytes(*device.secret_bytes()),
+            me: root.id(),
+            account: Account::from_pickle(file.account),
+            bundle: file.bundle,
+            fallback: file.fallback,
+            fallback_at: file.fallback_at,
+            reserved: reserved.collect::<Result<_, _>>()?,
+            people,
+            direct,
+            groups,
+            store: Some(store),
+            dirty: Dirty::default(),
+        })
+    }
+
+    /// Writes what changed: people and groups first, then the account that
+    /// lists them. Called before any ciphertext or plaintext is handed out.
+    pub(crate) fn save(&mut self) -> Result<(), E2eeError> {
+        let dirty = std::mem::take(&mut self.dirty);
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        for id in &dirty.people {
+            if let Some(person) = self.people.get(id) {
+                store.write(&store.name(b"person", &id.to_bytes()), &person.to_file())?;
+            }
+        }
+        for conversation in &dirty.groups {
+            if let Some(group) = self.groups.file(conversation) {
+                store.write(&store.name(b"group", conversation), &group)?;
+            }
+        }
+        if dirty.account {
+            let file = AccountFile {
+                device: self.device_bytes(),
+                account: self.account.pickle(),
+                bundle: self.bundle.clone(),
+                fallback: self.fallback,
+                fallback_at: self.fallback_at,
+                reserved: self
+                    .reserved
+                    .iter()
+                    .map(|(id, k)| (id.to_bytes(), *k))
+                    .collect(),
+                people: self.people.keys().map(MeshId::to_bytes).collect(),
+                groups: self.groups.conversations(),
+                waiting: self.groups.waiting.clone(),
+                requested: self.groups.requested.iter().copied().collect(),
+            };
+            store.write(ACCOUNT, &file)?;
+        }
+        Ok(())
     }
 
     /// This device's signed bundle.
@@ -181,9 +408,10 @@ impl E2ee {
     /// The field for this device's address record for `contact` (D4): the
     /// bundle, the fallback key and the one-time key reserved for them. Our
     /// own ID gets one too, for our other devices.
-    pub fn record_field(&mut self, contact: &MeshId, now: u64) -> Vec<u8> {
+    pub fn record_field(&mut self, contact: &MeshId, now: u64) -> Result<Vec<u8>, E2eeError> {
         if now >= self.fallback_at + FALLBACK_LIFE {
             self.renew_fallback(now);
+            self.dirty.account = true;
         }
         if !self.reserved.contains_key(contact) && self.reserved.len() < MAX_ONE_TIME_KEYS {
             let made = self.account.generate_one_time_keys(1);
@@ -192,18 +420,26 @@ impl E2ee {
             if let Some(key) = made.created.first() {
                 self.reserved.insert(*contact, key.to_bytes());
             }
+            self.dirty.account = true;
         }
+        self.save()?;
         let mut out = self.bundle.clone();
         out.extend_from_slice(&self.fallback);
         if let Some(key) = self.reserved.get(contact) {
             out.extend_from_slice(key);
         }
-        out
+        Ok(out)
     }
 
     /// Takes the newest device list seen for `id` (D11). A device it drops
     /// loses its keys and sessions. True when the list was newer.
-    pub fn learn_devices(&mut self, id: &MeshId, devices: &DeviceList) -> bool {
+    pub fn learn_devices(&mut self, id: &MeshId, devices: &DeviceList) -> Result<bool, E2eeError> {
+        let newer = self.take_devices(id, devices);
+        self.save()?;
+        Ok(newer)
+    }
+
+    fn take_devices(&mut self, id: &MeshId, devices: &DeviceList) -> bool {
         if devices.root() != *id {
             return false;
         }
@@ -223,6 +459,8 @@ impl E2ee {
                     self.direct.insert(keys.conversation(), *id);
                 }
                 self.people.insert(*id, Person::new(devices.clone()));
+                self.dirty.account = true;
+                self.dirty.people.insert(*id);
                 return true;
             }
         };
@@ -241,6 +479,7 @@ impl E2ee {
             }
         }
         person.sessions.retain(|d, _| current(d));
+        self.dirty.people.insert(*id);
         true
     }
 
@@ -256,7 +495,7 @@ impl E2ee {
         if field.len() != MAX_BUNDLE_LEN + 32 && field.len() != MAX_FIELD_LEN {
             return Err(E2eeError::Malformed);
         }
-        self.learn_devices(id, devices);
+        self.take_devices(id, devices);
         let person = self.people.get_mut(id).ok_or(E2eeError::Malformed)?;
         let bundle = Bundle::open(&field[..MAX_BUNDLE_LEN], &person.devices)?;
         if bundle.device != *device {
@@ -280,7 +519,8 @@ impl E2ee {
         keys.bundle = bundle;
         keys.fallback = fallback;
         keys.one_time = one_time.filter(|k| keys.used != Some(*k));
-        Ok(())
+        self.dirty.people.insert(*id);
+        self.save()
     }
 
     /// Encrypts `body` for a 1:1 conversation with `peer`: once for each of
@@ -308,10 +548,12 @@ impl E2ee {
         let inside = self.inside(conversation, kind, body)?;
         let mut targets: Vec<_> = theirs.into_iter().map(|d| (*peer, d)).collect();
         targets.extend(self.own_devices().into_iter().map(|d| (self.me, d)));
-        targets
+        let out = targets
             .into_iter()
             .map(|(id, (device, key))| Ok((key, self.encrypt_to(&id, &device, &inside)?)))
-            .collect()
+            .collect::<Result<_, E2eeError>>()?;
+        self.save()?;
+        Ok(out)
     }
 
     /// `id`'s current devices we can reach.
@@ -355,6 +597,7 @@ impl E2ee {
         inside: &[u8],
     ) -> Result<Vec<u8>, E2eeError> {
         let plain = self.claim(inside);
+        self.dirty.people.insert(*id);
         let person = self.people.get_mut(id).ok_or(E2eeError::NoKeys)?;
         let sessions = person.sessions.entry(*device).or_default();
         if sessions.is_empty() {
@@ -481,6 +724,7 @@ impl E2ee {
                 .map_err(|_| E2eeError::CantOpen)?;
             let one_time = m.one_time_key().to_bytes();
             self.reserved.retain(|_, k| *k != one_time);
+            self.dirty.account = true;
             let (id, device) = claimed(&created.plaintext)?;
             if !candidates.contains(&(id, device)) {
                 return Err(E2eeError::CantOpen);
@@ -498,6 +742,7 @@ impl E2ee {
         }
         let plain = result?;
         let found = found.expect("set with the plaintext");
+        self.dirty.people.insert(found.0);
         if claimed(&plain)? != found {
             return Err(E2eeError::CantOpen);
         }
@@ -513,6 +758,7 @@ impl E2ee {
         let mut out = Received::default();
         if envelope.kind == EnvelopeType::Group {
             self.open_group(bytes, &envelope, now, &mut out)?;
+            self.save()?;
             return Ok(out);
         }
         let (sender, device, inside) = self.open_olm(&envelope)?;
@@ -523,6 +769,7 @@ impl E2ee {
             }
             _ => out.opened.push(self.place_direct(sender, device, inside)?),
         }
+        self.save()?;
         Ok(out)
     }
 
@@ -594,7 +841,7 @@ pub(crate) mod tests {
 
     /// `a` learns `b`'s keys from the record `b` left for `a`.
     pub fn introduce(a: &mut Device, b: &mut Device) {
-        let field = b.e2ee.record_field(&a.who.root.id(), NOW);
+        let field = b.e2ee.record_field(&a.who.root.id(), NOW).unwrap();
         a.e2ee
             .learn(
                 &b.who.root.id(),
@@ -696,7 +943,7 @@ pub(crate) mod tests {
     fn a_one_time_key_works_once() {
         let (mut alice, mut bob, mut carol) = (device(), device(), device());
         let (alice_id, bob_id) = (alice.who.root.id(), bob.who.root.id());
-        let stale = bob.e2ee.record_field(&alice_id, NOW);
+        let stale = bob.e2ee.record_field(&alice_id, NOW).unwrap();
         friends(&mut alice, &mut bob);
         friends(&mut carol, &mut bob);
         let one_time = alice.e2ee.people[&bob_id]
@@ -734,7 +981,7 @@ pub(crate) mod tests {
             .unwrap();
         let keys = alice.e2ee.people[&bob_id].keys.values().next().unwrap();
         assert_eq!(keys.one_time, None);
-        let fresh = bob.e2ee.record_field(&alice_id, NOW);
+        let fresh = bob.e2ee.record_field(&alice_id, NOW).unwrap();
         assert_ne!(fresh[MAX_BUNDLE_LEN + 32..], stale[MAX_BUNDLE_LEN + 32..]);
     }
 
@@ -831,14 +1078,19 @@ pub(crate) mod tests {
         let one = two
             .without_device(&alice.who.root, &laptop.who.device.public())
             .unwrap();
-        assert!(bob.e2ee.learn_devices(&alice.who.root.id(), &one));
-        assert!(alice.e2ee.learn_devices(&alice.who.root.id(), &one));
+        assert!(bob.e2ee.learn_devices(&alice.who.root.id(), &one).unwrap());
+        assert!(
+            alice
+                .e2ee
+                .learn_devices(&alice.who.root.id(), &one)
+                .unwrap()
+        );
         assert_eq!(
             bob.e2ee.open1(to_bob).unwrap_err(),
             E2eeError::RevokedDevice
         );
         // An older list doesn't bring it back.
-        assert!(!bob.e2ee.learn_devices(&alice.who.root.id(), &two));
+        assert!(!bob.e2ee.learn_devices(&alice.who.root.id(), &two).unwrap());
         // And Alice no longer encrypts to it.
         let out = alice
             .e2ee
@@ -874,7 +1126,7 @@ pub(crate) mod tests {
         introduce(&mut eve, &mut alice);
         assert!(eve.e2ee.open1(&to_bob).is_err());
         // A field whose bundle isn't the record's device is refused.
-        let field = bob.e2ee.record_field(&alice.who.root.id(), NOW);
+        let field = bob.e2ee.record_field(&alice.who.root.id(), NOW).unwrap();
         assert!(
             alice
                 .e2ee
@@ -945,12 +1197,16 @@ pub(crate) mod tests {
     fn the_fallback_key_is_replaced_weekly() {
         let mut alice = device();
         let bob = device();
-        let first = alice.e2ee.record_field(&bob.who.root.id(), NOW);
-        let same = alice.e2ee.record_field(&bob.who.root.id(), NOW + 3600);
+        let first = alice.e2ee.record_field(&bob.who.root.id(), NOW).unwrap();
+        let same = alice
+            .e2ee
+            .record_field(&bob.who.root.id(), NOW + 3600)
+            .unwrap();
         assert_eq!(first, same);
         let later = alice
             .e2ee
-            .record_field(&bob.who.root.id(), NOW + FALLBACK_LIFE);
+            .record_field(&bob.who.root.id(), NOW + FALLBACK_LIFE)
+            .unwrap();
         assert_ne!(first[MAX_BUNDLE_LEN..][..32], later[MAX_BUNDLE_LEN..][..32]);
         assert_eq!(first[..MAX_BUNDLE_LEN], later[..MAX_BUNDLE_LEN]);
     }
