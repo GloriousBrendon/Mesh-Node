@@ -10,11 +10,11 @@
 //! vodozemac's pickles; they never leave the seal.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+use mesh_identity::write_atomically;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
@@ -106,28 +106,6 @@ impl Store {
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new(&Key::from(*self.key))
     }
-}
-
-/// Temporary file beside `path`, owner-only, synced, then renamed over it,
-/// as the keystore does.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

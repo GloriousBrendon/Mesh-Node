@@ -155,16 +155,14 @@ impl Store {
         })
     }
 
-    /// Writes to a temporary file, then renames it over the old one.
+    /// Writes the store so that a crash leaves the old file or the new one.
     pub fn save(&mut self) -> Result<(), StoreError> {
         let saved = Saved {
             format: FORMAT_V1,
             entries: self.entries.iter().map(|(k, v)| (*k, v.clone())).collect(),
         };
         let bytes = postcard::to_stdvec(&saved).expect("serialising to memory");
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &self.path)?;
+        mesh_identity::write_atomically(&self.path, &bytes)?;
         self.dirty = false;
         Ok(())
     }

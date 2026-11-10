@@ -1084,7 +1084,10 @@ fn unix_now() -> u64 {
 
 /// Temporary file beside `path`, owner-only, synced, then renamed over it:
 /// a crash leaves the old file or the new one, never half of one.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes `bytes` to a temporary file beside `path` (owner-only), syncs
+/// it, renames it over `path`, then syncs the folder: after a crash or a
+/// power cut there's the old file or the new one, never half of either.
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())

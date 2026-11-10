@@ -288,3 +288,20 @@ fn two_helpers_share_a_code_through_the_seed() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// A power cut can leave a store half written. Address records are put
+/// again within 30 minutes, so a damaged `addrs.bin` starts empty instead
+/// of stopping the seed (audit finding 4).
+#[test]
+fn a_damaged_address_file_starts_empty() {
+    let dir = temp_dir("seed-damaged");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("addrs.bin"), b"half a file").unwrap();
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dir, &relay);
+    seed.ticket();
+    let log = seed.stop().join("\n");
+    assert!(log.contains("address records were damaged"), "{log}");
+    drop(relay.runtime);
+    let _ = std::fs::remove_dir_all(dir);
+}

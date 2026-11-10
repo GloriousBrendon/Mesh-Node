@@ -64,7 +64,7 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
     let cert = DeviceCert::issue(&root, &device.public(), "seed", unix_now())
         .map_err(|e| format!("can't make the seed's certificate: {e}"))?;
     let store = Store::load(&dir.join(STORE_FILE)).map_err(|e| e.to_string())?;
-    let addrs = addrs::Store::load(&dir.join(ADDR_FILE)).map_err(|e| e.to_string())?;
+    let addrs = load_addrs(&dir.join(ADDR_FILE))?;
     let knocks = knocks::Store::load(&dir.join(KNOCK_FILE)).map_err(|e| e.to_string())?;
     eprintln!(
         "mesh-node seed: holding {} codes, {} address records, {} friend requests",
@@ -107,6 +107,23 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
     Ok(())
 }
 
+/// Address records are put again within 30 minutes (routing D4), so a
+/// damaged file (a power cut) is moved aside and the store starts empty,
+/// rather than stopping the seed for good. The other stores still refuse.
+fn load_addrs(path: &Path) -> Result<addrs::Store, String> {
+    match addrs::Store::load(path) {
+        Err(addrs::StoreError::Corrupt(_)) => {
+            eprintln!("mesh-node seed: the address records were damaged; starting empty");
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".damaged");
+            std::fs::rename(path, &aside)
+                .map_err(|e| format!("can't move {} aside: {e}", path.display()))?;
+            addrs::Store::load(path).map_err(|e| e.to_string())
+        }
+        loaded => loaded.map_err(|e| e.to_string()),
+    }
+}
+
 /// The seed's key: made on first start (owner-only file), loaded after.
 /// `root secret [32] | device secret [32]`.
 fn key(path: &Path) -> Result<(RootKey, DeviceKey), String> {
@@ -119,7 +136,7 @@ fn key(path: &Path) -> Result<(RootKey, DeviceKey), String> {
                 .map_err(|e| format!("no randomness: {e}"))?;
             let mut bytes = root.secret_bytes().to_vec();
             bytes.extend_from_slice(device.secret_bytes().as_ref());
-            write_private(path, &bytes)
+            mesh_identity::write_atomically(path, &bytes)
                 .map_err(|e| format!("can't write {}: {e}", path.display()))?;
             eprintln!("mesh-node seed: made a new seed key");
             bytes
@@ -134,15 +151,6 @@ fn key(path: &Path) -> Result<(RootKey, DeviceKey), String> {
         RootKey::from_secret_bytes(root.try_into().expect("32 bytes")),
         DeviceKey::from_secret_bytes(device.try_into().expect("32 bytes")),
     ))
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)?.write_all(bytes)
 }
 
 /// Logs the seed's ticket once it has a home relay: it goes in the clients'
