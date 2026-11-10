@@ -19,7 +19,7 @@
 //! command answers with one event; a failure is a `meshError` with a stable
 //! `kind` the UI switches on, the `fn` it answers, and a message to show.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,8 +33,8 @@ use crate::{knocks, seed};
 use mesh_identity::{
     Account, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey, DeviceList,
     FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr, Link,
-    MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, check_password, is_kept,
-    keyring_status, open_knock, seal_knock,
+    MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, Status as Chosen, check_password,
+    is_kept, keyring_status, open_knock, seal_knock,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -234,6 +234,38 @@ struct Helper {
     record_ttl: u64,
     /// The wait before the next publish after a failed one.
     publish_retry: Duration,
+    /// Each friend's devices and what each last said (D12).
+    presence: HashMap<[u8; 32], HashMap<[u8; 32], Presence>>,
+    /// Mesh-Voice saw no input for a while (D13: auto-idle, per device).
+    idle: bool,
+    /// What we show friends now; the presence streams follow it.
+    shown: tokio::sync::watch::Sender<Presence>,
+}
+
+/// What a friend's device shows: on the wire, one byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Presence {
+    Offline = 0,
+    Idle = 1,
+    Online = 2,
+    Dnd = 3,
+}
+
+impl Presence {
+    fn from_byte(byte: u8) -> Option<Self> {
+        [Self::Offline, Self::Idle, Self::Online, Self::Dnd]
+            .into_iter()
+            .find(|p| *p as u8 == byte)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Idle => "idle",
+            Self::Online => "online",
+            Self::Dnd => "dnd",
+        }
+    }
 }
 
 struct Net {
@@ -248,6 +280,8 @@ struct Net {
     streams: tokio::task::JoinHandle<()>,
     /// Every contact's record is on a seed (`meshNet`'s `published`).
     published: Arc<AtomicBool>,
+    /// Friends' devices we're sending presence to.
+    presenting: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
 }
 
 /// What a background request found out.
@@ -271,6 +305,8 @@ enum Back {
     Collected(Vec<Collected>),
     /// Another of our devices sent its account state.
     Synced(Box<(Account, MeshAddr)>),
+    /// A device of someone's said what it shows, or went quiet.
+    Presence(Box<(MeshId, [u8; 32], Option<Presence>)>),
 }
 
 /// One code's requests, from every seed that answered.
@@ -303,6 +339,9 @@ impl Helper {
             allowed: Arc::default(),
             record_ttl: routing::RECORD_TTL,
             publish_retry: PUBLISH_RETRY,
+            presence: HashMap::new(),
+            idle: false,
+            shown: tokio::sync::watch::Sender::new(Presence::Online),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -498,6 +537,23 @@ impl Helper {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.unblock(&id)?;
                 self.changed(Some(func));
+            }
+            "statusSet" => {
+                let status = Chosen::parse(arg(0)?)
+                    .ok_or_else(|| Fail("bad-args", "online, idle, dnd or invisible".to_owned()))?;
+                self.unlocked()?.set_status(status)?;
+                self.update_shown();
+                self.changed(Some(func));
+            }
+            "activity" => {
+                self.idle = match arg(0)? {
+                    "idle" => true,
+                    "active" => false,
+                    _ => return Err(Fail("bad-args", "active or idle".to_owned())),
+                };
+                self.update_shown();
+                self.unlocked()?;
+                self.emit_social(Some(func));
             }
             "socialList" => {
                 self.unlocked()?;
@@ -852,7 +908,9 @@ impl Helper {
                 {
                     eprintln!("mesh-node: couldn't save a contact's address: {e}");
                 }
-                if self.connected(&id) {
+                let promoted = self.connected(&id);
+                self.present_to(&id);
+                if promoted {
                     return self.changed(None);
                 }
                 return self.emit_social(None);
@@ -866,11 +924,15 @@ impl Helper {
                 if self.connected(&id) {
                     self.changed(None);
                 }
-                return;
+                return self.present_to(&id);
             }
             Back::Synced(synced) => {
                 let (theirs, from) = *synced;
                 return self.synced(&theirs, &from);
+            }
+            Back::Presence(heard) => {
+                let (id, device, heard) = *heard;
+                return self.presence_heard(id, device, heard);
             }
             Back::Resolved(resolved) => {
                 let (id, lookup_id, note) = *resolved;
@@ -955,6 +1017,91 @@ impl Helper {
         }
     }
 
+    /// A friend's best device (D13): DND beats online, which beats idle.
+    fn presence_of(&self, id: &MeshId) -> Presence {
+        self.presence
+            .get(&id.to_bytes())
+            .and_then(|devices| devices.values().max().copied())
+            .unwrap_or(Presence::Offline)
+    }
+
+    /// What friends see of this device: invisible shows as offline, but we
+    /// stay reachable (D13).
+    fn update_shown(&self) {
+        let Some(store) = &self.store else { return };
+        let shown = match store.account().status() {
+            Chosen::Invisible => Presence::Offline,
+            Chosen::Dnd => Presence::Dnd,
+            Chosen::Idle => Presence::Idle,
+            Chosen::Online if self.idle => Presence::Idle,
+            Chosen::Online => Presence::Online,
+        };
+        self.shown
+            .send_if_modified(|p| std::mem::replace(p, shown) != shown);
+    }
+
+    /// Starts sending our presence to each of a friend's connected devices
+    /// that doesn't have it yet (D12).
+    fn present_to(&self, id: &MeshId) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        if store.account().kind(id) != Some(Kind::Friend) {
+            return;
+        }
+        for addr in net.node.connected(id) {
+            let key = *addr.device.as_bytes();
+            if !lock(&net.presenting).insert(key) {
+                continue;
+            }
+            let (node, presenting) = (net.node.clone(), net.presenting.clone());
+            let mut shown = self.shown.subscribe();
+            tokio::spawn(async move {
+                let sent = async {
+                    let (_, mut send, _recv) = node.open(&addr, PRESENCE).await.ok()?;
+                    loop {
+                        let now = *shown.borrow_and_update() as u8;
+                        mesh_transport::frame::write_frame(&mut send, &[now])
+                            .await
+                            .ok()?;
+                        tokio::select! {
+                            changed = shown.changed() => changed.ok()?,
+                            () = tokio::time::sleep(HEARTBEAT) => {}
+                        }
+                    }
+                };
+                let _: Option<()> = sent.await;
+                lock(&presenting).remove(&key);
+            });
+        }
+    }
+
+    /// A friend's device said what it shows, or went quiet (`None`).
+    fn presence_heard(&mut self, id: MeshId, device: [u8; 32], heard: Option<Presence>) {
+        // Their stream came over a connection that passed the handshake, which
+        // may get here before our own dial's answer does.
+        if heard.is_some() && self.connected(&id) {
+            self.changed(None);
+        }
+        let friend = self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.account().kind(&id) == Some(Kind::Friend));
+        let before = self.presence_of(&id);
+        let devices = self.presence.entry(id.to_bytes()).or_default();
+        match heard {
+            Some(p) if friend => drop(devices.insert(device, p)),
+            _ => drop(devices.remove(&device)),
+        }
+        if self.presence_of(&id) != before {
+            self.emit_social(None);
+        }
+        // They hear from us too, whoever connected first.
+        if heard.is_some() {
+            self.present_to(&id);
+        }
+    }
+
     /// The account state changed here: tell Mesh-Voice, and our other
     /// devices that are connected (D11).
     fn changed(&self, answers: Option<&str>) {
@@ -989,6 +1136,8 @@ impl Helper {
                 }
             }
             self.dial_contacts();
+            // Our chosen status may have changed on the other device.
+            self.update_shown();
             self.changed(None);
         }
         if ours != *theirs
@@ -1055,7 +1204,7 @@ impl Helper {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains(&id.to_bytes())
             }),
-            services: vec![SYNC.to_owned()],
+            services: vec![SYNC.to_owned(), PRESENCE.to_owned()],
             ..Config::default()
         };
         self.allow_contacts();
@@ -1085,7 +1234,9 @@ impl Helper {
                     peers,
                     streams,
                     published,
+                    presenting: Arc::default(),
                 });
+                self.update_shown();
                 self.hold_codes(false);
                 self.collect();
             }
@@ -1103,6 +1254,7 @@ impl Helper {
             net.node.close().await;
             self.held.clear();
             self.publish_retry = PUBLISH_RETRY;
+            self.presence.clear();
             emit_net(None, false);
         }
     }
@@ -1170,7 +1322,7 @@ impl Helper {
                     "name": e.name,
                     "nick": e.nick,
                     "verified": e.verified,
-                    "presence": "offline",
+                    "presence": self.presence_of(&id).as_str(),
                     "seen": store.contact(&id).and_then(|c| c.seen),
                 })),
                 Kind::Incoming => incoming.push(json!({
@@ -1364,6 +1516,16 @@ fn emit_fail(func: &str, kind: &str, message: &str) {
 
 /// The account-state service between our own devices (D11).
 const SYNC: &str = "sync";
+/// What a device shows its friends (D12).
+const PRESENCE: &str = "presence";
+/// Presence is sent again this often, even unchanged.
+const HEARTBEAT: Duration = Duration::from_secs(60);
+/// A friend's device silent this long counts as offline.
+const PRESENCE_SILENCE: Duration = Duration::from_secs(150);
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 /// How long a device has to send its state.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -1385,19 +1547,39 @@ fn push_account(node: Arc<Node>, addr: MeshAddr, account: Vec<u8>) {
     });
 }
 
-/// Answers the streams other devices open to us: only our own devices may
-/// sync, and only one frame each.
+/// Answers the streams other devices open to us: presence from friends (the
+/// loop drops anyone else's), and sync from our own devices, one frame each.
 async fn serve_streams(
     node: Arc<Node>,
     own: MeshId,
     back: tokio::sync::mpsc::UnboundedSender<Back>,
 ) {
     while let Some(mut stream) = node.next_stream().await {
+        let back = back.clone();
+        if stream.service == PRESENCE && stream.peer.id != own {
+            tokio::spawn(async move {
+                let (id, device) = (stream.peer.id, *stream.peer.device.as_bytes());
+                loop {
+                    let read = mesh_transport::frame::read_frame(&mut stream.recv);
+                    let heard = match tokio::time::timeout(PRESENCE_SILENCE, read).await {
+                        Ok(Ok(Some(frame))) => match frame[..] {
+                            [byte] => Presence::from_byte(byte),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let _ = back.send(Back::Presence(Box::new((id, device, heard))));
+                    if heard.is_none() {
+                        break;
+                    }
+                }
+            });
+            continue;
+        }
         if stream.service != SYNC || stream.peer.id != own {
             let _ = stream.send.reset(0u32.into());
             continue;
         }
-        let back = back.clone();
         tokio::spawn(async move {
             let read = mesh_transport::frame::read_frame(&mut stream.recv);
             let Ok(Ok(Some(bytes))) = tokio::time::timeout(SYNC_TIMEOUT, read).await else {

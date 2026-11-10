@@ -227,3 +227,58 @@ fn own_devices_keep_the_same_lists() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// What `meshSocial` says about friend `id`.
+fn presence(social: &Value, id: &str) -> String {
+    let friends = social["friends"].as_array().unwrap();
+    let friend = friends.iter().find(|f| f["id"] == id);
+    friend
+        .map_or("absent", |f| f["presence"].as_str().unwrap())
+        .to_owned()
+}
+
+fn sees(h: &mut Helper, id: &str, what: &str) {
+    h.social_until(|s| presence(s, id) == what);
+}
+
+#[test]
+fn friends_see_presence() {
+    let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("presence-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob");
+    alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
+    bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
+    sees(&mut alice, &id_b, "online");
+    sees(&mut bob, &id_a, "online");
+
+    // Bob's status shows on Alice's side.
+    bob.expect("statusSet", &["dnd"], "meshSocial");
+    sees(&mut alice, &id_b, "dnd");
+    bob.expect("statusSet", &["online"], "meshSocial");
+    sees(&mut alice, &id_b, "online");
+    bob.expect("activity", &["idle"], "meshSocial");
+    sees(&mut alice, &id_b, "idle");
+    bob.expect("activity", &["active"], "meshSocial");
+    sees(&mut alice, &id_b, "online");
+
+    // Invisible: offline to Alice, but she can still reach him.
+    let social = bob.expect("statusSet", &["invisible"], "meshSocial");
+    assert_eq!(social["status"], "invisible");
+    sees(&mut alice, &id_b, "offline");
+    assert_eq!(alice.expect("netPingId", &[&id_b], "meshPing")["id"], id_b);
+
+    // Alice locks: Bob sees her go.
+    alice.expect("idLock", &[], "meshIdentity");
+    sees(&mut bob, &id_a, "offline");
+
+    let stderr = [alice, bob].map(Helper::quit).concat();
+    assert!(!stderr.contains(PASSWORD));
+    seed.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
