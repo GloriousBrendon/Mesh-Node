@@ -84,11 +84,24 @@ fn a_seed_holds_and_answers_codes() {
             .open(&once, now())
             .unwrap();
         assert_eq!(record.root(), root.id());
+        // Looking it up again is fine; a friend request uses it up
+        // (SPEC-social D1), and only Alice can read the request.
+        assert_eq!(ask(&bob, &addr, "code-get", &held.lookup_id()).await[0], 0);
+        let knock = request(&root, &once);
+        assert_eq!(ask(&bob, &addr, "knock-put", &knock).await, [0]);
+        assert_eq!(ask(&bob, &addr, "knock-put", &knock).await, [1], "used");
         assert_eq!(
             ask(&bob, &addr, "code-get", &held.lookup_id()).await,
             [1],
             "used"
         );
+        let mine = mesh_identity::CodeRevoke::new(&root, &once).to_bytes();
+        let theirs = mesh_identity::CodeRevoke::new(&RootKey::generate().unwrap(), &once);
+        assert_eq!(ask(&bob, &addr, "knock-get", &theirs.to_bytes()).await, [1]);
+        let mut box_ = vec![0, 0];
+        box_.extend_from_slice(&(knock.len() as u16).to_be_bytes());
+        box_.extend_from_slice(&knock);
+        assert_eq!(ask(&alice, &addr, "knock-get", &mine).await, box_);
 
         // Revoked: gone for Bob, and Alice can't hold it again.
         let kept = FriendCode::generate().unwrap();
@@ -145,6 +158,20 @@ fn a_seed_holds_and_answers_codes() {
 
 const PASSWORD: &str = "correct horse battery staple";
 
+/// A friend request from a new identity to `owner`, through `code`.
+fn request(owner: &RootKey, code: &FriendCode) -> Vec<u8> {
+    let (root, device) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
+    let cert = DeviceCert::issue(&root, &device.public(), "pc", now()).unwrap();
+    let devices = mesh_identity::DeviceList::first(&root, cert).unwrap();
+    let from = mesh_identity::KnockFrom {
+        root: &root,
+        device: &device,
+        devices: &devices,
+        name: "Bob",
+    };
+    mesh_identity::seal_knock(&from, &owner.id(), &code.lookup_id(), "", now()).unwrap()
+}
+
 impl Helper {
     /// Reads events until a `meshCodes` that satisfies `done`.
     fn codes_until(&mut self, done: impl Fn(&[Value]) -> bool) -> Vec<Value> {
@@ -192,20 +219,13 @@ fn two_helpers_share_a_code_through_the_seed() {
         (&resolved["id"], resolved["code"].as_str()),
         (&id_a, Some(&*once))
     );
+    // Looking it up doesn't use it; a friend request would (tests/social.rs).
     let again = b.expect(
         "codeResolve",
         &[&format!("mesh://code/{once}")],
-        "meshError",
+        "meshResolved",
     );
-    assert_eq!(
-        (again["fn"].as_str(), again["kind"].as_str()),
-        (Some("codeResolve"), Some("not-found"))
-    );
-
-    // Alice unlocks again: the seed says it's used, so it leaves her list.
-    a.expect("idLock", &[], "meshIdentity");
-    a.expect("idUnlock", &["alice", PASSWORD], "meshIdentity");
-    a.codes_until(|codes| codes.iter().all(|c| c["code"] != *once));
+    assert_eq!(again["id"], id_a);
 
     // Revoked: Bob finds nothing (the revoke goes out in the background).
     let kept = a.held_code("unlimited");
@@ -245,7 +265,12 @@ fn two_helpers_share_a_code_through_the_seed() {
         .unwrap()
         .to_owned();
     let codes = a.codes_until(|codes| codes.iter().any(|c| c["code"] == late));
-    assert!(codes.iter().all(|c| c["held"] == false), "nobody holds it");
+    assert!(
+        codes
+            .iter()
+            .any(|c| c["code"] == late && c["held"] == false),
+        "nobody holds it"
+    );
     let mut seed = Seed::start(&dir_s, &relay);
     seed.ticket();
     a.expect("idLock", &[], "meshIdentity");

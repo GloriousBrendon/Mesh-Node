@@ -311,17 +311,37 @@ impl Store {
             self.dirty = true;
             return Get::None;
         }
-        let Entry::Live { held, uses_left } = entry else {
-            return Get::None;
+        match entry {
+            Entry::Live { held, .. } => Get::Found(held.clone()),
+            Entry::Gone { .. } => Get::None,
+        }
+    }
+
+    /// Uses up one of a live code's uses for a friend request (SPEC-social
+    /// D1), and gives its revoke tag. `None` if no live code has that ID.
+    pub fn spend(&mut self, lookup_id: &[u8; 16], now: u64) -> Option<[u8; 32]> {
+        let entry = self.entries.get_mut(lookup_id)?;
+        if entry.expired(now) {
+            return None;
+        }
+        let Entry::Live { uses_left, .. } = entry else {
+            return None;
         };
-        let found = held.clone();
         match *uses_left {
-            None => return Get::Found(found),
+            None => {}
             Some(1) => *entry = entry.gone(),
             Some(n) => *uses_left = Some(n - 1),
         }
         self.dirty = true;
-        Get::Found(found)
+        Some(entry.tag())
+    }
+
+    /// For the code's owner (who has the revoke): whether the code is still
+    /// live. `None` if the seed knows no code with that ID and revoke.
+    pub fn owner_status(&self, revoke: &CodeRevoke, now: u64) -> Option<bool> {
+        let entry = self.entries.get(&revoke.lookup_id())?;
+        (revoke.tag() == entry.tag())
+            .then(|| matches!(entry, Entry::Live { .. }) && !entry.expired(now))
     }
 
     /// Deletes the record if the revoke is its owner's. Says nothing back
@@ -402,32 +422,24 @@ mod tests {
         for held in [&once, &five, &unlimited] {
             assert_eq!(s.hold(&caller(1), held.as_bytes(), NOW), Hold::Ok);
         }
-        assert!(matches!(
-            s.get(&caller(2), &once.lookup_id(), NOW),
-            Get::Found(_)
-        ));
-        assert_eq!(
-            s.get(&caller(3), &once.lookup_id(), NOW),
-            Get::None,
-            "single use"
-        );
-        for i in 0..5 {
+        // Looking a code up doesn't use it (SPEC-social D1); a request does.
+        for i in 0..3 {
             assert!(matches!(
-                s.get(&caller(10 + i), &five.lookup_id(), NOW),
+                s.get(&caller(2 + i), &once.lookup_id(), NOW),
                 Get::Found(_)
             ));
         }
-        assert_eq!(
-            s.get(&caller(20), &five.lookup_id(), NOW),
-            Get::None,
-            "five used"
-        );
-        for i in 0..8 {
-            assert!(matches!(
-                s.get(&caller(30 + i), &unlimited.lookup_id(), NOW),
-                Get::Found(_)
-            ));
+        assert_eq!(s.spend(&once.lookup_id(), NOW), Some(once.revoke_tag()));
+        assert_eq!(s.spend(&once.lookup_id(), NOW), None, "single use");
+        assert_eq!(s.get(&caller(3), &once.lookup_id(), NOW), Get::None);
+        for _ in 0..5 {
+            assert!(s.spend(&five.lookup_id(), NOW).is_some());
         }
+        assert_eq!(s.spend(&five.lookup_id(), NOW), None, "five used");
+        for _ in 0..8 {
+            assert!(s.spend(&unlimited.lookup_id(), NOW).is_some());
+        }
+        assert_eq!(s.spend(&[9; 16], NOW), None, "never held");
 
         // The owner holding a used-up code again doesn't bring it back.
         assert_eq!(s.hold(&caller(1), once.as_bytes(), NOW), Hold::Gone);
@@ -446,22 +458,15 @@ mod tests {
         let root = RootKey::generate().unwrap();
         let (code_, held) = code(&root, Some(7 * DAY), Some(5));
         s.hold(&caller(1), held.as_bytes(), NOW);
-        for i in 0..4 {
-            s.get(&caller(10 + i), &held.lookup_id(), NOW);
+        for _ in 0..4 {
+            s.spend(&held.lookup_id(), NOW);
         }
         // Rebuilt with a fresh nonce, as the helper does.
         let rebuilt = HeldCode::new(&root, &code_, NOW, Some(7 * DAY), Some(5)).unwrap();
         assert_ne!(rebuilt.as_bytes(), held.as_bytes());
         assert_eq!(s.hold(&caller(1), rebuilt.as_bytes(), NOW), Hold::Ok);
-        assert!(matches!(
-            s.get(&caller(20), &held.lookup_id(), NOW),
-            Get::Found(_)
-        ));
-        assert_eq!(
-            s.get(&caller(21), &held.lookup_id(), NOW),
-            Get::None,
-            "still five in all"
-        );
+        assert!(s.spend(&held.lookup_id(), NOW).is_some());
+        assert_eq!(s.spend(&held.lookup_id(), NOW), None, "still five in all");
     }
 
     #[test]
@@ -491,8 +496,9 @@ mod tests {
 
         let (_, used) = code(&root, Some(3600), Some(1));
         s.hold(&caller(1), used.as_bytes(), NOW);
-        s.get(&caller(2), &used.lookup_id(), NOW);
+        s.spend(&used.lookup_id(), NOW);
         assert_eq!(s.len(), 1, "a marker");
+        assert_eq!(s.spend(&used.lookup_id(), NOW + 3600), None);
         s.sweep(NOW + 3600);
         assert_eq!(s.len(), 0, "the marker expires with the record");
         assert_eq!(s.hold(&caller(1), b"short", NOW), Hold::Bad);
@@ -510,7 +516,14 @@ mod tests {
             s.get(&caller(2), &held.lookup_id(), NOW),
             Get::Found(_)
         ));
-        s.revoke(&CodeRevoke::new(&root, &code).to_bytes());
+        let (theirs, mine) = (
+            CodeRevoke::new(&other, &code),
+            CodeRevoke::new(&root, &code),
+        );
+        assert_eq!(s.owner_status(&theirs, NOW), None);
+        assert_eq!(s.owner_status(&mine, NOW), Some(true));
+        s.revoke(&mine.to_bytes());
+        assert_eq!(s.owner_status(&mine, NOW), Some(false));
         assert_eq!(s.get(&caller(2), &held.lookup_id(), NOW), Get::None);
         assert_eq!(
             s.hold(&caller(1), held.as_bytes(), NOW),
@@ -646,8 +659,8 @@ mod tests {
         let (_, used) = code(&root, None, Some(1));
         s.hold(&caller(1), live.as_bytes(), NOW);
         s.hold(&caller(1), used.as_bytes(), NOW);
-        s.get(&caller(2), &live.lookup_id(), NOW);
-        s.get(&caller(2), &used.lookup_id(), NOW);
+        s.spend(&live.lookup_id(), NOW);
+        s.spend(&used.lookup_id(), NOW);
         assert!(s.dirty);
         s.save().unwrap();
         assert!(!s.dirty);
@@ -655,15 +668,12 @@ mod tests {
         let mut back = Store::load(&s.path).unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!(back.hold(&caller(1), used.as_bytes(), NOW), Hold::Gone);
-        for i in 0..4 {
-            assert!(matches!(
-                back.get(&caller(10 + i), &live.lookup_id(), NOW),
-                Get::Found(_)
-            ));
+        for _ in 0..4 {
+            assert!(back.spend(&live.lookup_id(), NOW).is_some());
         }
         assert_eq!(
-            back.get(&caller(20), &live.lookup_id(), NOW),
-            Get::None,
+            back.spend(&live.lookup_id(), NOW),
+            None,
             "the count survived"
         );
 

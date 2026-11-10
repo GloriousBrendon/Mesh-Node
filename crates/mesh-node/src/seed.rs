@@ -3,11 +3,12 @@
 //!
 //! Each request is one stream: the service tag, one request frame, one
 //! answer frame whose first byte is the answer (`codes::Hold`/`codes::Get`).
-//! The address services (SPEC-routing D5) are batched: frames until the
-//! caller finishes, each answered in turn (`addrs::Put`/`addrs::Get`).
+//! The address services (SPEC-routing D5) and the friend-request services
+//! (SPEC-social D1, D3) are batched: frames until the caller finishes, each
+//! answered in turn (`addrs::Put`/`addrs::Get`, `knocks::Put`/`knocks::Get`).
 
-use crate::addrs;
 use crate::codes::{self, Caller, Get, Store};
+use crate::{addrs, knocks};
 use mesh_identity::{DeviceCert, DeviceKey, RootKey};
 use mesh_transport::{Config, MeshAddr, Node, Relays, ServiceStream, frame};
 use std::path::Path;
@@ -20,10 +21,13 @@ pub const GET: &str = "code-get";
 pub const REVOKE: &str = "code-revoke";
 pub const ADDR_PUT: &str = "addr-put";
 pub const ADDR_GET: &str = "addr-get";
+pub const KNOCK_PUT: &str = "knock-put";
+pub const KNOCK_GET: &str = "knock-get";
 
 const KEY_FILE: &str = "seed.key";
 const STORE_FILE: &str = "codes.bin";
 const ADDR_FILE: &str = "addrs.bin";
+const KNOCK_FILE: &str = "knocks.bin";
 /// Address records come back within 30 minutes, so losing a few minutes of
 /// them costs nothing (SPEC-routing).
 const SAVE_ADDRS_EVERY: Duration = Duration::from_secs(300);
@@ -44,12 +48,15 @@ struct Counts {
     revokes: AtomicU64,
     puts: AtomicU64,
     gets: AtomicU64,
+    knock_puts: AtomicU64,
+    knock_gets: AtomicU64,
 }
 
 #[derive(Clone)]
 struct Stores {
     codes: Arc<Mutex<Store>>,
     addrs: Arc<Mutex<addrs::Store>>,
+    knocks: Arc<Mutex<knocks::Store>>,
 }
 
 pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
@@ -58,18 +65,21 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
         .map_err(|e| format!("can't make the seed's certificate: {e}"))?;
     let store = Store::load(&dir.join(STORE_FILE)).map_err(|e| e.to_string())?;
     let addrs = addrs::Store::load(&dir.join(ADDR_FILE)).map_err(|e| e.to_string())?;
+    let knocks = knocks::Store::load(&dir.join(KNOCK_FILE)).map_err(|e| e.to_string())?;
     eprintln!(
-        "mesh-node seed: holding {} codes, {} address records",
+        "mesh-node seed: holding {} codes, {} address records, {} friend requests",
         store.len(),
-        addrs.len()
+        addrs.len(),
+        knocks.len()
     );
     let stores = Stores {
         codes: Arc::new(Mutex::new(store)),
         addrs: Arc::new(Mutex::new(addrs)),
+        knocks: Arc::new(Mutex::new(knocks)),
     };
     let config = Config {
         relays,
-        services: [HOLD, GET, REVOKE, ADDR_PUT, ADDR_GET]
+        services: [HOLD, GET, REVOKE, ADDR_PUT, ADDR_GET, KNOCK_PUT, KNOCK_GET]
             .map(String::from)
             .to_vec(),
         ..Config::default()
@@ -85,6 +95,7 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
     tokio::spawn(serve(node.clone(), stores.clone(), counts.clone()));
     tokio::spawn(save_often(stores.codes.clone(), SAVE_EVERY));
     tokio::spawn(save_often(stores.addrs.clone(), SAVE_ADDRS_EVERY));
+    tokio::spawn(save_often(stores.knocks.clone(), SAVE_ADDRS_EVERY));
     tokio::spawn(sweep_hourly(stores.clone(), counts));
 
     shutdown().await;
@@ -92,6 +103,7 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
     node.close().await;
     save(&stores.codes);
     save(&stores.addrs);
+    save(&stores.knocks);
     Ok(())
 }
 
@@ -147,26 +159,47 @@ async fn announce(node: Arc<Node>) {
 
 async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
     while let Some(stream) = node.next_stream().await {
-        if [ADDR_PUT, ADDR_GET].contains(&stream.service.as_str()) {
-            tokio::spawn(answer_batch(stream, stores.addrs.clone(), counts.clone()));
-        } else {
-            tokio::spawn(answer(stream, stores.codes.clone(), counts.clone()));
-        }
+        let (stores, counts) = (stores.clone(), counts.clone());
+        let count = |n: &AtomicU64| {
+            n.fetch_add(1, Ordering::Relaxed);
+        };
+        match stream.service.as_str() {
+            ADDR_PUT => tokio::spawn(answer_batch(stream, move |caller, request, now| {
+                count(&counts.puts);
+                vec![lock(&stores.addrs).put(caller, request, now).byte()]
+            })),
+            ADDR_GET => tokio::spawn(answer_batch(stream, move |caller, request, now| {
+                count(&counts.gets);
+                match <[u8; 16]>::try_from(request) {
+                    Ok(lookup) => lock(&stores.addrs).get(caller, &lookup, now).to_bytes(),
+                    Err(_) => vec![addrs::Put::Bad.byte()],
+                }
+            })),
+            KNOCK_PUT => tokio::spawn(answer_batch(stream, move |caller, request, now| {
+                count(&counts.knock_puts);
+                let mut codes = lock(&stores.codes);
+                let put = lock(&stores.knocks).put(caller, request, &mut codes, now);
+                vec![put.byte()]
+            })),
+            KNOCK_GET => tokio::spawn(answer_batch(stream, move |caller, request, now| {
+                count(&counts.knock_gets);
+                let codes = lock(&stores.codes);
+                lock(&stores.knocks)
+                    .get(caller, request, &codes, now)
+                    .to_bytes()
+            })),
+            _ => tokio::spawn(answer(stream, stores.codes.clone(), counts.clone())),
+        };
     }
 }
 
-/// Address requests: each frame answered as it comes, until the caller
-/// finishes.
-async fn answer_batch(
-    mut stream: ServiceStream,
-    store: Arc<Mutex<addrs::Store>>,
-    counts: Arc<Counts>,
-) {
+/// Batched requests: each frame answered by `handle` as it comes, until the
+/// caller finishes.
+async fn answer_batch(mut stream: ServiceStream, handle: impl Fn(&Caller, &[u8], u64) -> Vec<u8>) {
     let caller = Caller {
         device: *stream.peer.device.as_bytes(),
         network: stream.direct_ip.map(codes::network),
     };
-    let put = stream.service == ADDR_PUT;
     loop {
         let request = match tokio::time::timeout(
             REQUEST_TIMEOUT,
@@ -181,20 +214,7 @@ async fn answer_batch(
                 return;
             }
         };
-        let now = unix_now();
-        let reply = {
-            let mut store = lock(&store);
-            if put {
-                counts.puts.fetch_add(1, Ordering::Relaxed);
-                vec![store.put(&caller, &request, now).byte()]
-            } else {
-                counts.gets.fetch_add(1, Ordering::Relaxed);
-                match <[u8; 16]>::try_from(request.as_slice()) {
-                    Ok(lookup) => store.get(&caller, &lookup, now).to_bytes(),
-                    Err(_) => vec![addrs::Put::Bad.byte()],
-                }
-            }
-        };
+        let reply = handle(&caller, &request, unix_now());
         if frame::write_frame(&mut stream.send, &reply).await.is_err() {
             return;
         }
@@ -269,6 +289,15 @@ impl Saved for Store {
     }
 }
 
+impl Saved for knocks::Store {
+    fn dirty(&self) -> bool {
+        self.dirty
+    }
+    fn save(&mut self) -> Result<(), String> {
+        knocks::Store::save(self).map_err(|e| format!("couldn't save the friend requests: {e}"))
+    }
+}
+
 impl Saved for addrs::Store {
     fn dirty(&self) -> bool {
         self.dirty
@@ -308,9 +337,14 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>) {
             store.sweep(now);
             store.len()
         };
+        let requests = {
+            let mut store = lock(&stores.knocks);
+            store.sweep(now);
+            store.len()
+        };
         let take = |n: &AtomicU64| n.swap(0, Ordering::Relaxed);
         eprintln!(
-            "mesh-node seed: last hour {} holds, {} lookups ({} found, {} slowed), {} revokes, {} address puts, {} address gets; {held} held, {records} address records",
+            "mesh-node seed: last hour {} holds, {} lookups ({} found, {} slowed), {} revokes, {} address puts, {} address gets, {} request puts, {} request gets; {held} held, {records} address records, {requests} requests",
             take(&counts.holds),
             take(&counts.lookups),
             take(&counts.found),
@@ -318,6 +352,8 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>) {
             take(&counts.revokes),
             take(&counts.puts),
             take(&counts.gets),
+            take(&counts.knock_puts),
+            take(&counts.knock_gets),
         );
     }
 }

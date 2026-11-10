@@ -356,6 +356,12 @@ impl CodeRevoke {
         self.lookup_id
     }
 
+    /// The tag the held record carries for this revoke. `blake3::Hash`
+    /// compares in constant time.
+    pub fn tag(&self) -> blake3::Hash {
+        blake3::hash(&self.secret)
+    }
+
     /// `lookup_id [16] | secret [32]`.
     pub fn to_bytes(&self) -> [u8; 48] {
         let mut bytes = [0u8; 48];
