@@ -207,7 +207,7 @@ impl E2ee {
             .entry(conversation)
             .or_insert_with(Group::empty);
         group.members = members;
-        group.changed = now.max(group.changed + 1);
+        group.changed = now.max(group.changed.saturating_add(1));
         self.dirty.account = true;
         self.dirty.groups.insert(conversation);
         self.save()
@@ -453,11 +453,10 @@ impl E2ee {
             .groups
             .entry(conversation)
             .or_insert_with(Group::empty);
-        // Only a member may change the list, or share a chain.
-        if !group.members.is_empty() && !group.members.contains(&sender) {
-            return Err(E2eeError::NotMember);
-        }
-        if share.changed > group.changed {
+        // The list comes from `set_members`. A share brings it only for a
+        // group we hadn't heard of: a member can't rewrite it (audit finding
+        // 12), and `dm`'s group events decide changes.
+        if group.members.is_empty() {
             group.members = share.members;
             group.changed = share.changed;
             self.dirty.account = true;
@@ -747,12 +746,43 @@ mod tests {
         assert!(answer.opened.is_empty() && answer.replies.is_empty());
         assert_eq!(deliver(&out, &mut [&mut b])[0][0].body, b"no carol");
 
-        // Bob takes the new list from Alice's share: his next chain skips Carol.
+        // Bob's list comes from his own side (the helper's command, `dm`'s
+        // group events), never from a share: his next chain skips Carol once
+        // he's told.
+        b.e2ee.set_members(group, &[id(&a)], NOW + 1).unwrap();
         let out = b
             .e2ee
             .encrypt_group(group, Kind::TestNote, b"bob", NOW)
             .unwrap();
         assert!(out.iter().all(|(d, _)| *d != key(&c)));
+    }
+
+    /// A member can't rewrite the list with a share (audit finding 12): not
+    /// with a newer `changed`, not with the largest one.
+    #[test]
+    fn a_share_cant_change_the_members() {
+        let (mut a, mut b, c) = three();
+        let group = a.e2ee.new_group(&[id(&b)], NOW).unwrap();
+        let out = a
+            .e2ee
+            .encrypt_group(group, Kind::TestNote, b"just us", NOW)
+            .unwrap();
+        deliver(&out, &mut [&mut b]);
+        // Bob's modified client adds Carol, as late as it can be.
+        b.e2ee
+            .set_members(group, &[id(&a), id(&c)], u64::MAX)
+            .unwrap();
+        let out = b
+            .e2ee
+            .encrypt_group(group, Kind::TestNote, b"carol's in", NOW)
+            .unwrap();
+        assert_eq!(deliver(&out, &mut [&mut a])[0][0].body, b"carol's in");
+        let mut ours = [id(&a), id(&b)];
+        ours.sort_by_key(|m| m.to_bytes());
+        assert_eq!(a.e2ee.members(&group).unwrap(), &ours[..]);
+        // And Alice can still change her own list.
+        a.e2ee.set_members(group, &[id(&b)], NOW + 1).unwrap();
+        b.e2ee.set_members(group, &[id(&a)], u64::MAX).unwrap();
     }
 
     #[test]
