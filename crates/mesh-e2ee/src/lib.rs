@@ -4,8 +4,12 @@
 //! vodozemac's types stay inside this crate. No networking here.
 
 mod bundle;
+mod envelope;
 
 pub use bundle::{Bundle, MAX_BUNDLE_LEN};
+pub use envelope::{
+    Envelope, EnvelopeType, Inside, Kind, MAX_BODY, MAX_INSIDE, open_sealed, seal_for,
+};
 
 /// Why something couldn't be encrypted or opened. Each is fixed text and
 /// names nothing (D15).
@@ -17,6 +21,8 @@ pub enum E2eeError {
     RevokedDevice,
     #[error("the signature doesn't match")]
     BadSignature,
+    #[error("that isn't for this device")]
+    NotForUs,
     #[error("the message is too long")]
     TooLong,
     #[error("couldn't get randomness from the system")]

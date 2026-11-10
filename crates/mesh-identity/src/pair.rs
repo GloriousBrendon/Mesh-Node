@@ -15,6 +15,7 @@ const LOOKUP_CONTEXT: &str = "mesh/v1/pair-lookup";
 const SLOT_CONTEXT: &str = "mesh/v1/pair-slot";
 const RECORD_KEY_CONTEXT: &str = "mesh/v1/pair-record-key";
 const KNOCK_SLOT_CONTEXT: &str = "mesh/v1/knock-slot";
+const CONVERSATION_CONTEXT: &str = "mesh/v1/dm-conversation";
 const DAY: u64 = 86_400;
 
 /// The UTC day a unix time falls in.
@@ -61,6 +62,13 @@ impl PairKeys {
         hash.as_bytes()[..8].try_into().expect("8 bytes")
     }
 
+    /// The pair's 1:1 conversation ID (SPEC-e2ee D10): both sides know it
+    /// without asking, so two people can't end up with two chats.
+    pub fn conversation(&self) -> [u8; 16] {
+        let hash = self.hasher(CONVERSATION_CONTEXT).finalize();
+        hash.as_bytes()[..16].try_into().expect("16 bytes")
+    }
+
     pub(crate) fn record_key(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(*self.hasher(RECORD_KEY_CONTEXT).finalize().as_bytes())
     }
@@ -93,6 +101,8 @@ mod tests {
         assert_eq!(ab.lookup(&alice.id(), day), ba.lookup(&alice.id(), day));
         assert_eq!(ab.slot(&device), ba.slot(&device));
         assert_eq!(*ab.record_key(), *ba.record_key());
+        assert_eq!(ab.conversation(), ba.conversation());
+        assert_ne!(ab.conversation(), eb.conversation());
 
         assert_ne!(ab.lookup(&alice.id(), day), eb.lookup(&alice.id(), day));
         assert_ne!(*ab.record_key(), *eb.record_key());
