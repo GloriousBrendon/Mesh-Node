@@ -60,8 +60,10 @@ const PUBLISH_RETRY: Duration = Duration::from_secs(60);
 /// How often friend requests left with our codes are collected (D7).
 const COLLECT_EVERY: Duration = Duration::from_secs(300);
 /// Seeds every install knows (SPEC-seed D6); `--seed` replaces them.
-// ponytail: empty until the homelab seed runs (seed Task 7).
-pub const SEEDS: &[&str] = &[];
+// ponytail: the homelab seed is home-only for now (its relay answers on the LAN and Tailscale only); add a VPS seed when friends outside need codes.
+pub const SEEDS: &[&str] = &[
+    "mesh://node/1191ccb55a67bcf6fe9408ccd615fce54ff8af653b19a4909f4dbdc967e9533e?relay=https://relay.nagbreeklabs.co.za/",
+];
 
 #[derive(Deserialize)]
 struct Cmd {

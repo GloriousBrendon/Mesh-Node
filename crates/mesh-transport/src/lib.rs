@@ -68,6 +68,24 @@ pub enum Relays {
     Disabled,
 }
 
+/// n0's public relays, the ones `Relays::Default` uses.
+pub fn public_relays() -> Vec<iroh::RelayUrl> {
+    use iroh::defaults::prod::*;
+    [
+        NA_EAST_RELAY_HOSTNAME,
+        NA_WEST_RELAY_HOSTNAME,
+        EU_RELAY_HOSTNAME,
+        AP_RELAY_HOSTNAME,
+    ]
+    .iter()
+    .map(|host| {
+        format!("https://{host}")
+            .parse()
+            .expect("iroh's own hostnames")
+    })
+    .collect()
+}
+
 /// How the node is set up.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -217,6 +235,17 @@ pub fn secret_key(device: &DeviceKey) -> iroh::SecretKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_relays_are_n0s() {
+        let relays = public_relays();
+        assert_eq!(relays.len(), 4);
+        assert!(relays.iter().all(|r| {
+            r.scheme() == "https"
+                && r.host_str()
+                    .is_some_and(|h| h.ends_with(".relay.n0.iroh.link."))
+        }));
+    }
 
     #[test]
     fn endpoint_id_is_the_device_key() {

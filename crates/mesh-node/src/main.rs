@@ -2,10 +2,11 @@
 //! Mesh-Voice's helper: commands arrive on stdin as `{"fn":..,"args":[..]}`
 //! lines, events go out on stdout as `{"binding":..,"payload":"<json>"}`
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
-//! `--relay <url>` (repeatable) replaces n0's public relays; `--seed
-//! <ticket>` (repeatable) the built-in seeds. `--record-ttl <secs>` shortens
+//! `--relay <url>` (repeatable) replaces the built-in relays (ours, then
+//! n0's); `--seed <ticket>` (repeatable) the built-in seed. `--record-ttl <secs>` shortens
 //! how long address records last, for tests. Without `--seed`, the
-//! `MESH_SEEDS` environment variable (space-separated tickets) is used.
+//! `MESH_SEEDS` environment variable (space-separated tickets) is used; set
+//! but empty, there are no seeds.
 //!
 //! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed).
 
@@ -57,12 +58,13 @@ fn main() {
         .collect();
     // `MESH_SEEDS` (space-separated tickets) reaches the helper through
     // Mesh-Voice, which passes no flags: for trying a local seed by hand.
-    let from_env = std::env::var("MESH_SEEDS").unwrap_or_default();
+    // Set but empty means no seeds at all (the tests use that).
+    let from_env = std::env::var("MESH_SEEDS").ok();
     if seeds.is_empty() {
-        seeds = from_env.split_whitespace().collect();
-    }
-    if seeds.is_empty() {
-        seeds = helper::SEEDS.to_vec();
+        seeds = match &from_env {
+            Some(tickets) => tickets.split_whitespace().collect(),
+            None => helper::SEEDS.to_vec(),
+        };
     }
     let seeds: Vec<MeshAddr> = match seeds.iter().map(|t| MeshAddr::from_ticket(t)).collect() {
         Ok(seeds) => seeds,
@@ -85,11 +87,11 @@ fn main() {
             }
         },
     };
-    let relays = if relays.is_empty() {
-        Relays::Default
+    let relays = Relays::Custom(if relays.is_empty() {
+        default_relays()
     } else {
-        Relays::Custom(relays)
-    };
+        relays
+    });
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("mesh-node: can't create {}: {e}", dir.display());
         std::process::exit(1);
@@ -114,6 +116,18 @@ fn main() {
     } else {
         runtime.block_on(helper::run(&dir, relays, seeds, record_ttl));
     }
+}
+
+/// Our relay (on the homelab, SPEC-seed D5), then n0's. iroh makes whichever
+/// answers fastest the home relay.
+// ponytail: ours is home-only (LAN and Tailscale) for now; outside, it never answers and n0's are used.
+pub const OUR_RELAY: &str = "https://relay.nagbreeklabs.co.za";
+
+fn default_relays() -> Vec<RelayUrl> {
+    let ours: RelayUrl = OUR_RELAY.parse().expect("a valid URL");
+    std::iter::once(ours)
+        .chain(mesh_transport::public_relays())
+        .collect()
 }
 
 /// A relay from `--relay`: https, or plain http only on this machine (a
@@ -147,4 +161,26 @@ fn default_data_dir() -> Option<PathBuf> {
         env("XDG_DATA_HOME").or_else(|| env("HOME").map(|h| h.join(".local/share")))?
     };
     Some(base.join("mesh").join("node"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_built_in_lists_parse() {
+        let relays = default_relays();
+        assert_eq!(relays[0].as_str(), format!("{OUR_RELAY}/"));
+        assert_eq!(relays.len(), 5, "ours, then n0's four");
+        for ticket in helper::SEEDS {
+            let seed = MeshAddr::from_ticket(ticket).expect("a valid ticket");
+            assert_eq!(
+                seed.relay.as_ref(),
+                Some(&relays[0]),
+                "the seed is on our relay"
+            );
+        }
+        assert!(relay("http://example.org").is_err());
+        assert!(relay("http://127.0.0.1:3340").is_ok());
+    }
 }

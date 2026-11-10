@@ -64,6 +64,8 @@ impl Helper {
             .arg(dir)
             .args(["--relay", &relay.url])
             .args(args)
+            // Never the built-in (real) seed: only one a test passes with --seed.
+            .env("MESH_SEEDS", "")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
