@@ -162,6 +162,10 @@ pub struct Limits {
     pub handshakes: usize,
     /// Streams open at once on one connection.
     pub streams: u32,
+    /// Close a connection that has had no stream open for this long. A seed
+    /// sets it: clients dial again when they next ask. `None` keeps
+    /// connections open, as devices that send presence need.
+    pub idle: Option<std::time::Duration>,
 }
 
 impl Default for Limits {
@@ -170,6 +174,7 @@ impl Default for Limits {
             connections: 256,
             handshakes: 32,
             streams: 32,
+            idle: None,
         }
     }
 }
@@ -203,6 +208,8 @@ pub struct ServiceStream {
     /// The other side's IP while the connection is direct, for rate limits;
     /// `None` through a relay. Never log it.
     pub direct_ip: Option<std::net::IpAddr>,
+    /// Counts this stream as open until it's dropped (`Limits::idle`).
+    pub(crate) _open: endpoint::Open,
 }
 
 /// A ping's answer.

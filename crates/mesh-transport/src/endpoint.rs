@@ -24,6 +24,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Close code for connections ended by locking (after the handshake codes).
 const LOCKED: u32 = 5;
+/// Close code for a connection closed after sitting idle (`Limits::idle`).
+const IDLE: u32 = 7;
 /// Newly accepted peers waiting to be read with `next_peer`; past this,
 /// the notice is dropped (the connection itself stays).
 const ACCEPTED_QUEUE: usize = 64;
@@ -200,14 +202,15 @@ impl Node {
         service: &str,
     ) -> Result<(Peer, SendStream, RecvStream), TransportError> {
         let (peer, conn) = self.connection(addr).await?;
-        let (mut send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TransportError::Unreachable(e.to_string()))?;
-        frame::write_tag(&mut send, service)
-            .await
-            .map_err(dropped)?;
-        Ok((peer, send, recv))
+        match open_on(&conn, service).await {
+            // The other side closed it as idle just now: dial again, once.
+            Err(_) if closed_idle(&conn) => {
+                let (peer, conn) = self.connection(addr).await?;
+                let (send, recv) = open_on(&conn, service).await?;
+                Ok((peer, send, recv))
+            }
+            opened => opened.map(|(send, recv)| (peer, send, recv)),
+        }
     }
 
     /// The next stream another device opened for one of `Config::services`.
@@ -384,10 +387,51 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
 }
 
 /// Answers a connection's streams until it closes, then forgets it.
+/// One of a connection's streams, counted as open until dropped.
+#[derive(Debug)]
+pub(crate) struct Open(Arc<AtomicUsize>);
+
+impl Open {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The next stream the other side opens. With `Limits::idle`, a connection
+/// with no stream open for that long is closed, and this says `None`.
+async fn next_bi(
+    conn: &Connection,
+    idle: Option<Duration>,
+    open: &AtomicUsize,
+) -> Option<(SendStream, RecvStream)> {
+    let Some(idle) = idle else {
+        return conn.accept_bi().await.ok();
+    };
+    loop {
+        match tokio::time::timeout(idle, conn.accept_bi()).await {
+            Ok(accepted) => return accepted.ok(),
+            Err(_) if open.load(Ordering::Relaxed) == 0 => {
+                conn.close(IDLE.into(), b"idle");
+                return None;
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 async fn serve(shared: Arc<Shared>, peer: Peer, conn: Connection) {
     let device = peer.device;
-    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+    let open = Arc::new(AtomicUsize::new(0));
+    while let Some((mut send, mut recv)) = next_bi(&conn, shared.limits.idle, &open).await {
         let (shared, peer, direct_ip) = (shared.clone(), peer.clone(), direct_ip(&conn));
+        let open = Open::new(&open);
         tokio::spawn(async move {
             match frame::read_tag(&mut recv).await.as_deref() {
                 Ok(tag) if shared.services.iter().any(|s| s == tag) => {
@@ -397,6 +441,7 @@ async fn serve(shared: Arc<Shared>, peer: Peer, conn: Connection) {
                         send,
                         recv,
                         direct_ip,
+                        _open: open,
                     };
                     if let Err(mpsc::error::TrySendError::Full(mut stream)) =
                         shared.streams.try_send(stream)
@@ -420,6 +465,28 @@ async fn serve(shared: Arc<Shared>, peer: Peer, conn: Connection) {
         });
     }
     lock(&shared.conns).remove(&(device, conn.stable_id()));
+}
+
+/// A stream on `conn` for `service`.
+async fn open_on(
+    conn: &Connection,
+    service: &str,
+) -> Result<(SendStream, RecvStream), TransportError> {
+    let (mut send, recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| TransportError::Unreachable(e.to_string()))?;
+    frame::write_tag(&mut send, service)
+        .await
+        .map_err(dropped)?;
+    Ok((send, recv))
+}
+
+fn closed_idle(conn: &Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(c)) if c.error_code == IDLE.into()
+    )
 }
 
 /// Whether the connection's current path is direct or through a relay.

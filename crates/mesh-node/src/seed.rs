@@ -11,7 +11,7 @@ use crate::codes::{self, Caller, Get, Store};
 use crate::saved::Snapshot;
 use crate::{addrs, knocks};
 use mesh_identity::{DeviceCert, DeviceKey, RootKey, unix_now};
-use mesh_transport::{Config, MeshAddr, Node, Relays, ServiceStream, frame};
+use mesh_transport::{Config, Limits, MeshAddr, Node, Relays, ServiceStream, frame};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,16 @@ struct Stores {
     knocks: Arc<Mutex<knocks::Store>>,
 }
 
+/// Clients connect only to ask something, then go quiet: close a connection
+/// idle this long, so people unlocked all day don't hold one each (audit
+/// finding 7). They dial again on their next request.
+const IDLE: Duration = Duration::from_secs(30);
+/// Open connections at once: with `IDLE`, people asking within 30 s of each
+/// other, not people online. Each costs tens of KiB.
+const CONNECTIONS: usize = 2048;
+/// Handshakes under way at once.
+const HANDSHAKES: usize = 128;
+
 pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
     let (root, device) = key(&dir.join(KEY_FILE))?;
     let cert = DeviceCert::issue(&root, &device.public(), "seed", unix_now())
@@ -83,6 +93,12 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
         services: [HOLD, GET, REVOKE, ADDR_PUT, ADDR_GET, KNOCK_PUT, KNOCK_GET]
             .map(String::from)
             .to_vec(),
+        limits: Limits {
+            connections: CONNECTIONS,
+            handshakes: HANDSHAKES,
+            idle: Some(IDLE),
+            ..Limits::default()
+        },
         ..Config::default()
     };
     let node = Arc::new(

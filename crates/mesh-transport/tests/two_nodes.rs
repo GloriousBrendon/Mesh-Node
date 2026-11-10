@@ -422,3 +422,33 @@ async fn disconnect_closes_connections_made_both_ways_at_once() {
     );
     assert_eq!(b.status().connections, 0);
 }
+
+/// A seed closes connections that sit idle, so people who stay unlocked all
+/// day don't use up its connection limit (audit finding 7). A stream still
+/// open keeps its connection; the next request just dials again.
+#[tokio::test]
+async fn idle_connections_close_and_the_next_request_redials() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let limits = Limits {
+        idle: Some(Duration::from_millis(300)),
+        ..Limits::default()
+    };
+    let b = bob.node_with("seed", limits).await;
+    let a = alice.node("laptop").await;
+    let to_b = addr_of(&b);
+
+    // A stream that stays open keeps the connection.
+    let (_, mut send, _recv) = a.open(&to_b, "echo").await.unwrap();
+    frame::write_frame(&mut send, b"held").await.unwrap();
+    let held = b.next_stream().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(b.status().connections, 1, "closed with a stream open");
+
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(b.status().connections, 0, "an idle connection stayed");
+    assert!(a.ping(&to_b).await.is_ok());
+    let (_, mut send, _recv) = a.open(&to_b, "echo").await.unwrap();
+    frame::write_frame(&mut send, b"again").await.unwrap();
+    assert!(b.next_stream().await.is_some());
+}
