@@ -5,10 +5,14 @@
 
 mod bundle;
 mod envelope;
+mod session;
 
 pub use bundle::{Bundle, MAX_BUNDLE_LEN};
 pub use envelope::{
     Envelope, EnvelopeType, Inside, Kind, MAX_BODY, MAX_INSIDE, open_sealed, seal_for,
+};
+pub use session::{
+    Conversation, E2ee, FALLBACK_LIFE, MAX_FIELD_LEN, MAX_ONE_TIME_KEYS, Opened, Received,
 };
 
 /// Why something couldn't be encrypted or opened. Each is fixed text and
@@ -25,6 +29,16 @@ pub enum E2eeError {
     NotForUs,
     #[error("the message is too long")]
     TooLong,
+    #[error("no keys have been seen for that person yet")]
+    NoKeys,
+    #[error("that message was already opened")]
+    Replay,
+    #[error("couldn't open that message")]
+    CantOpen,
+    #[error("that message is from a device we don't know")]
+    UnknownSender,
+    #[error("that message isn't for a conversation we're in")]
+    NotMember,
     #[error("couldn't get randomness from the system")]
     Random,
 }
