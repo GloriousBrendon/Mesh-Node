@@ -19,9 +19,13 @@
 //! the username, the root key and the device list, but no device key: each
 //! install needs its own, so a restored device makes a new one.
 //!
-//! Contacts (routing) follow the contents as a second postcard value, only
-//! when there are any: a file without them is exactly the earlier format,
-//! and postcard ignores what follows a value, so older Mesh still opens it.
+//! Contacts (routing) follow the contents as a second postcard value, and
+//! the account state (social) as a third, only when there are any: a file
+//! without them is exactly the earlier format, and postcard ignores what
+//! follows a value, so older Mesh still opens it.
+//!
+//! The account state is the source of who you know; routing's contacts are
+//! kept in step with its `outgoing` and `friend` entries after every change.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -33,10 +37,12 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::account::{Account, Entry, Kind, Status};
 use crate::code::{ActiveCode, CodeError, CodeRevoke, FriendCode, HeldCode};
 use crate::contacts::{Contact, LastAddr, MAX_CONTACTS, clean_name};
 use crate::device::{DeviceCert, DeviceList};
 use crate::id::{DeviceKey, MeshId, RootKey};
+use crate::knock::Knock;
 use crate::link::{LinkError, LinkedIdentity};
 use crate::pair::PairKeys;
 use crate::password::{PasswordVerdict, check_password, normalize_username, valid_username};
@@ -52,6 +58,11 @@ const WRAPPED_LEN: usize = NONCE_LEN + 32 + TAG_LEN;
 const PARAMS_END: usize = 4 + 1 + 12 + SALT_LEN;
 /// Plus the wrap nonce and the wrapped data key.
 const HEADER_LEN: usize = PARAMS_END + WRAPPED_LEN;
+/// IDs one identity can block (SPEC-social D10).
+pub const MAX_BLOCKS: usize = 10_000;
+/// How long a code stays listed after it expires, so the requests left with
+/// it can still be collected (SPEC-social D6, D7).
+const CODE_COLLECT: u64 = 8 * 24 * 3600;
 
 /// Argon2id settings, kept in the header so they can be raised later without
 /// breaking old files.
@@ -122,6 +133,12 @@ pub enum KeystoreError {
     BadContactName,
     #[error("you can have at most {MAX_CONTACTS} contacts")]
     TooManyContacts,
+    #[error("you've blocked that ID; unblock them first")]
+    Blocked,
+    #[error("you can block at most {MAX_BLOCKS} IDs")]
+    TooManyBlocks,
+    #[error("there's no request from that ID")]
+    NoRequest,
     #[error("couldn't use the system keyring: {0}")]
     Keyring(String),
     #[error("couldn't get randomness from the system: {0}")]
@@ -301,6 +318,7 @@ pub struct Keystore {
     devices: DeviceList,
     codes: Vec<ActiveCode>,
     contacts: Vec<Contact>,
+    account: Account,
 }
 
 impl Keystore {
@@ -363,6 +381,7 @@ impl Keystore {
             devices,
             codes: Vec::new(),
             contacts: Vec::new(),
+            account: Account::default(),
         };
         store.save()?;
         Ok(store)
@@ -388,14 +407,14 @@ impl Keystore {
     }
 
     fn decode(path: &Path, sealed: Sealed, plain: &[u8]) -> Result<Self, KeystoreError> {
-        let (contents, contacts) = decode_with_contacts::<Contents>(plain)?;
+        let (contents, contacts, account) = decode_with_contacts::<Contents>(plain)?;
         let root = RootKey::from_secret_bytes(contents.root_secret);
         let devices = DeviceList::from_bytes(&contents.device_list)
             .map_err(|_| KeystoreError::CannotUnlock)?;
         if devices.root() != root.id() {
             return Err(KeystoreError::CannotUnlock);
         }
-        Ok(Self {
+        let mut store = Self {
             path: path.to_owned(),
             sealed,
             username: contents.username.clone(),
@@ -404,7 +423,25 @@ impl Keystore {
             devices,
             codes: contents.codes.clone(),
             contacts,
-        })
+            account,
+        };
+        store.adopt_contacts();
+        Ok(store)
+    }
+
+    /// Routing's contacts with no account entry (a keystore from before
+    /// `social`) become `outgoing`: the first connection makes them friends.
+    fn adopt_contacts(&mut self) {
+        let by = self.by();
+        for c in &self.contacts {
+            if self.account.get(&c.id()).is_none() {
+                self.account.change(&c.id(), by, c.added, |e| {
+                    e.kind = Kind::Outgoing;
+                    e.nick = c.name.clone();
+                    e.at = c.added;
+                });
+            }
+        }
     }
 
     /// Where this keystore lives.
@@ -452,7 +489,7 @@ impl Keystore {
             root_secret: *self.root.secret_bytes(),
             device_list: self.devices.to_bytes(),
         };
-        let plain = encode_with_contacts(&contents, &self.contacts)?;
+        let plain = encode_with_contacts(&contents, &self.contacts, &self.account)?;
         Sealed::new(BACKUP_MAGIC, params, &self.username, password)?.save(path, &plain)
     }
 
@@ -494,7 +531,7 @@ impl Keystore {
                 password: backup_password,
             },
         )?;
-        let (contents, contacts) = decode_with_contacts::<BackupContents>(&plain)?;
+        let (contents, contacts, account) = decode_with_contacts::<BackupContents>(&plain)?;
         let root = RootKey::from_secret_bytes(contents.root_secret);
         let backed_up = DeviceList::from_bytes(&contents.device_list)
             .map_err(|_| KeystoreError::CannotUnlock)?;
@@ -514,8 +551,10 @@ impl Keystore {
             device,
             devices,
         )?;
-        if !contacts.is_empty() {
+        if !contacts.is_empty() || !account.is_empty() {
             store.contacts = contacts;
+            store.account = account;
+            store.adopt_contacts();
             store.save()?;
         }
         Ok(store)
@@ -589,7 +628,8 @@ impl Keystore {
         let code = FriendCode::generate().map_err(KeystoreError::Random)?;
         let now = unix_now();
         let held = HeldCode::new(&self.root, &code, now, expiry, uses)?;
-        self.codes.retain(|c| !expired(c, now));
+        self.codes
+            .retain(|c| !expired(c, now.saturating_sub(CODE_COLLECT)));
         self.codes.push(ActiveCode {
             code,
             created_at: now,
@@ -623,6 +663,24 @@ impl Keystore {
             .collect()
     }
 
+    /// Every code still listed, expired or not: requests left with them may
+    /// still be waiting (SPEC-social D7).
+    pub fn collect_codes(&self) -> &[ActiveCode] {
+        &self.codes
+    }
+
+    /// The revoke for one of this identity's codes, which also reads the
+    /// requests left with it (SPEC-social D3).
+    pub fn code_revoke(&self, code: &FriendCode) -> CodeRevoke {
+        CodeRevoke::new(&self.root, code)
+    }
+
+    /// Takes a code off the list once its requests are collected.
+    pub fn drop_code(&mut self, code: &FriendCode) -> Result<(), KeystoreError> {
+        self.codes.retain(|c| c.code != *code);
+        self.save()
+    }
+
     /// Removes `code` from the list and returns the revoke to send to its
     /// holder. Works for codes made on another device too.
     pub fn revoke_code(&mut self, code: &FriendCode) -> Result<CodeRevoke, KeystoreError> {
@@ -647,7 +705,7 @@ impl Keystore {
             device_list: self.devices.to_bytes(),
             codes: self.codes.clone(),
         };
-        let plain = encode_with_contacts(&contents, &self.contacts)?;
+        let plain = encode_with_contacts(&contents, &self.contacts, &self.account)?;
         self.sealed.save(&self.path, &plain)
     }
 
@@ -659,37 +717,193 @@ impl Keystore {
         self.contacts.iter().find(|c| c.id() == *id)
     }
 
-    pub fn add_contact(&mut self, id: MeshId, name: &str) -> Result<(), KeystoreError> {
+    /// Who you know (SPEC-social D8).
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
+    /// Adds `id` by ID, or after sending them a request: `outgoing` until
+    /// they connect. If they'd asked you, this accepts. `nick` may be empty.
+    pub fn add_contact(&mut self, id: MeshId, nick: &str) -> Result<(), KeystoreError> {
         if id == self.id() {
             return Err(KeystoreError::OwnId);
         }
-        if self.contact(&id).is_some() {
-            return Err(KeystoreError::AlreadyContact);
+        let nick = clean_nick(nick)?;
+        match self.account.kind(&id) {
+            Some(Kind::Outgoing | Kind::Friend) => return Err(KeystoreError::AlreadyContact),
+            Some(Kind::Blocked) => return Err(KeystoreError::Blocked),
+            Some(Kind::Incoming) => return self.accept(&id),
+            _ => {}
         }
         if self.contacts.len() >= MAX_CONTACTS {
             return Err(KeystoreError::TooManyContacts);
         }
-        let name = clean_name(name).ok_or(KeystoreError::BadContactName)?;
         // A weak key could never be reached; refuse it up front.
         PairKeys::new(&self.root, &id).ok_or(KeystoreError::BadContactName)?;
-        self.contacts.push(Contact::new(id, name, unix_now()));
-        self.save()
+        let now = unix_now();
+        self.set_kind(&id, Kind::Outgoing, |e| {
+            e.nick = nick;
+            e.at = now;
+        })
     }
 
+    /// A request arrived. Dropped if they're blocked or already a friend; if
+    /// you'd asked them too, you're friends now. True if anything changed.
+    pub fn knocked(&mut self, knock: &Knock) -> Result<bool, KeystoreError> {
+        let id = knock.sender;
+        let seen = |e: &Entry| e.at >= knock.created_at;
+        match self.account.kind(&id) {
+            _ if id == self.id() => Ok(false),
+            Some(Kind::Blocked | Kind::Friend) => Ok(false),
+            Some(Kind::Incoming) if self.account.get(&id).is_some_and(seen) => Ok(false),
+            Some(Kind::Outgoing) => self.set_kind(&id, Kind::Friend, |_| {}).map(|()| true),
+            _ => {
+                let (name, note, at) = (knock.name.clone(), knock.note.clone(), knock.created_at);
+                self.set_kind(&id, Kind::Incoming, |e| {
+                    (e.name, e.note, e.at) = (name, note, at)
+                })?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub fn accept(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
+        if self.account.kind(id) != Some(Kind::Incoming) {
+            return Err(KeystoreError::NoRequest);
+        }
+        if self.contacts.len() >= MAX_CONTACTS {
+            return Err(KeystoreError::TooManyContacts);
+        }
+        self.set_kind(id, Kind::Friend, |_| {})
+    }
+
+    /// Drops their request; nothing tells them (SPEC-social D9).
+    pub fn decline(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
+        if self.account.kind(id) != Some(Kind::Incoming) {
+            return Err(KeystoreError::NoRequest);
+        }
+        self.set_kind(id, Kind::Removed, |_| {})
+    }
+
+    /// Removes a friend, or cancels a request you sent.
     pub fn remove_contact(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
-        let before = self.contacts.len();
-        self.contacts.retain(|c| c.id() != *id);
-        if self.contacts.len() == before {
+        if !matches!(self.account.kind(id), Some(Kind::Outgoing | Kind::Friend)) {
             return Err(KeystoreError::NotAContact);
         }
+        self.set_kind(id, Kind::Removed, |_| {})
+    }
+
+    pub fn block(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
+        if *id == self.id() {
+            return Err(KeystoreError::OwnId);
+        }
+        let blocks = self.account.entries().iter();
+        let blocks = blocks.filter(|e| e.kind == Kind::Blocked).count();
+        if self.account.kind(id) != Some(Kind::Blocked) && blocks >= MAX_BLOCKS {
+            return Err(KeystoreError::TooManyBlocks);
+        }
+        let now = unix_now();
+        self.set_kind(id, Kind::Blocked, |e| e.at = now)
+    }
+
+    /// Unblocking doesn't bring a friendship back.
+    pub fn unblock(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
+        if self.account.kind(id) != Some(Kind::Blocked) {
+            return Err(KeystoreError::NotAContact);
+        }
+        self.set_kind(id, Kind::Removed, |_| {})
+    }
+
+    /// Your name for them; empty clears it.
+    pub fn rename_contact(&mut self, id: &MeshId, nick: &str) -> Result<(), KeystoreError> {
+        let nick = clean_nick(nick)?;
+        let kind = self.known(id)?;
+        self.set_kind(id, kind, |e| e.nick = nick)
+    }
+
+    /// After comparing the safety number (SPEC-social D14).
+    pub fn verify(&mut self, id: &MeshId, verified: bool) -> Result<(), KeystoreError> {
+        let kind = self.known(id)?;
+        self.set_kind(id, kind, |e| e.verified = verified)
+    }
+
+    pub fn set_status(&mut self, status: Status) -> Result<(), KeystoreError> {
+        self.account.set_status(status, self.by(), unix_now());
         self.save()
     }
 
-    pub fn rename_contact(&mut self, id: &MeshId, name: &str) -> Result<(), KeystoreError> {
-        let name = clean_name(name).ok_or(KeystoreError::BadContactName)?;
-        let contact = self.contact_mut(id)?;
-        contact.name = name;
+    /// A connection with `id` passed the handshake. Their device let us in,
+    /// so an `outgoing` contact has added us too: friends now (D8). True if
+    /// that changed anything.
+    pub fn connected(&mut self, id: &MeshId) -> Result<bool, KeystoreError> {
+        if self.account.kind(id) != Some(Kind::Outgoing) {
+            return Ok(false);
+        }
+        self.set_kind(id, Kind::Friend, |_| {}).map(|()| true)
+    }
+
+    /// Takes in another device's account state (SPEC-social D11). True if
+    /// anything changed here.
+    pub fn merge_account(&mut self, other: &Account) -> Result<bool, KeystoreError> {
+        if !self.account.merge(other) {
+            return Ok(false);
+        }
+        self.account.prune(unix_now());
+        self.follow_account();
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Their kind, if they're in your lists as anything but a tombstone.
+    fn known(&self, id: &MeshId) -> Result<Kind, KeystoreError> {
+        match self.account.kind(id) {
+            None | Some(Kind::Removed) => Err(KeystoreError::NotAContact),
+            Some(kind) => Ok(kind),
+        }
+    }
+
+    fn set_kind(
+        &mut self,
+        id: &MeshId,
+        kind: Kind,
+        f: impl FnOnce(&mut Entry),
+    ) -> Result<(), KeystoreError> {
+        let now = unix_now();
+        self.account.change(id, self.by(), now, |e| {
+            if kind != Kind::Incoming {
+                e.note.clear();
+            }
+            if matches!(kind, Kind::Removed | Kind::Blocked) {
+                e.verified = false;
+            }
+            e.kind = kind;
+            f(e);
+        });
+        self.account.prune(now);
+        self.follow_account();
         self.save()
+    }
+
+    /// Keeps routing's contacts to exactly the `outgoing` and `friend` entries.
+    fn follow_account(&mut self) {
+        let account = &self.account;
+        let reachable =
+            |id: &MeshId| matches!(account.kind(id), Some(Kind::Outgoing | Kind::Friend));
+        self.contacts.retain(|c| reachable(&c.id()));
+        for e in account.entries() {
+            let id = e.id();
+            if reachable(&id) {
+                match self.contacts.iter_mut().find(|c| c.id() == id) {
+                    Some(c) => c.name = e.nick.clone(),
+                    None => self.contacts.push(Contact::new(id, e.nick.clone(), e.at)),
+                }
+            }
+        }
+    }
+
+    /// This device, as the tie-breaker in account stamps.
+    fn by(&self) -> [u8; 32] {
+        *self.device.public().as_bytes()
     }
 
     /// A handshake with `id`'s device worked through `last`: cache it, and
@@ -717,33 +931,51 @@ impl Keystore {
     }
 }
 
-/// `value`, then the contacts if there are any (see the module docs).
+/// `value`, then the contacts and the account state if there are any (see
+/// the module docs).
 fn encode_with_contacts<T: Serialize>(
     value: &T,
     contacts: &[Contact],
+    account: &Account,
 ) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
     let to_io = |e: postcard::Error| std::io::Error::other(e.to_string());
     let mut plain = Zeroizing::new(postcard::to_allocvec(value).map_err(to_io)?);
-    if !contacts.is_empty() {
+    if !contacts.is_empty() || !account.is_empty() {
         plain.extend_from_slice(&postcard::to_allocvec(contacts).map_err(to_io)?);
+    }
+    if !account.is_empty() {
+        plain.extend_from_slice(&account.to_bytes());
     }
     Ok(plain)
 }
 
 fn decode_with_contacts<T: serde::de::DeserializeOwned>(
     plain: &[u8],
-) -> Result<(T, Vec<Contact>), KeystoreError> {
-    let (value, rest) =
-        postcard::take_from_bytes::<T>(plain).map_err(|_| KeystoreError::CannotUnlock)?;
-    let contacts: Vec<Contact> = if rest.is_empty() {
-        Vec::new()
+) -> Result<(T, Vec<Contact>, Account), KeystoreError> {
+    let bad = |_| KeystoreError::CannotUnlock;
+    let (value, rest) = postcard::take_from_bytes::<T>(plain).map_err(bad)?;
+    let (contacts, rest): (Vec<Contact>, &[u8]) = if rest.is_empty() {
+        (Vec::new(), rest)
     } else {
-        postcard::from_bytes(rest).map_err(|_| KeystoreError::CannotUnlock)?
+        postcard::take_from_bytes(rest).map_err(bad)?
+    };
+    let account = if rest.is_empty() {
+        Account::default()
+    } else {
+        Account::from_bytes(rest).ok_or(KeystoreError::CannotUnlock)?
     };
     if !contacts.iter().all(Contact::valid) {
         return Err(KeystoreError::CannotUnlock);
     }
-    Ok((value, contacts))
+    Ok((value, contacts, account))
+}
+
+/// A nickname, trimmed; empty is allowed (no nickname).
+fn clean_nick(nick: &str) -> Result<String, KeystoreError> {
+    match nick.trim() {
+        "" => Ok(String::new()),
+        n => clean_name(n).ok_or(KeystoreError::BadContactName),
+    }
 }
 
 /// Argon2id over `normalize(username) || 0 || password`.
@@ -1070,7 +1302,7 @@ mod tests {
             Err(KeystoreError::OwnId)
         ));
         assert!(matches!(
-            store.add_contact(friend, "  "),
+            store.add_contact(friend, &"x".repeat(65)),
             Err(KeystoreError::BadContactName)
         ));
         store.add_contact(friend, " Alex ").unwrap();
@@ -1131,6 +1363,113 @@ mod tests {
         ));
         drop(store);
         let store = Keystore::unlock(&path, "Brendon", OTHER_PASSWORD).unwrap();
+        assert_eq!(store.contacts().len(), 1);
+    }
+
+    fn knock_from(root: &RootKey, at: u64) -> Knock {
+        let device = DeviceKey::generate().unwrap();
+        let cert = DeviceCert::issue(root, &device.public(), "pc", 1).unwrap();
+        Knock {
+            sender: root.id(),
+            devices: DeviceList::first(root, cert).unwrap(),
+            name: "Sam".into(),
+            note: "hi".into(),
+            created_at: at,
+        }
+    }
+
+    #[test]
+    fn the_lists_follow_the_account_and_are_backed_up() {
+        let path = temp_path("social");
+        let mut store = create(&path);
+        let (sam, eve, kim) = (
+            RootKey::generate().unwrap(),
+            RootKey::generate().unwrap(),
+            RootKey::generate().unwrap(),
+        );
+        let now = unix_now();
+
+        // A request isn't a contact: it isn't let in until accepted.
+        assert!(store.knocked(&knock_from(&sam, now)).unwrap());
+        assert!(!store.knocked(&knock_from(&sam, now)).unwrap());
+        assert_eq!(store.account().kind(&sam.id()), Some(Kind::Incoming));
+        assert_eq!(store.account().get(&sam.id()).unwrap().note, "hi");
+        assert!(store.contacts().is_empty());
+        store.accept(&sam.id()).unwrap();
+        assert_eq!(store.account().kind(&sam.id()), Some(Kind::Friend));
+        assert_eq!(store.contacts().len(), 1);
+        assert!(!store.knocked(&knock_from(&sam, now + 1)).unwrap());
+
+        // Blocked: never a contact, requests dropped.
+        store.knocked(&knock_from(&eve, now)).unwrap();
+        store.block(&eve.id()).unwrap();
+        assert!(!store.knocked(&knock_from(&eve, now + 5)).unwrap());
+        assert!(matches!(
+            store.add_contact(eve.id(), ""),
+            Err(KeystoreError::Blocked)
+        ));
+        assert!(matches!(
+            store.accept(&eve.id()),
+            Err(KeystoreError::NoRequest)
+        ));
+        assert_eq!(store.contacts().len(), 1);
+
+        // Added by ID, then their device connects: friends.
+        store.add_contact(kim.id(), "").unwrap();
+        assert_eq!(store.account().kind(&kim.id()), Some(Kind::Outgoing));
+        assert!(store.connected(&kim.id()).unwrap());
+        assert!(!store.connected(&kim.id()).unwrap());
+        assert_eq!(store.account().kind(&kim.id()), Some(Kind::Friend));
+        store.verify(&kim.id(), true).unwrap();
+        store.set_status(Status::Dnd).unwrap();
+
+        // Backed up, and opened as a second device.
+        let backup = path.with_file_name("social.mkb");
+        store.export_with(&backup, OTHER_PASSWORD, FAST).unwrap();
+        let laptop = path.with_file_name("social-laptop.mks");
+        let mut second = Keystore::import_with(
+            &backup,
+            &laptop,
+            "Brendon",
+            OTHER_PASSWORD,
+            PASSWORD,
+            "Laptop",
+            FAST,
+        )
+        .unwrap();
+        assert_eq!(second.account(), store.account());
+        assert_eq!(second.contacts().len(), 2);
+
+        // The laptop removes Sam; the desktop takes the change in.
+        second.remove_contact(&sam.id()).unwrap();
+        assert!(store.merge_account(second.account()).unwrap());
+        assert!(!store.merge_account(second.account()).unwrap());
+        assert_eq!(store.account().kind(&sam.id()), Some(Kind::Removed));
+        assert_eq!(store.contacts().len(), 1);
+        store.unblock(&eve.id()).unwrap();
+        assert_eq!(store.account().kind(&eve.id()), Some(Kind::Removed));
+
+        let account = store.account().clone();
+        drop(store);
+        let store = Keystore::unlock(&path, "Brendon", PASSWORD).unwrap();
+        assert_eq!(store.account(), &account);
+        assert_eq!(store.account().status(), Status::Dnd);
+        assert!(store.account().get(&kim.id()).unwrap().verified);
+    }
+
+    #[test]
+    fn routing_contacts_open_as_outgoing() {
+        let path = temp_path("adopt");
+        let mut store = create(&path);
+        let friend = RootKey::generate().unwrap().id();
+        store.add_contact(friend, "Alex").unwrap();
+        // As a keystore from routing: contacts, but no account state.
+        store.account = Account::default();
+        store.save().unwrap();
+        drop(store);
+        let store = Keystore::unlock(&path, "Brendon", PASSWORD).unwrap();
+        let entry = store.account().get(&friend).unwrap();
+        assert_eq!((entry.kind, entry.nick.as_str()), (Kind::Outgoing, "Alex"));
         assert_eq!(store.contacts().len(), 1);
     }
 
