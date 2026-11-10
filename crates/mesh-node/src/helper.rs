@@ -959,7 +959,7 @@ impl Helper {
             Back::Unsent(unsent) => {
                 let (device, envelopes) = *unsent;
                 if self.net.is_some() {
-                    self.waiting.entry(device).or_default().extend(envelopes);
+                    e2ee::wait(&mut self.waiting, device, envelopes);
                 }
                 return;
             }
@@ -1553,7 +1553,7 @@ impl Helper {
     fn deliver(&mut self, device: [u8; 32], envelopes: Vec<Vec<u8>>) {
         let (Some(net), Some((owner, addr))) = (&self.net, self.devices_at.get(&device).cloned())
         else {
-            return self.waiting.entry(device).or_default().extend(envelopes);
+            return e2ee::wait(&mut self.waiting, device, envelopes);
         };
         let connected = net.node.connected(&owner);
         let live = connected.iter().any(|a| *a.device.as_bytes() == device);
@@ -2050,7 +2050,7 @@ async fn serve_streams(
                     relay: None,
                     direct: Vec::new(),
                 };
-                let frames = e2ee::read(&mut stream).await;
+                let frames = e2ee::read(&mut stream.recv).await;
                 if !frames.is_empty() {
                     let _ = back.send(Back::Envelopes(Box::new((stream.peer.id, from, frames))));
                 }

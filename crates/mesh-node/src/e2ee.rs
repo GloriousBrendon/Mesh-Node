@@ -3,12 +3,13 @@
 //! records feed the bundle directory, and envelopes travel over the `e2ee`
 //! service, one per frame (`flags u8 | envelope`; bit 0 says it waited).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::routing::{self, Target};
 use mesh_e2ee::E2ee;
 use mesh_identity::{AddrRecord, MeshId};
-use mesh_transport::{MeshAddr, Node, ServiceStream};
+use mesh_transport::{MeshAddr, Node};
 
 /// One stream's frames: each frame's flags and its envelope.
 pub type Frames = Vec<(u8, Vec<u8>)>;
@@ -52,6 +53,10 @@ pub fn parse_conversation(text: &str) -> Option<[u8; 16]> {
 }
 /// The longest frame: the largest envelope, with room for Olm's overhead.
 pub const MAX_FRAME: usize = mesh_e2ee::MAX_INSIDE + 1024;
+/// Frames read from one stream at most (each up to `MAX_FRAME`).
+pub const MAX_FRAMES: usize = 256;
+/// Envelopes kept for one device that isn't connected.
+pub const MAX_WAITING: usize = 256;
 /// How long a device has to take what we send it.
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -87,31 +92,88 @@ pub fn learn(e2ee: &mut E2ee, id: &MeshId, records: &[AddrRecord]) -> bool {
     e2ee.devices_known(id) > knew
 }
 
-/// Sends frames to one device over the `e2ee` service. True once it took them.
+/// Sends frames to one device over the `e2ee` service, `MAX_FRAMES` to a
+/// stream as the reader takes them. True once it took them all.
 pub async fn send(node: &Node, addr: &MeshAddr, frames: &[Vec<u8>]) -> bool {
-    let sent = async {
-        let (_, mut send, _recv) = node.open(addr, SERVICE).await.ok()?;
-        for frame in frames {
-            mesh_transport::frame::write_frame(&mut send, frame)
-                .await
-                .ok()?;
+    for batch in frames.chunks(MAX_FRAMES) {
+        let sent = async {
+            let (_, mut send, _recv) = node.open(addr, SERVICE).await.ok()?;
+            for frame in batch {
+                mesh_transport::frame::write_frame(&mut send, frame)
+                    .await
+                    .ok()?;
+            }
+            send.finish().ok()?;
+            send.stopped().await.ok()
+        };
+        if !matches!(tokio::time::timeout(SEND_TIMEOUT, sent).await, Ok(Some(_))) {
+            return false;
         }
-        send.finish().ok()?;
-        send.stopped().await.ok()
-    };
-    matches!(tokio::time::timeout(SEND_TIMEOUT, sent).await, Ok(Some(_)))
+    }
+    true
 }
 
 /// Reads one `e2ee` stream's frames: each is the flags and the envelope.
-pub async fn read(stream: &mut ServiceStream) -> Frames {
+/// At most `MAX_FRAMES`; the sender sends the rest on another stream.
+pub async fn read(recv: &mut (impl tokio::io::AsyncRead + Unpin)) -> Frames {
     let mut frames = Vec::new();
-    loop {
-        let read = mesh_transport::frame::read_frame(&mut stream.recv);
+    while frames.len() < MAX_FRAMES {
+        let read = mesh_transport::frame::read_frame(recv);
         match tokio::time::timeout(SEND_TIMEOUT, read).await {
             Ok(Ok(Some(frame))) if frame.len() > 1 && frame.len() <= MAX_FRAME => {
                 frames.push((frame[0], frame[1..].to_vec()));
             }
             _ => return frames,
         }
+    }
+    frames
+}
+
+/// Keeps envelopes for a device that isn't connected: the newest
+/// `MAX_WAITING`, so one that stays away can't grow it without end.
+// ponytail: in memory until `dm` keeps waiting events on disk (D5).
+pub fn wait(
+    waiting: &mut HashMap<[u8; 32], Vec<Vec<u8>>>,
+    device: [u8; 32],
+    envelopes: Vec<Vec<u8>>,
+) {
+    let queue = waiting.entry(device).or_default();
+    queue.extend(envelopes);
+    let over = queue.len().saturating_sub(MAX_WAITING);
+    queue.drain(..over);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One friend's stream, or one device that stays away, can't fill this
+    /// device's memory (audit finding 13).
+    #[tokio::test]
+    async fn a_stream_and_a_waiting_queue_have_caps() {
+        let mut sent = Vec::new();
+        for i in 0..MAX_FRAMES + 50 {
+            let frame = [&[0u8][..], &(i as u32).to_be_bytes()].concat();
+            mesh_transport::frame::write_frame(&mut sent, &frame)
+                .await
+                .unwrap();
+        }
+        let frames = read(&mut &sent[..]).await;
+        assert_eq!(frames.len(), MAX_FRAMES);
+
+        let mut waiting = HashMap::new();
+        let device = [1; 32];
+        wait(
+            &mut waiting,
+            device,
+            (0..MAX_WAITING as u32)
+                .map(|i| i.to_be_bytes().to_vec())
+                .collect(),
+        );
+        wait(&mut waiting, device, vec![b"newest".to_vec()]);
+        let queue = &waiting[&device];
+        assert_eq!(queue.len(), MAX_WAITING);
+        assert_eq!(queue.last().unwrap(), b"newest", "the oldest goes");
+        assert_eq!(queue[0], 1u32.to_be_bytes());
     }
 }
