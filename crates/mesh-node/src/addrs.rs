@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 pub const PUTS_PER_DEVICE: u32 = 2000;
 /// Records one network (/24 or /48) may put an hour.
 pub const PUTS_PER_NETWORK: u32 = 4000;
+/// Records everyone reaching the seed through a relay may put an hour,
+/// together: half of what it holds.
+pub const PUTS_RELAYED: u32 = MAX_RECORDS as u32 / 2;
 /// Lookups one device may make a minute.
 pub const GETS_PER_DEVICE: u32 = 120;
 /// Records under one lookup ID: one per device of the sender.
@@ -162,9 +165,7 @@ impl Store {
             return Put::Bad;
         }
         let mut keys = vec![(caller.device.to_vec(), PUTS_PER_DEVICE)];
-        if let Some(net) = caller.network {
-            keys.push(([b"net:".as_slice(), &net].concat(), PUTS_PER_NETWORK));
-        }
+        keys.push(caller.network_limit(PUTS_PER_NETWORK, PUTS_RELAYED));
         if !self.puts.allow(now, HOUR, &keys) {
             return Put::SlowDown;
         }
@@ -295,6 +296,32 @@ mod tests {
         let got = found(s.get(&caller(3), &[1; 16], NOW));
         assert!(got.contains(&newer) && got.contains(&b) && got.len() == 2);
         assert_eq!(s.len(), 2);
+    }
+
+    /// Relayed callers share one bucket (audit finding 3, part 1).
+    #[test]
+    fn relayed_callers_share_one_bucket() {
+        let mut s = store("relayed");
+        let put = |s: &mut Store, i: u32| {
+            let mut device = [0xAA; 32];
+            device[..4].copy_from_slice(&i.to_be_bytes());
+            let mut r = record(0, 1, NOW + 100, 1);
+            r[..4].copy_from_slice(&i.to_be_bytes());
+            let relayed = Caller {
+                device,
+                network: None,
+            };
+            s.put(&relayed, &r, NOW)
+        };
+        for i in 0..PUTS_RELAYED {
+            assert_eq!(put(&mut s, i), Put::Ok);
+        }
+        assert_eq!(put(&mut s, PUTS_RELAYED), Put::SlowDown);
+        let direct = Caller {
+            device: [9; 32],
+            network: Some(crate::codes::network("203.0.113.9".parse().unwrap())),
+        };
+        assert_eq!(s.put(&direct, &record(7, 7, NOW + 100, 7), NOW), Put::Ok);
     }
 
     /// The count is kept as records come and go, not recounted (finding 8).

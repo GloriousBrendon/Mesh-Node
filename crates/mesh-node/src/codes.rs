@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 pub const LOOKUPS_PER_DEVICE: u32 = 10;
 /// Lookups one network (/24 or /48) may make a minute.
 pub const LOOKUPS_PER_NETWORK: u32 = 30;
+/// Lookups everyone reaching the seed through a relay may make a minute,
+/// together: half the total, so direct callers keep the rest.
+pub const LOOKUPS_RELAYED: u32 = LOOKUPS_TOTAL / 2;
 /// Lookups everyone together may make a minute.
 pub const LOOKUPS_TOTAL: u32 = 600;
 /// New codes one device may hold an hour.
@@ -34,6 +37,19 @@ const WHAT: &str = "code";
 pub struct Caller {
     pub device: [u8; 32],
     pub network: Option<[u8; 6]>,
+}
+
+impl Caller {
+    /// The network limit's key and size for this caller. Through a relay the
+    /// seed sees no network, and fresh keys are free, so relayed callers
+    /// share one bucket of their own (audit finding 3, part 1).
+    pub fn network_limit(&self, per_network: u32, relayed: u32) -> (Vec<u8>, u32) {
+        match self.network {
+            Some(net) => ([b"net:".as_slice(), &net].concat(), per_network),
+            // 7 bytes after the prefix: never a /24 or /48's 6.
+            None => (b"net:relayed".to_vec(), relayed),
+        }
+    }
 }
 
 /// The /24 (IPv4) or /48 (IPv6) an address is in.
@@ -277,9 +293,7 @@ impl Store {
             (caller.device.to_vec(), LOOKUPS_PER_DEVICE),
             (b"total".to_vec(), LOOKUPS_TOTAL),
         ];
-        if let Some(net) = caller.network {
-            keys.push(([b"net:".as_slice(), &net].concat(), LOOKUPS_PER_NETWORK));
-        }
+        keys.push(caller.network_limit(LOOKUPS_PER_NETWORK, LOOKUPS_RELAYED));
         if !self.lookups.allow(now, MINUTE, &keys) {
             return Get::SlowDown;
         }
@@ -373,6 +387,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Store::load(&dir.join("codes.bin")).unwrap()
+    }
+
+    /// Through a relay the seed sees no network, so fresh keys alone would
+    /// get round every limit but the total. Relayed callers share one
+    /// bucket, and direct callers keep theirs (audit finding 3, part 1).
+    fn relayed(i: u32) -> Caller {
+        let mut device = [0xAA; 32];
+        device[..4].copy_from_slice(&i.to_be_bytes());
+        Caller {
+            device,
+            network: None,
+        }
+    }
+
+    #[test]
+    fn relayed_callers_share_one_bucket() {
+        let mut s = store("relayed");
+        let root = RootKey::generate().unwrap();
+        let (_, held) = code(&root, None, None);
+        let id = held.lookup_id();
+        assert_eq!(s.hold(&caller(1), held.as_bytes(), NOW), Hold::Ok);
+        for i in 0..LOOKUPS_RELAYED {
+            assert!(matches!(s.get(&relayed(i), &id, NOW), Get::Found(_)));
+        }
+        assert_eq!(s.get(&relayed(u32::MAX), &id, NOW), Get::SlowDown);
+        let direct = Caller {
+            device: [9; 32],
+            network: Some(network("203.0.113.9".parse().unwrap())),
+        };
+        assert!(matches!(s.get(&direct, &id, NOW), Get::Found(_)));
     }
 
     #[test]
@@ -554,12 +598,14 @@ mod tests {
         };
         assert!(matches!(s.get(&elsewhere, &id, NOW + 60), Get::Found(_)));
 
-        // Everyone together.
+        // Everyone together, each from a network of their own.
         let mut found = 0;
         for i in 0..LOOKUPS_TOTAL + 5 {
+            let mut net = [7u8; 6];
+            net[..4].copy_from_slice(&i.to_be_bytes());
             let c = Caller {
                 device: (i + 1000).to_be_bytes().repeat(8).try_into().unwrap(),
-                network: None,
+                network: Some(net),
             };
             if matches!(s.get(&c, &id, NOW + 120), Get::Found(_)) {
                 found += 1;

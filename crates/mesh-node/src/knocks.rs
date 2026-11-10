@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 pub const PUTS_PER_DEVICE: u32 = 20;
 /// Requests one network (/24 or /48) may put an hour.
 pub const PUTS_PER_NETWORK: u32 = 60;
+/// Requests everyone reaching the seed through a relay may put an hour,
+/// together.
+pub const PUTS_RELAYED: u32 = 1000;
 /// Reads one device may make a minute.
 pub const GETS_PER_DEVICE: u32 = 60;
 /// Requests kept per code; past this, the oldest goes.
@@ -188,9 +191,7 @@ impl Store {
             return Put::Bad;
         };
         let mut keys = vec![(caller.device.to_vec(), PUTS_PER_DEVICE)];
-        if let Some(net) = caller.network {
-            keys.push(([b"net:".as_slice(), &net].concat(), PUTS_PER_NETWORK));
-        }
+        keys.push(caller.network_limit(PUTS_PER_NETWORK, PUTS_RELAYED));
         if !self.puts.allow(now, HOUR, &keys) {
             return Put::SlowDown;
         }
@@ -452,6 +453,25 @@ mod tests {
             network: net,
         };
         assert_eq!(s.knocks.put(&c, &k, &mut s.codes, NOW), Put::SlowDown);
+
+        // Relayed callers share one bucket (audit finding 3, part 1), in a
+        // later hour than the relayed puts above. One sender's resends: each
+        // still counts.
+        let later = NOW + 2 * HOUR;
+        for i in 0..PUTS_RELAYED {
+            let mut device = [0xAA; 32];
+            device[..4].copy_from_slice(&i.to_be_bytes());
+            let c = Caller {
+                device,
+                network: None,
+            };
+            assert_eq!(s.knocks.put(&c, &k, &mut s.codes, later), Put::Ok);
+        }
+        let c = Caller {
+            device: [251; 32],
+            network: None,
+        };
+        assert_eq!(s.knocks.put(&c, &k, &mut s.codes, later), Put::SlowDown);
 
         let revoke = CodeRevoke::new(&owner, &open);
         for _ in 0..GETS_PER_DEVICE {
