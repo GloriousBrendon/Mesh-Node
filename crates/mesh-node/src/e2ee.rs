@@ -15,6 +15,41 @@ pub type Frames = Vec<(u8, Vec<u8>)>;
 
 /// The transport service envelopes travel on.
 pub const SERVICE: &str = "e2ee";
+/// The frame flag for an envelope that waited for its reader.
+pub const WAITED: u8 = 1;
+/// A test note's text, in UTF-8 bytes (its body is `at u64 | text`).
+pub const MAX_NOTE: usize = mesh_e2ee::MAX_BODY - 8;
+
+/// A test note's body: when it was written, then the text.
+pub fn note_body(at: u64, text: &str) -> Vec<u8> {
+    [&at.to_be_bytes()[..], text.as_bytes()].concat()
+}
+
+/// A test note's time and text, if the body is one.
+pub fn read_note(body: &[u8]) -> Option<(u64, String)> {
+    let (at, text) = body.split_first_chunk::<8>()?;
+    Some((
+        u64::from_be_bytes(*at),
+        String::from_utf8(text.to_vec()).ok()?,
+    ))
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A conversation ID written as 32 hex characters.
+pub fn parse_conversation(text: &str) -> Option<[u8; 16]> {
+    let text = text.as_bytes();
+    if text.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in text.chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
 /// The longest frame: the largest envelope, with room for Olm's overhead.
 pub const MAX_FRAME: usize = mesh_e2ee::MAX_INSIDE + 1024;
 /// How long a device has to take what we send it.
@@ -37,9 +72,10 @@ pub async fn fetch(
     found
 }
 
-/// Takes in the e2ee fields of `id`'s records. True if any was new to us.
+/// Takes in the e2ee fields of `id`'s records. True if they gave us a
+/// device we had no keys for.
 pub fn learn(e2ee: &mut E2ee, id: &MeshId, records: &[AddrRecord]) -> bool {
-    let knew = e2ee.knows(id);
+    let knew = e2ee.devices_known(id);
     for record in records.iter().filter(|r| !r.e2ee.is_empty()) {
         if e2ee
             .learn(id, &record.devices, &record.device, &record.e2ee)
@@ -48,7 +84,7 @@ pub fn learn(e2ee: &mut E2ee, id: &MeshId, records: &[AddrRecord]) -> bool {
             eprintln!("mesh-node: a contact's record had e2ee keys that didn't check out");
         }
     }
-    !knew && e2ee.knows(id)
+    e2ee.devices_known(id) > knew
 }
 
 /// Sends frames to one device over the `e2ee` service. True once it took them.

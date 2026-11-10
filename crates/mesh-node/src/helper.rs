@@ -35,7 +35,7 @@ use crate::codes::{Get, Hold};
 use crate::e2ee;
 use crate::routing::{self, ReachError, Reached, Target};
 use crate::{knocks, seed};
-use mesh_e2ee::E2ee;
+use mesh_e2ee::{Conversation, E2ee, E2eeError, Kind as NoteKind, Opened};
 use mesh_identity::{
     Account, AddrRecord, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey,
     DeviceList, FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr,
@@ -251,7 +251,13 @@ struct Helper {
     e2ee: Option<E2ee>,
     /// Where each contact device was last seen (its record's relay, or its
     /// connection), to send it envelopes.
-    devices_at: HashMap<[u8; 32], MeshAddr>,
+    devices_at: HashMap<[u8; 32], (MeshId, MeshAddr)>,
+    /// Envelopes from devices whose keys we haven't seen yet, tried again
+    /// when their keys come: who sent them, the device, the frame.
+    unopened: Vec<(MeshId, MeshAddr, (u8, Vec<u8>))>,
+    /// Envelopes for devices we couldn't reach, until they connect. In memory
+    /// only: locking drops them (`mailbox` keeps them later).
+    waiting: HashMap<[u8; 32], Vec<Vec<u8>>>,
 }
 
 /// What a friend's device shows: on the wire, one byte.
@@ -311,6 +317,8 @@ enum Back {
     Records(Vec<(MeshId, Vec<AddrRecord>)>),
     /// Envelopes another device sent us: who, which device, each frame.
     Envelopes(Box<(MeshId, MeshAddr, e2ee::Frames)>),
+    /// A device didn't take these envelopes: they wait for it.
+    Unsent(Box<([u8; 32], Vec<Vec<u8>>)>),
     /// A contact answered through this address.
     Reached(Box<(MeshId, Option<LastAddr>, Option<DeviceList>)>),
     /// Someone's device connected to us and passed the handshake.
@@ -364,6 +372,8 @@ impl Helper {
             shown: tokio::sync::watch::Sender::new(Presence::Online),
             e2ee: None,
             devices_at: HashMap::new(),
+            waiting: HashMap::new(),
+            unopened: Vec::new(),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -646,6 +656,8 @@ impl Helper {
                     }
                 });
             }
+            "e2eeNote" => self.note(arg(0)?, arg(1)?, args.get(2).map(String::as_str))?,
+            "deviceRemove" => self.remove_device(arg(0)?)?,
             "netStatus" => self.emit_net(),
             "netTicket" => {
                 let ticket = self
@@ -906,15 +918,29 @@ impl Helper {
                 return self.dial_contacts();
             }
             Back::Records(found) => {
+                self.own_lists(&found);
                 let Some(e2ee) = self.e2ee.as_mut() else {
                     return;
                 };
+                let mut learned = Vec::new();
                 for (id, records) in &found {
-                    e2ee::learn(e2ee, id, records);
+                    if e2ee::learn(e2ee, id, records) {
+                        learned.push(*id);
+                    }
                     for r in records {
-                        if let Some(addr) = MeshAddr::from_parts(r.device.as_bytes(), &r.relay) {
-                            self.devices_at.insert(*r.device.as_bytes(), addr);
+                        let device = *r.device.as_bytes();
+                        if let Some(addr) = MeshAddr::from_parts(&device, &r.relay) {
+                            self.devices_at.insert(device, (*id, addr));
                         }
+                    }
+                }
+                // What came before their keys can open now.
+                let unopened = std::mem::take(&mut self.unopened);
+                for (id, from, frame) in unopened {
+                    if learned.contains(&id) {
+                        self.envelopes(id, from, vec![frame]);
+                    } else {
+                        self.unopened.push((id, from, frame));
                     }
                 }
                 return;
@@ -922,6 +948,13 @@ impl Helper {
             Back::Envelopes(got) => {
                 let (id, from, frames) = *got;
                 return self.envelopes(id, from, frames);
+            }
+            Back::Unsent(unsent) => {
+                let (device, envelopes) = *unsent;
+                if self.net.is_some() {
+                    self.waiting.entry(device).or_default().extend(envelopes);
+                }
+                return;
             }
             Back::Republish => return self.publish(),
             Back::Published(ok, keys) => {
@@ -953,12 +986,14 @@ impl Helper {
                 let promoted = self.connected(&id);
                 self.present_to(&id);
                 self.keys_for(&id);
+                self.send_waiting(&id);
                 if promoted {
                     return self.changed(None);
                 }
                 return self.emit_social(None);
             }
             Back::Connected(id) => {
+                self.send_waiting(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
                     // with ours if it's missing something (`Back::Synced`).
@@ -972,10 +1007,17 @@ impl Helper {
             }
             Back::Synced(synced) => {
                 let (theirs, from) = *synced;
+                let own = self.store.as_ref().map(Keystore::id);
+                if let Some(own) = own {
+                    self.send_waiting(&own);
+                }
                 return self.synced(&theirs, &from);
             }
             Back::Presence(heard) => {
                 let (id, device, heard, name) = *heard;
+                if heard.is_some() {
+                    self.send_waiting(&id);
+                }
                 return self.presence_heard(id, device, heard, &name);
             }
             Back::Resolved(resolved) => {
@@ -1270,6 +1312,50 @@ impl Helper {
         });
     }
 
+    /// Our own records may carry a newer list of our devices (one restored
+    /// from a backup adds itself): the keystore takes it, so this device can
+    /// remove that one.
+    fn own_lists(&mut self, found: &[(MeshId, Vec<AddrRecord>)]) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        let own = store.id();
+        let lists = found.iter().filter(|(id, _)| *id == own);
+        let newest = lists
+            .flat_map(|(_, r)| r)
+            .map(|r| &r.devices)
+            .max_by_key(|l| l.seq());
+        // Quietly: an unasked `meshIdentity` would read as an answer.
+        // Mesh-Voice sees the new device at its next `idStatus`.
+        if let Some(Err(e)) = newest.map(|list| store.own_list_seen(list)) {
+            eprintln!("mesh-node: couldn't save our device list: {e}");
+        }
+    }
+
+    /// Removes another of our devices: a new list, which our records carry
+    /// to everyone, and which e2ee follows at once (SPEC-e2ee D11).
+    fn remove_device(&mut self, key: &str) -> Result<(), Fail> {
+        let store = self.unlocked()?;
+        let cert = store
+            .devices()
+            .devices()
+            .iter()
+            .find(|d| e2ee::hex(d.device().as_bytes()) == key);
+        let device = *cert
+            .ok_or_else(|| Fail("not-linked", "that device isn't linked".to_owned()))?
+            .device();
+        store.remove_device(&device)?;
+        let (me, devices) = (store.id(), store.devices().clone());
+        if let Some(e2ee) = self.e2ee.as_mut()
+            && let Err(e) = e2ee.learn_devices(&me, &devices)
+        {
+            eprintln!("mesh-node: couldn't save e2ee state: {e}");
+        }
+        self.emit_identity();
+        self.publish();
+        Ok(())
+    }
+
     /// We're in touch with `id`: if we have no keys for them yet, look.
     fn keys_for(&self, id: &MeshId) {
         if self.e2ee.as_ref().is_some_and(|e| !e.knows(id)) {
@@ -1282,41 +1368,212 @@ impl Helper {
     /// what opening asks for (key shares, key requests).
     fn envelopes(&mut self, id: MeshId, from: MeshAddr, frames: e2ee::Frames) {
         let device = *from.device.as_bytes();
-        // A connection beats a relay we read in a record.
-        self.devices_at.entry(device).or_insert(from);
+        // A relay we read in a record beats a bare connection address.
+        self.devices_at.entry(device).or_insert((id, from.clone()));
         let Some(e2ee) = self.e2ee.as_mut() else {
             return;
         };
         let mut replies = Vec::new();
-        for (_flags, envelope) in frames {
+        let mut notes = Vec::new();
+        let mut unknown = false;
+        for (flags, envelope) in frames {
             match e2ee.decrypt(&envelope, unix_now()) {
+                Err(E2eeError::UnknownSender) => {
+                    // ponytail: kept in memory, 256 at most; `mailbox` keeps mail for real.
+                    if self.unopened.len() < 256 {
+                        self.unopened.push((id, from.clone(), (flags, envelope)));
+                    }
+                    unknown = true;
+                }
                 Ok(got) => {
                     for opened in got.opened {
+                        // On a live connection the sender is the device at
+                        // the other end; nobody passes envelopes on yet.
                         if opened.sender != id || opened.device.to_bytes() != device {
                             eprintln!(
                                 "mesh-node: an envelope's sender wasn't the device that sent it"
                             );
+                            continue;
                         }
+                        notes.push((opened, flags & e2ee::WAITED != 0));
                     }
                     replies.extend(got.replies);
                 }
                 Err(e) => eprintln!("mesh-node: couldn't open an envelope: {e}"),
             }
         }
-        self.send_envelopes(replies);
+        if unknown {
+            self.fetch_keys(Some(&id));
+        }
+        for (opened, waited) in notes {
+            self.emit_note(&opened, waited);
+        }
+        for (device, envelope) in replies {
+            self.deliver(device.to_bytes(), vec![envelope]);
+        }
     }
 
-    /// Sends each envelope to its device, over a connection if one's open.
-    fn send_envelopes(&self, envelopes: Vec<(ed25519_dalek::VerifyingKey, Vec<u8>)>) {
+    /// `meshNote`: a test note that opened, on the reader's devices and the
+    /// sender's other ones.
+    fn emit_note(&self, opened: &Opened, waited: bool) {
+        let (Some(store), Some(e2ee)) = (&self.store, &self.e2ee) else {
+            return;
+        };
+        if opened.kind != NoteKind::TestNote {
+            return;
+        }
+        let Some((at, text)) = e2ee::read_note(&opened.body) else {
+            return eprintln!("mesh-node: a test note didn't read");
+        };
+        let (with, group, conversation) = match opened.conversation {
+            Conversation::Direct(peer) => (Some(peer.to_string()), None, None),
+            Conversation::Group(c) => {
+                let members = e2ee.members(&c).unwrap_or_default();
+                let members: Vec<String> = members.iter().map(ToString::to_string).collect();
+                (None, Some(members), Some(e2ee::hex(&c)))
+            }
+        };
+        let list = if opened.sender == store.id() {
+            Some(store.devices().clone())
+        } else {
+            store.contact(&opened.sender).and_then(|c| c.devices())
+        };
+        let device = list.and_then(|l| {
+            let cert = l.devices().iter().find(|d| *d.device() == opened.device)?;
+            Some(cert.name().to_owned())
+        });
+        emit(
+            "meshNote",
+            json!({
+                "from": opened.sender.to_string(),
+                "device": device,
+                "with": with,
+                "group": group,
+                "conversation": conversation,
+                "text": text,
+                "at": at,
+                "path": if waited { "waited" } else { "live" },
+            }),
+        );
+    }
+
+    /// Sends a test note: one ID is 1:1, several a test group of them (or
+    /// `group`, an existing one, with them as its members now).
+    fn note(&mut self, ids: &str, text: &str, group: Option<&str>) -> Result<(), Fail> {
+        let store = self.unlocked()?;
+        let ids = ids
+            .split_whitespace()
+            .map(parse_id)
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            return Err(Fail("bad-args", "say who the note is for".to_owned()));
+        }
+        if let Some(id) = ids
+            .iter()
+            .find(|id| store.account().kind(id) != Some(Kind::Friend))
+        {
+            return Err(Fail("not-a-friend", format!("{id} isn't your friend")));
+        }
+        if text.len() > e2ee::MAX_NOTE {
+            return Err(Fail("too-long", "that note is too long".to_owned()));
+        }
+        let Some(e2ee) = self.e2ee.as_mut() else {
+            return Err(Fail(
+                "offline",
+                "end-to-end encryption didn't start".to_owned(),
+            ));
+        };
+        let now = unix_now();
+        let body = e2ee::note_body(now, text);
+        let fail = |e: E2eeError| match e {
+            E2eeError::NoKeys => Fail(
+                "no-keys",
+                "no keys from them yet; try again soon".to_owned(),
+            ),
+            E2eeError::TooLong => Fail("too-long", "that note is too long".to_owned()),
+            e => Fail("e2ee", e.to_string()),
+        };
+        let (deliveries, conversation) = match (group, &ids[..]) {
+            (None, [one]) => {
+                let out = e2ee.encrypt_direct(one, NoteKind::TestNote, &body);
+                if matches!(out, Err(E2eeError::NoKeys)) {
+                    self.fetch_keys(Some(one));
+                }
+                let out = out.map_err(fail)?;
+                (out.into_iter().map(|(d, e)| (d, vec![e])).collect(), None)
+            }
+            (group, _) => {
+                let conversation = match group {
+                    Some(text) => {
+                        let c = e2ee::parse_conversation(text)
+                            .ok_or_else(|| Fail("bad-args", "that isn't a group".to_owned()))?;
+                        if e2ee.members(&c).is_none() {
+                            return Err(Fail(
+                                "not-a-member",
+                                "you're not in that group".to_owned(),
+                            ));
+                        }
+                        e2ee.set_members(c, &ids, now).map_err(fail)?;
+                        c
+                    }
+                    None => e2ee.new_group(&ids, now).map_err(fail)?,
+                };
+                let out = e2ee.encrypt_group(conversation, NoteKind::TestNote, &body, now);
+                (out.map_err(fail)?, Some(e2ee::hex(&conversation)))
+            }
+        };
+        let devices = deliveries.len();
+        for (device, envelopes) in deliveries {
+            self.deliver(device.to_bytes(), envelopes);
+        }
+        emit(
+            "meshNoteSent",
+            json!({ "fn": "e2eeNote", "conversation": conversation, "devices": devices }),
+        );
+        Ok(())
+    }
+
+    /// Sends envelopes to a device where we last saw it. Without a live
+    /// connection they count as waited, and we try its address anyway; if
+    /// it doesn't take them, they wait until it connects.
+    fn deliver(&mut self, device: [u8; 32], envelopes: Vec<Vec<u8>>) {
+        let (Some(net), Some((owner, addr))) = (&self.net, self.devices_at.get(&device).cloned())
+        else {
+            return self.waiting.entry(device).or_default().extend(envelopes);
+        };
+        let connected = net.node.connected(&owner);
+        let live = connected.iter().any(|a| *a.device.as_bytes() == device);
+        let flags = if live { 0 } else { e2ee::WAITED };
+        let (node, back) = (net.node.clone(), self.back.clone());
+        tokio::spawn(async move {
+            let frames: Vec<Vec<u8>> = envelopes
+                .iter()
+                .map(|e| [&[flags][..], e].concat())
+                .collect();
+            if !e2ee::send(&node, &addr, &frames).await {
+                let _ = back.send(Back::Unsent(Box::new((device, envelopes))));
+            }
+        });
+    }
+
+    /// `id`'s devices are connected: what waited for them goes now.
+    fn send_waiting(&mut self, id: &MeshId) {
         let Some(net) = &self.net else { return };
-        for (device, envelope) in envelopes {
-            let Some(addr) = self.devices_at.get(device.as_bytes()).cloned() else {
+        for addr in net.node.connected(id) {
+            let device = *addr.device.as_bytes();
+            let Some(envelopes) = self.waiting.remove(&device) else {
                 continue;
             };
-            let node = net.node.clone();
+            let (node, back) = (net.node.clone(), self.back.clone());
             tokio::spawn(async move {
-                let frame = [&[0u8][..], &envelope].concat();
-                e2ee::send(&node, &addr, &[frame]).await;
+                let waited = [e2ee::WAITED];
+                let frames: Vec<Vec<u8>> = envelopes
+                    .iter()
+                    .map(|e| [&waited[..], e].concat())
+                    .collect();
+                if !e2ee::send(&node, &addr, &frames).await {
+                    let _ = back.send(Back::Unsent(Box::new((device, envelopes))));
+                }
             });
         }
     }
@@ -1419,6 +1676,8 @@ impl Helper {
         }
         self.e2ee = None;
         self.devices_at.clear();
+        self.waiting.clear();
+        self.unopened.clear();
     }
 
     fn emit_unlocked(&self) {
@@ -1546,6 +1805,7 @@ impl Helper {
             .map(|d| {
                 json!({
                     "name": d.name(),
+                    "key": e2ee::hex(d.device().as_bytes()),
                     "createdAt": d.created_at(),
                     "thisDevice": *d.device() == this,
                 })

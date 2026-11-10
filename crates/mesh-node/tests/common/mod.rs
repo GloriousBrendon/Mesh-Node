@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -35,16 +35,22 @@ impl Relay {
     }
 }
 
+/// The longest a test waits for the helper to say anything.
+const LINE_TIMEOUT: Duration = Duration::from_secs(90);
+
 pub struct Helper {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// stdout's lines, read on their own thread so a wait can time out.
+    stdout: mpsc::Receiver<String>,
     /// The latest `meshNet`: it comes whenever the node's state changes, so
     /// `event` sets it aside.
     pub net: Option<Value>,
     /// The latest `meshSocial` that answered no command (something changed
     /// by itself), set aside the same way.
     pub social: Option<Value>,
+    /// Every `meshNote` so far: they come whenever a note arrives.
+    pub notes: Vec<Value>,
 }
 
 impl Helper {
@@ -64,23 +70,30 @@ impl Helper {
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let out = BufReader::new(child.stdout.take().unwrap());
+        let (tx, stdout) = mpsc::channel();
+        std::thread::spawn(move || {
+            out.lines()
+                .map_while(Result::ok)
+                .for_each(|l| drop(tx.send(l)))
+        });
         Self {
             child,
             stdin,
             stdout,
             net: None,
             social: None,
+            notes: Vec::new(),
         }
     }
 
     /// The next line's binding and decoded payload.
     pub fn line(&mut self) -> (String, Value) {
-        let mut line = String::new();
-        assert!(
-            self.stdout.read_line(&mut line).unwrap() > 0,
-            "mesh-node exited"
-        );
+        let line = match self.stdout.recv_timeout(LINE_TIMEOUT) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("mesh-node went quiet"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("mesh-node exited"),
+        };
         let frame: Value = serde_json::from_str(&line).unwrap();
         let payload = serde_json::from_str(frame["payload"].as_str().unwrap()).unwrap();
         (frame["binding"].as_str().unwrap().to_owned(), payload)
@@ -94,6 +107,7 @@ impl Helper {
                 (binding, payload) if binding == "meshSocial" && payload["fn"].is_null() => {
                     self.social = Some(payload)
                 }
+                (binding, payload) if binding == "meshNote" => self.notes.push(payload),
                 event => return event,
             }
         }
@@ -109,6 +123,7 @@ impl Helper {
             match self.line() {
                 (binding, payload) if binding == "meshSocial" => self.social = Some(payload),
                 (binding, payload) if binding == "meshNet" => self.net = Some(payload),
+                (binding, payload) if binding == "meshNote" => self.notes.push(payload),
                 (binding, _) if binding == "meshCodes" => {}
                 (binding, payload) => panic!("unexpected {binding} {payload}"),
             }
@@ -126,6 +141,25 @@ impl Helper {
                 (binding, payload) if binding == "meshSocial" && payload["fn"].is_null() => {
                     self.social = Some(payload)
                 }
+                (binding, payload) if binding == "meshNote" => self.notes.push(payload),
+                (binding, payload) => panic!("unexpected {binding} {payload}"),
+            }
+        }
+    }
+
+    /// Waits for a `meshNote` with this text; it may already have come.
+    pub fn note_with(&mut self, text: &str) -> Value {
+        let started = std::time::Instant::now();
+        loop {
+            assert!(started.elapsed() < LINE_TIMEOUT, "no note {text:?}");
+            if let Some(note) = self.notes.iter().find(|n| n["text"] == text) {
+                return note.clone();
+            }
+            match self.line() {
+                (binding, payload) if binding == "meshNote" => self.notes.push(payload),
+                (binding, payload) if binding == "meshNet" => self.net = Some(payload),
+                (binding, payload) if binding == "meshSocial" => self.social = Some(payload),
+                (binding, _) if binding == "meshCodes" => {}
                 (binding, payload) => panic!("unexpected {binding} {payload}"),
             }
         }

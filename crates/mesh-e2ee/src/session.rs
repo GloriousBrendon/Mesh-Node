@@ -562,6 +562,11 @@ impl E2ee {
         !self.reachable_of(id).is_empty()
     }
 
+    /// How many of `id`'s devices we can encrypt to.
+    pub fn devices_known(&self, id: &MeshId) -> usize {
+        self.reachable_of(id).len()
+    }
+
     /// `id`'s current devices we can reach.
     pub(crate) fn reachable_of(&self, id: &MeshId) -> Vec<(Key, VerifyingKey)> {
         self.people
