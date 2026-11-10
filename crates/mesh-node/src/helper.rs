@@ -15,6 +15,10 @@
 //! wait on the seeds until the code's owner collects them; a connection with
 //! someone you've added means they added you too, so you're friends.
 //!
+//! E2ee (SPEC-e2ee): each record carries this device's e2ee field, friends'
+//! fields feed the bundle directory, and envelopes travel on the `e2ee`
+//! service.
+//!
 //! Commands are never logged or echoed: passwords travel in them. Each
 //! command answers with one event; a failure is a `meshError` with a stable
 //! `kind` the UI switches on, the `fn` it answers, and a message to show.
@@ -28,13 +32,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::codes::{Get, Hold};
+use crate::e2ee;
 use crate::routing::{self, ReachError, Reached, Target};
 use crate::{knocks, seed};
+use mesh_e2ee::E2ee;
 use mesh_identity::{
-    Account, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey, DeviceList,
-    FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr, Link,
-    MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, Status as Chosen, check_password,
-    is_kept, keyring_status, open_knock, seal_knock,
+    Account, AddrRecord, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey,
+    DeviceList, FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr,
+    Link, MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, Status as Chosen,
+    check_password, is_kept, keyring_status, open_knock, seal_knock,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -184,6 +190,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
                 helper.publish();
                 helper.dial_contacts();
                 helper.sync_own();
+                helper.fetch_keys(None);
                 continue;
             }
             _ = collect.tick() => {
@@ -240,6 +247,11 @@ struct Helper {
     idle: bool,
     /// What we show friends now; the presence streams follow it.
     shown: tokio::sync::watch::Sender<Presence>,
+    /// This device's e2ee state, while unlocked.
+    e2ee: Option<E2ee>,
+    /// Where each contact device was last seen (its record's relay, or its
+    /// connection), to send it envelopes.
+    devices_at: HashMap<[u8; 32], MeshAddr>,
 }
 
 /// What a friend's device shows: on the wire, one byte.
@@ -280,6 +292,8 @@ struct Net {
     streams: tokio::task::JoinHandle<()>,
     /// Every contact's record is on a seed (`meshNet`'s `published`).
     published: Arc<AtomicBool>,
+    /// And those records carry our e2ee keys (`meshNet`'s `keys`).
+    keys: Arc<AtomicBool>,
     /// Friends' devices we're sending presence to.
     presenting: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
 }
@@ -290,8 +304,13 @@ enum Back {
     Held(Vec<(FriendCode, Option<Hold>)>),
     /// The home relay changed (or came up): records go out again.
     Relay,
-    Published(bool),
+    /// Whether the seeds took every record, and whether they carried keys.
+    Published(bool, bool),
     Republish,
+    /// Contacts' records, for their e2ee keys.
+    Records(Vec<(MeshId, Vec<AddrRecord>)>),
+    /// Envelopes another device sent us: who, which device, each frame.
+    Envelopes(Box<(MeshId, MeshAddr, e2ee::Frames)>),
     /// A contact answered through this address.
     Reached(Box<(MeshId, Option<LastAddr>, Option<DeviceList>)>),
     /// Someone's device connected to us and passed the handshake.
@@ -343,6 +362,8 @@ impl Helper {
             presence: HashMap::new(),
             idle: false,
             shown: tokio::sync::watch::Sender::new(Presence::Online),
+            e2ee: None,
+            devices_at: HashMap::new(),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -699,7 +720,7 @@ impl Helper {
     }
 
     /// The contacts changed: let in exactly them, and leave records for them.
-    fn contacts_changed(&self) {
+    fn contacts_changed(&mut self) {
         self.allow_contacts();
         self.publish();
     }
@@ -881,12 +902,32 @@ impl Helper {
             Back::Relay => {
                 self.publish();
                 self.sync_own();
+                self.fetch_keys(None);
                 return self.dial_contacts();
             }
+            Back::Records(found) => {
+                let Some(e2ee) = self.e2ee.as_mut() else {
+                    return;
+                };
+                for (id, records) in &found {
+                    e2ee::learn(e2ee, id, records);
+                    for r in records {
+                        if let Some(addr) = MeshAddr::from_parts(r.device.as_bytes(), &r.relay) {
+                            self.devices_at.insert(*r.device.as_bytes(), addr);
+                        }
+                    }
+                }
+                return;
+            }
+            Back::Envelopes(got) => {
+                let (id, from, frames) = *got;
+                return self.envelopes(id, from, frames);
+            }
             Back::Republish => return self.publish(),
-            Back::Published(ok) => {
+            Back::Published(ok, keys) => {
                 if let Some(net) = &self.net {
                     net.published.store(ok, Ordering::Relaxed);
+                    net.keys.store(ok && keys, Ordering::Relaxed);
                 }
                 if ok {
                     self.publish_retry = PUBLISH_RETRY;
@@ -911,6 +952,7 @@ impl Helper {
                 }
                 let promoted = self.connected(&id);
                 self.present_to(&id);
+                self.keys_for(&id);
                 if promoted {
                     return self.changed(None);
                 }
@@ -925,6 +967,7 @@ impl Helper {
                 if self.connected(&id) {
                     self.changed(None);
                 }
+                self.keys_for(&id);
                 return self.present_to(&id);
             }
             Back::Synced(synced) => {
@@ -1203,9 +1246,97 @@ impl Helper {
         }
     }
 
+    /// Looks up the records of every contact (or only `id`) and our own,
+    /// for their e2ee keys, in the background.
+    fn fetch_keys(&self, only: Option<&MeshId>) {
+        let (Some(store), Some(net), Some(_)) = (&self.store, &self.net, &self.e2ee) else {
+            return;
+        };
+        if self.seeds.is_empty() {
+            return;
+        }
+        let ids: Vec<MeshId> = match only {
+            Some(id) => vec![*id],
+            None => store.contacts().iter().map(|c| c.id()).collect(),
+        };
+        let mut targets: Vec<Target> = ids.iter().filter_map(|id| Target::of(store, id)).collect();
+        if only.is_none() {
+            targets.extend(Target::own(store));
+        }
+        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        tokio::spawn(async move {
+            let found = e2ee::fetch(&anon, &seeds, targets, unix_now()).await;
+            let _ = back.send(Back::Records(found));
+        });
+    }
+
+    /// We're in touch with `id`: if we have no keys for them yet, look.
+    fn keys_for(&self, id: &MeshId) {
+        if self.e2ee.as_ref().is_some_and(|e| !e.knows(id)) {
+            self.fetch_keys(Some(id));
+        }
+    }
+
+    /// Envelopes a device sent over a live connection: open each, check it
+    /// came from that device (the connection says who it is), and send back
+    /// what opening asks for (key shares, key requests).
+    fn envelopes(&mut self, id: MeshId, from: MeshAddr, frames: e2ee::Frames) {
+        let device = *from.device.as_bytes();
+        // A connection beats a relay we read in a record.
+        self.devices_at.entry(device).or_insert(from);
+        let Some(e2ee) = self.e2ee.as_mut() else {
+            return;
+        };
+        let mut replies = Vec::new();
+        for (_flags, envelope) in frames {
+            match e2ee.decrypt(&envelope, unix_now()) {
+                Ok(got) => {
+                    for opened in got.opened {
+                        if opened.sender != id || opened.device.to_bytes() != device {
+                            eprintln!(
+                                "mesh-node: an envelope's sender wasn't the device that sent it"
+                            );
+                        }
+                    }
+                    replies.extend(got.replies);
+                }
+                Err(e) => eprintln!("mesh-node: couldn't open an envelope: {e}"),
+            }
+        }
+        self.send_envelopes(replies);
+    }
+
+    /// Sends each envelope to its device, over a connection if one's open.
+    fn send_envelopes(&self, envelopes: Vec<(ed25519_dalek::VerifyingKey, Vec<u8>)>) {
+        let Some(net) = &self.net else { return };
+        for (device, envelope) in envelopes {
+            let Some(addr) = self.devices_at.get(device.as_bytes()).cloned() else {
+                continue;
+            };
+            let node = net.node.clone();
+            tokio::spawn(async move {
+                let frame = [&[0u8][..], &envelope].concat();
+                e2ee::send(&node, &addr, &[frame]).await;
+            });
+        }
+    }
+
     /// Starts this device's node for the open identity (replacing any running).
     async fn start_net(&mut self) {
         self.stop_net().await;
+        let Some(store) = &self.store else { return };
+        let data = self.path.parent().unwrap_or(Path::new("."));
+        let opened = E2ee::open(
+            data,
+            store.data_key(),
+            store.root_key(),
+            store.device_key(),
+            store.devices(),
+            unix_now(),
+        );
+        self.e2ee = opened
+            .inspect_err(|e| eprintln!("mesh-node: end-to-end encryption didn't start: {e}"))
+            .ok();
         let Some(store) = &self.store else { return };
         let this = store.device_key().public();
         let Some(cert) = store
@@ -1226,7 +1357,11 @@ impl Helper {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains(&id.to_bytes())
             }),
-            services: vec![SYNC.to_owned(), PRESENCE.to_owned()],
+            services: vec![
+                SYNC.to_owned(),
+                PRESENCE.to_owned(),
+                e2ee::SERVICE.to_owned(),
+            ],
             ..Config::default()
         };
         self.allow_contacts();
@@ -1241,9 +1376,11 @@ impl Helper {
             Ok((node, anon)) => {
                 let node = Arc::new(node);
                 let published = Arc::new(AtomicBool::new(false));
+                let keys = Arc::new(AtomicBool::new(false));
                 let watch = tokio::spawn(watch_net(
                     node.clone(),
                     published.clone(),
+                    keys.clone(),
                     self.back.clone(),
                 ));
                 let peers = tokio::spawn(watch_peers(node.clone(), self.back.clone()));
@@ -1256,6 +1393,7 @@ impl Helper {
                     peers,
                     streams,
                     published,
+                    keys,
                     presenting: Arc::default(),
                 });
                 self.update_shown();
@@ -1277,8 +1415,10 @@ impl Helper {
             self.held.clear();
             self.publish_retry = PUBLISH_RETRY;
             self.presence.clear();
-            emit_net(None, false);
+            emit_net(None, false, false);
         }
+        self.e2ee = None;
+        self.devices_at.clear();
     }
 
     fn emit_unlocked(&self) {
@@ -1300,7 +1440,7 @@ impl Helper {
 
     /// Sends this device's record for every contact to the seeds, in the
     /// background; `meshNet` says when they're there.
-    fn publish(&self) {
+    fn publish(&mut self) {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
         };
@@ -1311,11 +1451,21 @@ impl Helper {
         if self.seeds.is_empty() {
             return;
         }
-        let records = routing::records(store, &relay, unix_now(), self.record_ttl);
+        let (now, keys) = (unix_now(), self.e2ee.is_some());
+        let mut e2ee = self.e2ee.as_mut();
+        let records = routing::records(store, &relay, now, self.record_ttl, |id| {
+            let field = e2ee.as_mut().map(|e| e.record_field(id, now));
+            field
+                .and_then(|f| {
+                    f.inspect_err(|e| eprintln!("mesh-node: couldn't make e2ee keys: {e}"))
+                        .ok()
+                })
+                .unwrap_or_default()
+        });
         let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
         tokio::spawn(async move {
             let ok = routing::publish(&anon, &seeds, &records).await;
-            let _ = back.send(Back::Published(ok));
+            let _ = back.send(Back::Published(ok, keys));
         });
     }
 
@@ -1324,8 +1474,9 @@ impl Helper {
             Some(net) => emit_net(
                 Some(&net.node.status()),
                 net.published.load(Ordering::Relaxed),
+                net.keys.load(Ordering::Relaxed),
             ),
-            None => emit_net(None, false),
+            None => emit_net(None, false, false),
         }
     }
 
@@ -1601,6 +1752,20 @@ async fn serve_streams(
             });
             continue;
         }
+        if stream.service == e2ee::SERVICE {
+            tokio::spawn(async move {
+                let from = MeshAddr {
+                    device: stream.peer.device,
+                    relay: None,
+                    direct: Vec::new(),
+                };
+                let frames = e2ee::read(&mut stream).await;
+                if !frames.is_empty() {
+                    let _ = back.send(Back::Envelopes(Box::new((stream.peer.id, from, frames))));
+                }
+            });
+            continue;
+        }
         if stream.service != SYNC || stream.peer.id != own {
             let _ = stream.send.reset(0u32.into());
             continue;
@@ -1642,27 +1807,31 @@ fn unix_now() -> u64 {
 async fn watch_net(
     node: Arc<Node>,
     published: Arc<AtomicBool>,
+    keys: Arc<AtomicBool>,
     back: tokio::sync::mpsc::UnboundedSender<Back>,
 ) {
-    let mut last: Option<(Status, bool)> = None;
+    let mut last: Option<(Status, bool, bool)> = None;
     loop {
-        let now = (node.status(), published.load(Ordering::Relaxed));
+        let flag = |f: &AtomicBool| f.load(Ordering::Relaxed);
+        let now = (node.status(), flag(&published), flag(&keys));
         if last.as_ref() != Some(&now) {
             if now.0.relay.is_some() && last.as_ref().map(|l| &l.0.relay) != Some(&now.0.relay) {
                 let _ = back.send(Back::Relay);
             }
-            emit_net(Some(&now.0), now.1);
+            emit_net(Some(&now.0), now.1, now.2);
             last = Some(now);
         }
         tokio::time::sleep(NET_POLL).await;
     }
 }
 
-/// `meshNet`: never any IP address (SPEC-transport "Endpoint").
-fn emit_net(status: Option<&Status>, published: bool) {
+/// `meshNet`: never any IP address (SPEC-transport "Endpoint"). `keys`:
+/// our published records carry our e2ee keys (SPEC-e2ee).
+fn emit_net(status: Option<&Status>, published: bool, keys: bool) {
     let payload = match status {
         None => json!({
             "state": "off", "relay": null, "direct": false, "connections": 0, "published": false,
+            "keys": false,
         }),
         Some(s) => json!({
             "state": if s.online { "online" } else { "connecting" },
@@ -1670,6 +1839,7 @@ fn emit_net(status: Option<&Status>, published: bool) {
             "direct": s.direct,
             "connections": s.connections,
             "published": published,
+            "keys": keys,
         }),
     };
     emit("meshNet", payload);

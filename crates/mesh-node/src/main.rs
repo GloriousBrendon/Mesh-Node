@@ -11,6 +11,7 @@
 
 mod addrs;
 mod codes;
+mod e2ee;
 mod helper;
 mod knocks;
 mod routing;

@@ -44,7 +44,8 @@ impl Helper {
     }
 
     fn published(&mut self) {
-        self.net(|n| n["published"] == true);
+        // The records carry our e2ee keys too (SPEC-e2ee D4).
+        self.net(|n| n["published"] == true && n["keys"] == true);
     }
 
     /// Pings by ID until it answers, as a person retrying would (records

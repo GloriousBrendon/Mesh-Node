@@ -19,8 +19,15 @@ pub const RECORD_TTL: u64 = 2 * 3600;
 pub const REFRESH_EVERY: u64 = 30 * 60;
 
 /// This device's record for each contact, and one under the self pair for
-/// our other devices (SPEC-social D11), on `relay`.
-pub fn records(store: &Keystore, relay: &RelayUrl, now: u64, ttl: u64) -> Vec<Vec<u8>> {
+/// our other devices (SPEC-social D11), on `relay`. `field` gives each one's
+/// e2ee field (SPEC-e2ee D4).
+pub fn records(
+    store: &Keystore,
+    relay: &RelayUrl,
+    now: u64,
+    ttl: u64,
+    mut field: impl FnMut(&MeshId) -> Vec<u8>,
+) -> Vec<Vec<u8>> {
     let ids = store.contacts().iter().map(|c| c.id());
     std::iter::once(store.id())
         .chain(ids)
@@ -31,7 +38,7 @@ pub fn records(store: &Keystore, relay: &RelayUrl, now: u64, ttl: u64) -> Vec<Ve
                 store.device_key(),
                 store.devices(),
                 relay.as_str(),
-                &[],
+                &field(&id),
                 now,
                 ttl,
             );
@@ -191,7 +198,7 @@ pub async fn own_devices(
 /// The contact's records on the seeds for today and yesterday (midnight, and
 /// clocks that disagree), opened and checked: one per device, newest first,
 /// only devices their newest known list still has. Also that list.
-async fn find(
+pub async fn find(
     anon: &Node,
     seeds: &[MeshAddr],
     target: &Target,

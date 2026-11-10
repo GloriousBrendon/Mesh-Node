@@ -181,7 +181,14 @@ fn two_helpers_ping_through_a_relay() {
     keys.sort();
     assert_eq!(
         keys,
-        ["connections", "direct", "published", "relay", "state"]
+        [
+            "connections",
+            "direct",
+            "keys",
+            "published",
+            "relay",
+            "state"
+        ]
     );
 
     // Only contacts get in (SPEC-routing D9): a stranger's ping is refused.

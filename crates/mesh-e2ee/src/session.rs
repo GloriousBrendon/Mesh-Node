@@ -45,6 +45,7 @@ const SESSIONS_PER_DEVICE: usize = 4;
 const FIRST_MESSAGES_KEPT: usize = 1000;
 /// The longest record field.
 pub const MAX_FIELD_LEN: usize = MAX_BUNDLE_LEN + 64;
+const _: () = assert!(MAX_FIELD_LEN <= mesh_identity::MAX_E2EE_FIELD);
 
 type Key = [u8; 32];
 
@@ -554,6 +555,11 @@ impl E2ee {
             .collect::<Result<_, E2eeError>>()?;
         self.save()?;
         Ok(out)
+    }
+
+    /// Whether we can encrypt to any of `id`'s devices.
+    pub fn knows(&self, id: &MeshId) -> bool {
+        !self.reachable_of(id).is_empty()
     }
 
     /// `id`'s current devices we can reach.

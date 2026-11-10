@@ -2455,7 +2455,9 @@ dependencies = [
 name = "mesh-node"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "iroh-relay",
+ "mesh-e2ee",
  "mesh-identity",
  "mesh-transport",
  "postcard",
