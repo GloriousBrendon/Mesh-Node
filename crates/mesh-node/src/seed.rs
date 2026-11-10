@@ -8,7 +8,7 @@
 //! answered in turn (`addrs::Put`/`addrs::Get`, `knocks::Put`/`knocks::Get`).
 
 use crate::codes::{self, Caller, Get, Store};
-use crate::saved::StoreError;
+use crate::saved::Snapshot;
 use crate::{addrs, knocks};
 use mesh_identity::{DeviceCert, DeviceKey, RootKey, unix_now};
 use mesh_transport::{Config, MeshAddr, Node, Relays, ServiceStream, frame};
@@ -284,51 +284,64 @@ async fn answer(mut stream: ServiceStream, store: Arc<Mutex<Store>>, counts: Arc
 }
 
 /// The stores, as saving sees them.
-trait Saved {
-    fn dirty(&self) -> bool;
-    fn save(&mut self) -> Result<(), StoreError>;
+trait Saved: Send + 'static {
+    fn dirty(&mut self) -> &mut bool;
+    fn snapshot(&mut self) -> Snapshot;
 }
 
 impl Saved for Store {
-    fn dirty(&self) -> bool {
-        self.dirty
+    fn dirty(&mut self) -> &mut bool {
+        &mut self.dirty
     }
-    fn save(&mut self) -> Result<(), StoreError> {
-        Store::save(self)
+    fn snapshot(&mut self) -> Snapshot {
+        Store::snapshot(self)
     }
 }
 
 impl Saved for addrs::Store {
-    fn dirty(&self) -> bool {
-        self.dirty
+    fn dirty(&mut self) -> &mut bool {
+        &mut self.dirty
     }
-    fn save(&mut self) -> Result<(), StoreError> {
-        addrs::Store::save(self)
+    fn snapshot(&mut self) -> Snapshot {
+        addrs::Store::snapshot(self)
     }
 }
 
 impl Saved for knocks::Store {
-    fn dirty(&self) -> bool {
-        self.dirty
+    fn dirty(&mut self) -> &mut bool {
+        &mut self.dirty
     }
-    fn save(&mut self) -> Result<(), StoreError> {
-        knocks::Store::save(self)
+    fn snapshot(&mut self) -> Snapshot {
+        knocks::Store::snapshot(self)
     }
 }
 
 async fn save_often<S: Saved>(store: Arc<Mutex<S>>, every: Duration) {
     loop {
         tokio::time::sleep(every).await;
-        save(&store);
+        let store = store.clone();
+        // The write and its syncs block: off the runtime's threads.
+        let _ = tokio::task::spawn_blocking(move || save(&store)).await;
     }
 }
 
+/// One write at a time, in the order the snapshots were taken.
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// Takes the store's bytes under its lock, then writes them without it, so
+/// requests don't wait for the disk (audit finding 8).
 fn save<S: Saved>(store: &Mutex<S>) {
-    let mut store = lock(store);
-    if store.dirty()
-        && let Err(e) = store.save()
-    {
+    let _one = lock(&WRITING);
+    let snapshot = {
+        let mut store = lock(store);
+        if !*store.dirty() {
+            return;
+        }
+        store.snapshot()
+    };
+    if let Err(e) = snapshot.write() {
         eprintln!("mesh-node seed: {e}");
+        *lock(store).dirty() = true;
     }
 }
 

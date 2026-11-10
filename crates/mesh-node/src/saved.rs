@@ -54,7 +54,17 @@ pub fn encode<T: Serialize>(entries: Vec<T>) -> Vec<u8> {
     postcard::to_stdvec(&file).expect("serialising to memory")
 }
 
-/// Writes `bytes` so that a crash leaves the old file or the new one.
-pub fn write(path: &Path, what: &'static str, bytes: &[u8]) -> Result<(), StoreError> {
-    mesh_identity::write_atomically(path, bytes).map_err(|e| StoreError::Write(what, e))
+/// A store's file as it was when taken, to write without holding the store.
+pub struct Snapshot {
+    pub path: PathBuf,
+    pub what: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+impl Snapshot {
+    /// Writes it so that a crash leaves the old file or the new one.
+    pub fn write(&self) -> Result<(), StoreError> {
+        mesh_identity::write_atomically(&self.path, &self.bytes)
+            .map_err(|e| StoreError::Write(self.what, e))
+    }
 }

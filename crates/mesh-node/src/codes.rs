@@ -211,11 +211,21 @@ impl Store {
     }
 
     /// Writes the store so that a crash leaves the old file or the new one.
+    /// The seed writes snapshots instead, outside the lock.
+    #[cfg(test)]
     pub fn save(&mut self) -> Result<(), StoreError> {
-        let bytes = saved::encode(self.entries.iter().collect());
-        saved::write(&self.path, WHAT, &bytes)?;
+        self.snapshot().write().inspect_err(|_| self.dirty = true)
+    }
+
+    /// The file's bytes now, for writing outside the store's lock. The
+    /// store counts as saved; mark it dirty again if the write fails.
+    pub fn snapshot(&mut self) -> saved::Snapshot {
         self.dirty = false;
-        Ok(())
+        saved::Snapshot {
+            path: self.path.clone(),
+            what: WHAT,
+            bytes: saved::encode(self.entries.iter().collect()),
+        }
     }
 
     pub fn len(&self) -> usize {

@@ -131,11 +131,21 @@ impl Store {
     }
 
     /// Writes the store so that a crash leaves the old file or the new one.
+    /// The seed writes snapshots instead, outside the lock.
+    #[cfg(test)]
     pub fn save(&mut self) -> Result<(), StoreError> {
-        let bytes = saved::encode(self.entries.iter().collect());
-        saved::write(&self.path, WHAT, &bytes)?;
+        self.snapshot().write().inspect_err(|_| self.dirty = true)
+    }
+
+    /// The file's bytes now, for writing outside the store's lock. The
+    /// store counts as saved; mark it dirty again if the write fails.
+    pub fn snapshot(&mut self) -> saved::Snapshot {
         self.dirty = false;
-        Ok(())
+        saved::Snapshot {
+            path: self.path.clone(),
+            what: WHAT,
+            bytes: saved::encode(self.entries.iter().collect()),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -183,12 +193,15 @@ impl Store {
                     }
                 }
                 let slots = self.entries.entry(lookup).or_default();
+                let before = slots.len();
                 slots.retain(|s| s.expires_at > now);
+                self.records -= before - slots.len();
+                self.dirty |= slots.len() != before;
                 if slots.len() >= SLOTS_PER_LOOKUP {
                     return Put::Full;
                 }
                 slots.push(new);
-                self.records = self.entries.values().map(Vec::len).sum();
+                self.records += 1;
                 self.dirty = true;
                 Put::Ok
             }
@@ -282,6 +295,35 @@ mod tests {
         let got = found(s.get(&caller(3), &[1; 16], NOW));
         assert!(got.contains(&newer) && got.contains(&b) && got.len() == 2);
         assert_eq!(s.len(), 2);
+    }
+
+    /// The count is kept as records come and go, not recounted (finding 8).
+    #[test]
+    fn the_count_follows_puts_expiry_and_sweeps() {
+        let mut s = store("count");
+        for slot in 0..4 {
+            let r = record(1, slot, NOW + 10 + u64::from(slot), slot);
+            assert_eq!(s.put(&caller(1), &r, NOW), Put::Ok);
+        }
+        assert_eq!(s.len(), 4);
+        // A replacement in its slot adds nothing.
+        assert_eq!(s.put(&caller(1), &record(1, 0, NOW + 50, 9), NOW), Put::Ok);
+        assert_eq!(s.len(), 4);
+        // A new record drops its lookup's expired ones (slots 1 and 2).
+        assert_eq!(
+            s.put(&caller(1), &record(1, 7, NOW + 90, 7), NOW + 12),
+            Put::Ok
+        );
+        assert_eq!(s.len(), 3);
+        assert_eq!(
+            s.put(&caller(1), &record(2, 1, NOW + 90, 1), NOW + 12),
+            Put::Ok
+        );
+        assert_eq!(s.len(), 4);
+        s.sweep(NOW + 60);
+        assert_eq!(s.len(), 2);
+        s.save().unwrap();
+        assert_eq!(Store::load(&s.path).unwrap().len(), 2);
     }
 
     #[test]

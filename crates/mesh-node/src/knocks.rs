@@ -127,6 +127,8 @@ struct CodeBox {
 pub struct Store {
     path: PathBuf,
     boxes: HashMap<[u8; 16], CodeBox>,
+    /// Requests in all boxes, kept as they come and go.
+    count: usize,
     puts: Window,
     gets: Window,
     pub dirty: bool,
@@ -140,9 +142,10 @@ impl Store {
             b.knocks.len() <= PER_CODE
                 && (b.knocks.iter()).all(|k| knock_outer(&k.knock) == Some((*lookup, k.slot)))
         })?;
-        let boxes = boxes.into_iter().collect();
+        let boxes: HashMap<_, CodeBox> = boxes.into_iter().collect();
         Ok(Self {
             path: path.to_owned(),
+            count: boxes.values().map(|b| b.knocks.len()).sum(),
             boxes,
             puts: Window::default(),
             gets: Window::default(),
@@ -151,15 +154,25 @@ impl Store {
     }
 
     /// Writes the store so that a crash leaves the old file or the new one.
+    /// The seed writes snapshots instead, outside the lock.
+    #[cfg(test)]
     pub fn save(&mut self) -> Result<(), StoreError> {
-        let bytes = saved::encode(self.boxes.iter().collect());
-        saved::write(&self.path, WHAT, &bytes)?;
+        self.snapshot().write().inspect_err(|_| self.dirty = true)
+    }
+
+    /// The file's bytes now, for writing outside the store's lock. The
+    /// store counts as saved; mark it dirty again if the write fails.
+    pub fn snapshot(&mut self) -> saved::Snapshot {
         self.dirty = false;
-        Ok(())
+        saved::Snapshot {
+            path: self.path.clone(),
+            what: WHAT,
+            bytes: saved::encode(self.boxes.iter().collect()),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.boxes.values().map(|b| b.knocks.len()).sum()
+        self.count
     }
 
     /// Takes a request if its code is live, using one of the code's uses. A
@@ -200,11 +213,13 @@ impl Store {
             knocks: Vec::new(),
         });
         b.tag = tag;
+        let before = b.knocks.len();
         b.knocks.retain(|k| k.slot != slot);
         if b.knocks.len() >= PER_CODE {
             b.knocks.remove(0);
         }
         b.knocks.push(held);
+        self.count = self.count + b.knocks.len() - before;
         self.dirty = true;
         Put::Ok
     }
@@ -246,6 +261,7 @@ impl Store {
             b.knocks.retain(|k| k.put_at + KEEP > now);
         }
         self.boxes.retain(|_, b| !b.knocks.is_empty());
+        self.count = self.boxes.values().map(|b| b.knocks.len()).sum();
         self.dirty |= self.len() != before;
     }
 }
@@ -384,6 +400,7 @@ mod tests {
         put(&mut s, 1, &knock(&sam, &owner, &open), NOW);
         let again = knock(&sam, &owner, &open);
         put(&mut s, 1, &again, NOW);
+        assert_eq!(s.knocks.len(), 1, "a resend replaces");
         assert_eq!(
             get(&mut s, &revoke, NOW),
             Get::Found {
@@ -403,6 +420,9 @@ mod tests {
         };
         assert_eq!(knocks.len(), PER_CODE);
         assert!(!knocks.contains(&first), "the oldest went");
+        assert_eq!(s.knocks.len(), PER_CODE, "the count follows");
+        s.knocks.sweep(NOW + KEEP);
+        assert_eq!(s.knocks.len(), 0);
     }
 
     #[test]
