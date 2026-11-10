@@ -11,7 +11,12 @@
 //!             | encrypted (body | device signature [64]) + 16 tag
 //! body = version u8 | lookup [16] | slot [8] | device [32] | created_at u64
 //!        | expires_at u64 | relay len u16 | relay | list len u16 | list
+//!        | e2ee len u16 | e2ee                        (version 2 only)
 //! ```
+//!
+//! Version 2 (SPEC-e2ee D4) adds an opaque e2ee field: the device's e2ee
+//! bundle and the keys it keeps for this contact. Version 1 still opens,
+//! with an empty field.
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
@@ -23,6 +28,12 @@ use crate::pair::{PairKeys, day_of};
 
 const DOMAIN: &str = "mesh/v1/addr-record";
 const FORMAT_V1: u8 = 1;
+const FORMAT_V2: u8 = 2;
+/// The e2ee field's limit, in bytes. SPEC-e2ee D4 allows up to 1 KiB, but
+/// the biggest record (16 devices with the longest names, the longest relay)
+/// is 3,797 bytes before it, and the seed takes 4,096. The field e2ee sends
+/// is 201 bytes.
+pub const MAX_E2EE_FIELD: usize = 256;
 const OUTER_LEN: usize = 16 + 8 + 8;
 const NONCE_LEN: usize = 24;
 /// A relay URL's limit, in bytes.
@@ -59,6 +70,8 @@ pub struct AddrRecord {
     pub expires_at: u64,
     /// The sender's device list, verified and rooted in the expected ID.
     pub devices: DeviceList,
+    /// The e2ee field, opaque here; empty in a version 1 record.
+    pub e2ee: Vec<u8>,
 }
 
 /// What the seed reads from a sealed record: lookup ID, slot, expiry.
@@ -74,17 +87,19 @@ pub fn addr_outer(bytes: &[u8]) -> Option<([u8; 16], [u8; 8], u64)> {
 }
 
 /// Seals `device`'s address for the pair `keys`, from the identity `devices`
-/// belongs to, valid from `now` for `ttl` seconds.
+/// belongs to, valid from `now` for `ttl` seconds, carrying `e2ee`.
 pub fn seal_addr(
     keys: &PairKeys,
     device: &DeviceKey,
     devices: &DeviceList,
     relay: &str,
+    e2ee: &[u8],
     now: u64,
     ttl: u64,
 ) -> Result<Vec<u8>, AddrError> {
     let list = devices.to_bytes();
-    if relay.len() > MAX_RELAY_LEN || list.len() > u16::MAX as usize {
+    if relay.len() > MAX_RELAY_LEN || list.len() > u16::MAX as usize || e2ee.len() > MAX_E2EE_FIELD
+    {
         return Err(AddrError::TooLong);
     }
     let public = device.public();
@@ -92,7 +107,7 @@ pub fn seal_addr(
     let slot = keys.slot(&public);
     let expires_at = now + ttl;
 
-    let mut body = vec![FORMAT_V1];
+    let mut body = vec![FORMAT_V2];
     body.extend_from_slice(&lookup);
     body.extend_from_slice(&slot);
     body.extend_from_slice(public.as_bytes());
@@ -102,6 +117,8 @@ pub fn seal_addr(
     body.extend_from_slice(relay.as_bytes());
     body.extend_from_slice(&(list.len() as u16).to_be_bytes());
     body.extend_from_slice(&list);
+    body.extend_from_slice(&(e2ee.len() as u16).to_be_bytes());
+    body.extend_from_slice(e2ee);
     let signature = device.sign(DOMAIN, &body);
     body.extend_from_slice(&signature.to_bytes());
 
@@ -152,7 +169,8 @@ pub fn open_addr(
 
     let mut r = Reader(body);
     let malformed = AddrError::Malformed;
-    if r.take(1)? != [FORMAT_V1] || r.take(16)? != lookup || r.take(8)? != slot {
+    let version = r.take(1)?[0];
+    if ![FORMAT_V1, FORMAT_V2].contains(&version) || r.take(16)? != lookup || r.take(8)? != slot {
         return Err(malformed);
     }
     let device = VerifyingKey::from_bytes(r.take(32)?.try_into().map_err(|_| malformed)?)
@@ -165,6 +183,16 @@ pub fn open_addr(
     let relay = String::from_utf8(r.take(relay_len)?.to_vec()).map_err(|_| malformed)?;
     let list_len = r.u16()?;
     let devices = DeviceList::from_bytes(r.take(list_len)?).map_err(|_| malformed)?;
+    let e2ee = match version {
+        FORMAT_V2 => {
+            let len = r.u16()?;
+            if len > MAX_E2EE_FIELD {
+                return Err(malformed);
+            }
+            r.take(len)?.to_vec()
+        }
+        _ => Vec::new(),
+    };
     if !r.0.is_empty() {
         return Err(malformed);
     }
@@ -187,6 +215,7 @@ pub fn open_addr(
         created_at,
         expires_at,
         devices,
+        e2ee,
     })
 }
 
@@ -246,7 +275,16 @@ mod tests {
 
     fn sealed(from: &Person, to: &Person) -> Vec<u8> {
         let keys = PairKeys::new(&from.root, &to.root.id()).unwrap();
-        seal_addr(&keys, &from.device, &from.devices, RELAY, NOW, 7200).unwrap()
+        seal_addr(
+            &keys,
+            &from.device,
+            &from.devices,
+            RELAY,
+            b"e2ee",
+            NOW,
+            7200,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -259,6 +297,7 @@ mod tests {
         assert_eq!(record.relay, RELAY);
         assert_eq!((record.created_at, record.expires_at), (NOW, NOW + 7200));
         assert_eq!(record.devices.root(), alice.root.id());
+        assert_eq!(record.e2ee, b"e2ee");
 
         let (lookup, slot, expires) = addr_outer(&bytes).unwrap();
         assert_eq!(lookup, keys.lookup(&alice.root.id(), day_of(NOW)));
@@ -301,7 +340,7 @@ mod tests {
         let (alice, bob) = (person(), person());
         let stranger = DeviceKey::generate().unwrap();
         let keys = PairKeys::new(&alice.root, &bob.root.id()).unwrap();
-        let bytes = seal_addr(&keys, &stranger, &alice.devices, RELAY, NOW, 7200).unwrap();
+        let bytes = seal_addr(&keys, &stranger, &alice.devices, RELAY, &[], NOW, 7200).unwrap();
         assert_eq!(
             open_addr(&keys, &alice.root.id(), &bytes, NOW).unwrap_err(),
             AddrError::NotCurrent
@@ -312,7 +351,7 @@ mod tests {
         let cert = DeviceCert::issue(&alice.root, &second.public(), "laptop", NOW).unwrap();
         let two = alice.devices.with_device(&alice.root, cert).unwrap();
         let one = two.without_device(&alice.root, &second.public()).unwrap();
-        let bytes = seal_addr(&keys, &second, &one, RELAY, NOW, 7200).unwrap();
+        let bytes = seal_addr(&keys, &second, &one, RELAY, &[], NOW, 7200).unwrap();
         assert_eq!(
             open_addr(&keys, &alice.root.id(), &bytes, NOW).unwrap_err(),
             AddrError::NotCurrent
@@ -325,8 +364,79 @@ mod tests {
         let keys = PairKeys::new(&alice.root, &bob.root.id()).unwrap();
         let relay = "x".repeat(MAX_RELAY_LEN + 1);
         assert_eq!(
-            seal_addr(&keys, &alice.device, &alice.devices, &relay, NOW, 60).unwrap_err(),
+            seal_addr(&keys, &alice.device, &alice.devices, &relay, &[], NOW, 60).unwrap_err(),
             AddrError::TooLong
         );
+        let field = [0; MAX_E2EE_FIELD + 1];
+        assert_eq!(
+            seal_addr(&keys, &alice.device, &alice.devices, RELAY, &field, NOW, 60).unwrap_err(),
+            AddrError::TooLong
+        );
+    }
+
+    #[test]
+    fn the_biggest_record_fits() {
+        // 16 devices with the longest names, the longest relay, a full field.
+        let (mut alice, bob) = (person(), person());
+        for i in 1..crate::MAX_DEVICES {
+            let device = DeviceKey::generate().unwrap();
+            let name = format!("{i:0>width$}", width = crate::MAX_DEVICE_NAME);
+            let cert = DeviceCert::issue(&alice.root, &device.public(), &name, NOW).unwrap();
+            alice.devices = alice.devices.with_device(&alice.root, cert).unwrap();
+        }
+        let keys = PairKeys::new(&alice.root, &bob.root.id()).unwrap();
+        let relay = "r".repeat(MAX_RELAY_LEN);
+        let field = [9; MAX_E2EE_FIELD];
+        let bytes = seal_addr(
+            &keys,
+            &alice.device,
+            &alice.devices,
+            &relay,
+            &field,
+            NOW,
+            60,
+        );
+        assert!(bytes.unwrap().len() <= MAX_RECORD_LEN);
+    }
+
+    /// A version 1 record, as routing made them before e2ee, still opens.
+    #[test]
+    fn version_1_still_opens() {
+        let (alice, bob) = (person(), person());
+        let keys = PairKeys::new(&alice.root, &bob.root.id()).unwrap();
+        let public = alice.device.public();
+        let lookup = keys.lookup(&alice.root.id(), day_of(NOW));
+        let slot = keys.slot(&public);
+        let list = alice.devices.to_bytes();
+        let mut body = vec![FORMAT_V1];
+        body.extend_from_slice(&lookup);
+        body.extend_from_slice(&slot);
+        body.extend_from_slice(public.as_bytes());
+        body.extend_from_slice(&NOW.to_be_bytes());
+        body.extend_from_slice(&(NOW + 60).to_be_bytes());
+        body.extend_from_slice(&(RELAY.len() as u16).to_be_bytes());
+        body.extend_from_slice(RELAY.as_bytes());
+        body.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        body.extend_from_slice(&list);
+        let signature = alice.device.sign(DOMAIN, &body);
+        body.extend_from_slice(&signature.to_bytes());
+        let mut out = lookup.to_vec();
+        out.extend_from_slice(&slot);
+        out.extend_from_slice(&(NOW + 60).to_be_bytes());
+        let nonce = [3u8; NONCE_LEN];
+        let payload = Payload {
+            msg: &body,
+            aad: &out,
+        };
+        let sealed = cipher(&keys)
+            .encrypt(&XNonce::from(nonce), payload)
+            .unwrap();
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&sealed);
+
+        let theirs = PairKeys::new(&bob.root, &alice.root.id()).unwrap();
+        let record = open_addr(&theirs, &alice.root.id(), &out, NOW).unwrap();
+        assert_eq!(record.device, public);
+        assert!(record.e2ee.is_empty());
     }
 }

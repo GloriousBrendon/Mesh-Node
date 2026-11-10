@@ -19,7 +19,8 @@ mod safety;
 
 pub use account::{Account, Entry, Kind, Status, TOMBSTONE_LIFE};
 pub use addr::{
-    AddrError, AddrRecord, MAX_RECORD_LEN, MAX_RELAY_LEN, addr_outer, open_addr, seal_addr,
+    AddrError, AddrRecord, MAX_E2EE_FIELD, MAX_RECORD_LEN, MAX_RELAY_LEN, addr_outer, open_addr,
+    seal_addr,
 };
 pub use code::{
     ActiveCode, CodeError, CodeRecord, CodeRevoke, DEFAULT_EXPIRY, DEFAULT_USES, EXPIRY_CHOICES,

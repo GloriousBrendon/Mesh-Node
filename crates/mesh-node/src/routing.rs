@@ -31,6 +31,7 @@ pub fn records(store: &Keystore, relay: &RelayUrl, now: u64, ttl: u64) -> Vec<Ve
                 store.device_key(),
                 store.devices(),
                 relay.as_str(),
+                &[],
                 now,
                 ttl,
             );
