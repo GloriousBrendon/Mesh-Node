@@ -51,6 +51,8 @@ use serde_json::{Value, json};
 use zeroize::Zeroize;
 
 const KEYSTORE_FILE: &str = "identity.mks";
+/// How long a new home relay must hold before records go out for it.
+const RELAY_SETTLE: Duration = Duration::from_secs(10);
 /// How often the node's state is checked for a change to report.
 const NET_POLL: Duration = Duration::from_secs(1);
 /// How often codes no seed holds yet are offered again.
@@ -317,8 +319,13 @@ enum Back {
     Held(Vec<(FriendCode, Option<Hold>)>),
     /// The home relay changed (or came up): records go out again.
     Relay,
-    /// Whether the seeds took every record, and whether they carried keys.
-    Published(bool, bool),
+    /// Whether the seeds took every record, whether they carried keys, and
+    /// whether that was all our records or one contact's.
+    Published {
+        ok: bool,
+        keys: bool,
+        all: bool,
+    },
     Republish,
     /// Contacts' records, for their e2ee keys.
     Records(Vec<(MeshId, Vec<AddrRecord>)>),
@@ -532,14 +539,14 @@ impl Helper {
             "friendAdd" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.add_contact(id, arg(1).unwrap_or(""))?;
-                self.contacts_changed();
+                self.contacts_changed(Some(&id));
                 self.dial(&id);
                 self.changed(Some(func));
             }
             "friendAccept" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.accept(&id)?;
-                self.contacts_changed();
+                self.contacts_changed(Some(&id));
                 // Their device lets us in (they asked), so this connection
                 // makes us friends on their side too (D8, D9).
                 self.dial(&id);
@@ -738,10 +745,15 @@ impl Helper {
         Ok((anon, self.seeds.clone()))
     }
 
-    /// The contacts changed: let in exactly them, and leave records for them.
-    fn contacts_changed(&mut self) {
+    fn publish(&mut self) {
+        self.publish_only(None);
+    }
+
+    /// The contacts changed: let in exactly them, and leave records for them
+    /// (`only` the one that changed, when it's one).
+    fn contacts_changed(&mut self, only: Option<&MeshId>) {
         self.allow_contacts();
-        self.publish();
+        self.publish_only(only);
     }
 
     /// They're no longer let in; their records lapse (routing D4).
@@ -964,13 +976,16 @@ impl Helper {
                 return;
             }
             Back::Republish => return self.publish(),
-            Back::Published(ok, keys) => {
-                if let Some(net) = &self.net {
+            Back::Published { ok, keys, all } => {
+                // One contact's record going up says nothing about the rest.
+                if let Some(net) = self.net.as_ref().filter(|_| all || !ok) {
                     net.published.store(ok, Ordering::Relaxed);
                     net.keys.store(ok && keys, Ordering::Relaxed);
                 }
                 if ok {
-                    self.publish_retry = PUBLISH_RETRY;
+                    if all {
+                        self.publish_retry = PUBLISH_RETRY;
+                    }
                 } else if self.net.is_some() {
                     let (wait, back) = (self.publish_retry, self.back.clone());
                     let most = Duration::from_secs(routing::REFRESH_EVERY);
@@ -1050,7 +1065,7 @@ impl Helper {
                         return emit_fail("friendRequest", kind, &message);
                     }
                 }
-                self.contacts_changed();
+                self.contacts_changed(Some(&id));
                 self.dial(&id);
                 return self.changed(Some("friendRequest"));
             }
@@ -1105,7 +1120,7 @@ impl Helper {
         }
         if changed {
             // A request from someone we'd asked made them a friend.
-            self.contacts_changed();
+            self.contacts_changed(None);
             self.dial_contacts();
             self.changed(None);
         }
@@ -1244,7 +1259,7 @@ impl Helper {
         };
         let ours = store.account().clone();
         if merged {
-            self.contacts_changed();
+            self.contacts_changed(None);
             // Whoever is no longer a contact (removed, blocked elsewhere) goes.
             if let Some(net) = &self.net {
                 for e in ours.entries() {
@@ -1730,7 +1745,9 @@ impl Helper {
 
     /// Sends this device's record for every contact to the seeds, in the
     /// background; `meshNet` says when they're there.
-    fn publish(&mut self) {
+    /// With `only`, just that contact's record: one change mustn't put
+    /// every record again (audit finding 9).
+    fn publish_only(&mut self, only: Option<&MeshId>) {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
         };
@@ -1741,9 +1758,9 @@ impl Helper {
         if self.seeds.is_empty() {
             return;
         }
-        let (now, keys) = (unix_now(), self.e2ee.is_some());
+        let (now, keys, all) = (unix_now(), self.e2ee.is_some(), only.is_none());
         let mut e2ee = self.e2ee.as_mut();
-        let records = routing::records(store, &relay, now, self.record_ttl, |id| {
+        let records = routing::records(store, &relay, now, self.record_ttl, only, |id| {
             let field = e2ee.as_mut().map(|e| e.record_field(id, now));
             field
                 .and_then(|f| {
@@ -1755,7 +1772,7 @@ impl Helper {
         let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
         tokio::spawn(async move {
             let ok = routing::publish(&anon, &seeds, &records).await;
-            let _ = back.send(Back::Published(ok, keys));
+            let _ = back.send(Back::Published { ok, keys, all });
         });
     }
 
@@ -2095,13 +2112,27 @@ async fn watch_net(
     back: tokio::sync::mpsc::UnboundedSender<Back>,
 ) {
     let mut last: Option<(Status, bool, bool)> = None;
+    // The relay records last went out for, and a new one waiting to settle.
+    let (mut acted, mut settling) = (None, None);
     loop {
         let flag = |f: &AtomicBool| f.load(Ordering::Relaxed);
         let now = (node.status(), flag(&published), flag(&keys));
-        if last.as_ref() != Some(&now) {
-            if now.0.relay.is_some() && last.as_ref().map(|l| &l.0.relay) != Some(&now.0.relay) {
+        let relay = now.0.relay.clone();
+        if relay.is_some() && relay != acted {
+            // The first relay goes at once; a change waits until it holds,
+            // so a flapping relay doesn't put every record each time
+            // (audit finding 9).
+            let since = match &settling {
+                Some((r, at)) if *r == relay => *at,
+                _ => tokio::time::Instant::now(),
+            };
+            settling = Some((relay.clone(), since));
+            if acted.is_none() || since.elapsed() >= RELAY_SETTLE {
                 let _ = back.send(Back::Relay);
+                (acted, settling) = (relay, None);
             }
+        }
+        if last.as_ref() != Some(&now) {
             emit_net(Some(&now.0), now.1, now.2);
             last = Some(now);
         }

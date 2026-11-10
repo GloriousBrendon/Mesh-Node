@@ -7,15 +7,19 @@
 
 use crate::codes::{Caller, Window};
 use crate::saved::{self, StoreError};
-use mesh_identity::{MAX_RECORD_LEN, addr_outer};
+use mesh_identity::{MAX_CONTACTS, MAX_RECORD_LEN, addr_outer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Records one device may put an hour.
-pub const PUTS_PER_DEVICE: u32 = 2000;
-/// Records one network (/24 or /48) may put an hour.
-pub const PUTS_PER_NETWORK: u32 = 4000;
+/// Records one device may put an hour: four full rounds of the most
+/// contacts allowed, plus our own record (the two refreshes, a relay
+/// change, and adds and retries), so a full list never hits it (audit
+/// finding 9).
+pub const PUTS_PER_DEVICE: u32 = 4 * (MAX_CONTACTS as u32 + 1);
+/// Records one network (/24 or /48) may put an hour: two such devices.
+pub const PUTS_PER_NETWORK: u32 = 2 * PUTS_PER_DEVICE;
+const _: () = assert!(PUTS_PER_DEVICE as usize >= 2 * (MAX_CONTACTS + 1));
 /// Records everyone reaching the seed through a relay may put an hour,
 /// together: half of what it holds.
 pub const PUTS_RELAYED: u32 = MAX_RECORDS as u32 / 2;
@@ -402,7 +406,8 @@ mod tests {
             network: Some([1; 6]),
         };
         for i in 0..PUTS_PER_DEVICE {
-            let r = record((i % 250) as u8, (i / 250) as u8, NOW + 60, 0);
+            let mut r = record(0, 0, NOW + 60, 0);
+            r[..4].copy_from_slice(&i.to_be_bytes());
             assert_eq!(s.put(&net, &r, NOW), Put::Ok, "put {i}");
         }
         let r = record(250, 0, NOW + 60, 0);

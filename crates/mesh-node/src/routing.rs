@@ -20,17 +20,19 @@ pub const REFRESH_EVERY: u64 = 30 * 60;
 
 /// This device's record for each contact, and one under the self pair for
 /// our other devices (SPEC-social D11), on `relay`. `field` gives each one's
-/// e2ee field (SPEC-e2ee D4).
+/// e2ee field (SPEC-e2ee D4). With `only`, just that contact's record.
 pub fn records(
     store: &Keystore,
     relay: &RelayUrl,
     now: u64,
     ttl: u64,
+    only: Option<&MeshId>,
     mut field: impl FnMut(&MeshId) -> Vec<u8>,
 ) -> Vec<Vec<u8>> {
     let ids = store.contacts().iter().map(|c| c.id());
     std::iter::once(store.id())
         .chain(ids)
+        .filter(|id| only.is_none_or(|only| only == id))
         .filter_map(|id| {
             let keys = store.pair_keys(&id)?;
             let sealed = seal_addr(
@@ -244,4 +246,43 @@ pub async fn find(
     // A newer list than the one already known goes back to the keystore.
     let newer = newest.filter(|l| target.known.as_ref().is_none_or(|k| l.seq() > k.seq()));
     Ok((found, newer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_identity::RootKey;
+
+    /// A change to one contact puts only their record, not everyone's
+    /// (audit finding 9); a refresh still puts them all, and ours.
+    #[test]
+    fn one_contact_or_all_of_them() {
+        let dir = std::env::temp_dir().join(format!("mesh-routing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let password = "correct horse battery staple";
+        let mut store = Keystore::create(&dir.join("keystore"), "alice", password, "pc").unwrap();
+        let ids: Vec<MeshId> = (0..3).map(|_| RootKey::generate().unwrap().id()).collect();
+        for id in &ids {
+            store.add_contact(*id, "").unwrap();
+        }
+        let relay: RelayUrl = "https://relay.example/".parse().unwrap();
+        let all = records(&store, &relay, 1_800_000_000, RECORD_TTL, None, |_| {
+            Vec::new()
+        });
+        assert_eq!(
+            all.len(),
+            ids.len() + 1,
+            "every contact and our own devices"
+        );
+        let one = records(
+            &store,
+            &relay,
+            1_800_000_000,
+            RECORD_TTL,
+            Some(&ids[1]),
+            |_| Vec::new(),
+        );
+        assert_eq!(one.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
