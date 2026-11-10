@@ -14,6 +14,7 @@ use crate::id::{MeshId, RootKey};
 const LOOKUP_CONTEXT: &str = "mesh/v1/pair-lookup";
 const SLOT_CONTEXT: &str = "mesh/v1/pair-slot";
 const RECORD_KEY_CONTEXT: &str = "mesh/v1/pair-record-key";
+const KNOCK_SLOT_CONTEXT: &str = "mesh/v1/knock-slot";
 const DAY: u64 = 86_400;
 
 /// The UTC day a unix time falls in.
@@ -50,6 +51,13 @@ impl PairKeys {
             .hasher(SLOT_CONTEXT)
             .update(device.as_bytes())
             .finalize();
+        hash.as_bytes()[..8].try_into().expect("8 bytes")
+    }
+
+    /// Where this pair's friend request goes under a code's lookup ID
+    /// (SPEC-social D5): one per sender, so a resend replaces the last.
+    pub fn knock_slot(&self, lookup_id: &[u8; 16]) -> [u8; 8] {
+        let hash = self.hasher(KNOCK_SLOT_CONTEXT).update(lookup_id).finalize();
         hash.as_bytes()[..8].try_into().expect("8 bytes")
     }
 
