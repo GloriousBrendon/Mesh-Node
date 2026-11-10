@@ -9,6 +9,7 @@ use mesh_transport::{
     ALPN, Config, HandshakeError, Limits, MeshAddr, Node, Path, Relays, TransportError, frame,
 };
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct Device {
@@ -345,7 +346,7 @@ async fn only_allowed_identities_get_in() {
     let allowed = alice.id();
     let config = Config {
         relays: Relays::Disabled,
-        allow: mesh_transport::Allow::only(move |id| *id == allowed),
+        allow: mesh_transport::Allow::only(move |id, _| *id == allowed),
         ..Config::default()
     };
     let b = Node::start(&bob.key, &bob.cert("desktop"), config)
@@ -364,6 +365,44 @@ async fn only_allowed_identities_get_in() {
     b.disconnect(&alice.id());
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(b.status().connections, 0);
+}
+
+#[tokio::test]
+async fn a_refused_device_of_an_allowed_identity_is_kept_out() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let laptop = Device {
+        root: RootKey::from_secret_bytes(*alice.root.secret_bytes()),
+        key: DeviceKey::generate().unwrap(),
+    };
+    let allowed = alice.id();
+    let refused: Arc<Mutex<Option<iroh::PublicKey>>> = Arc::default();
+    let check = refused.clone();
+    let config = Config {
+        relays: Relays::Disabled,
+        allow: mesh_transport::Allow::only(move |id, device| {
+            *id == allowed && *check.lock().unwrap() != Some(*device)
+        }),
+        ..Config::default()
+    };
+    let b = Node::start(&bob.key, &bob.cert("desktop"), config)
+        .await
+        .unwrap();
+    let (a, l) = (alice.node("desk").await, laptop.node("laptop").await);
+    assert!(a.ping(&addr_of(&b)).await.is_ok());
+    assert!(l.ping(&addr_of(&b)).await.is_ok());
+
+    // The laptop is removed: its open connection goes, the desk's stays,
+    // and the laptop can't come back.
+    *refused.lock().unwrap() = iroh::PublicKey::from_bytes(laptop.key.public().as_bytes()).ok();
+    b.prune();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(b.status().connections, 1);
+    let err = l.dial(&addr_of(&b)).await.unwrap_err();
+    assert!(
+        matches!(err, TransportError::Handshake(HandshakeError::NotAllowed)),
+        "{err:?}"
+    );
+    assert!(a.ping(&addr_of(&b)).await.is_ok());
 }
 
 #[tokio::test]

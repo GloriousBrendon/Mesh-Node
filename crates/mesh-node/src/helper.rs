@@ -224,6 +224,9 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
     helper.stop_net().await;
 }
 
+/// Each allowed ID, with the device keys its newest list removed.
+type Allowed = HashMap<[u8; 32], HashSet<[u8; 32]>>;
+
 struct Helper {
     path: PathBuf,
     store: Option<Keystore>,
@@ -238,7 +241,9 @@ struct Helper {
     /// Where background seed requests report back to the loop.
     back: tokio::sync::mpsc::UnboundedSender<Back>,
     /// Whose devices may connect: our own identity and our contacts (D9).
-    allowed: Arc<RwLock<HashSet<[u8; 32]>>>,
+    /// Who may connect: our ID and our contacts', each with the devices its
+    /// newest known list removed (D9; audit finding 2).
+    allowed: Arc<RwLock<Allowed>>,
     /// How long address records last (D4).
     record_ttl: u64,
     /// The wait before the next publish after a failed one.
@@ -985,6 +990,10 @@ impl Helper {
                 {
                     eprintln!("mesh-node: couldn't save a contact's address: {e}");
                 }
+                if list.is_some() {
+                    // A newer list of theirs may have removed a device.
+                    self.allow_contacts();
+                }
                 let promoted = self.connected(&id);
                 self.present_to(&id);
                 self.keys_for(&id);
@@ -1329,8 +1338,10 @@ impl Helper {
             .max_by_key(|l| l.seq());
         // Quietly: an unasked `meshIdentity` would read as an answer.
         // Mesh-Voice sees the new device at its next `idStatus`.
-        if let Some(Err(e)) = newest.map(|list| store.own_list_seen(list)) {
-            eprintln!("mesh-node: couldn't save our device list: {e}");
+        match newest.map(|list| store.own_list_seen(list)) {
+            Some(Ok(true)) => self.allow_contacts(),
+            Some(Err(e)) => eprintln!("mesh-node: couldn't save our device list: {e}"),
+            _ => {}
         }
     }
 
@@ -1353,6 +1364,7 @@ impl Helper {
         {
             eprintln!("mesh-node: couldn't save e2ee state: {e}");
         }
+        self.allow_contacts();
         self.emit_identity();
         self.publish();
         Ok(())
@@ -1610,11 +1622,15 @@ impl Helper {
         let allowed = self.allowed.clone();
         let config = Config {
             relays: self.relays.clone(),
-            allow: Allow::only(move |id| {
-                allowed
+            allow: Allow::only(move |id, device| {
+                // A device not in the newest list we hold may be newly linked;
+                // only one that list removed is refused.
+                let allowed = allowed
                     .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(&id.to_bytes())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                allowed
+                    .get(&id.to_bytes())
+                    .is_some_and(|revoked| !revoked.contains(device.as_bytes()))
             }),
             services: vec![
                 SYNC.to_owned(),
@@ -1687,16 +1703,29 @@ impl Helper {
         self.emit_codes(None);
     }
 
-    /// Lets in exactly our own identity and our contacts (D9).
+    /// Lets in exactly our own identity and our contacts (D9), but no device
+    /// their newest list removed, and closes what that no longer lets in.
     fn allow_contacts(&self) {
+        let revoked = |list: Option<DeviceList>| -> HashSet<[u8; 32]> {
+            let Some(list) = list else {
+                return HashSet::new();
+            };
+            list.revoked().iter().map(|d| d.to_bytes()).collect()
+        };
         let ids = self.store.iter().flat_map(|store| {
-            std::iter::once(store.id().to_bytes())
-                .chain(store.contacts().iter().map(|c| c.id().to_bytes()))
+            std::iter::once((
+                store.id().to_bytes(),
+                revoked(Some(store.devices().clone())),
+            ))
+            .chain((store.contacts().iter()).map(|c| (c.id().to_bytes(), revoked(c.devices()))))
         });
         *self
             .allowed
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ids.collect();
+        if let Some(net) = &self.net {
+            net.node.prune();
+        }
     }
 
     /// Sends this device's record for every contact to the seeds, in the

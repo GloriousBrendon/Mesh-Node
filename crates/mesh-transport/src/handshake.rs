@@ -110,7 +110,7 @@ pub(crate) async fn accept(
         .flatten()
         .ok_or(HandshakeError::BadCert)?;
     let peer = check_hello(&theirs, &conn.remote_id())?;
-    if !allow.allows(&peer.id) {
+    if !allow.allows(&peer.id, &peer.device) {
         return Err(HandshakeError::NotAllowed);
     }
     frame::write_frame(&mut send, ours)

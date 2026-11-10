@@ -237,6 +237,11 @@ impl DeviceList {
         self.devices.iter().any(|d| &d.device == device) && !self.revoked.contains(device)
     }
 
+    /// The devices this list removed (the newest `MAX_REVOKED`).
+    pub fn revoked(&self) -> &[VerifyingKey] {
+        &self.revoked
+    }
+
     /// Ok when this list may replace `older`: same identity, higher `seq`.
     pub fn replaces(&self, older: &DeviceList) -> Result<(), DeviceError> {
         if self.root != older.root {

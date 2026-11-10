@@ -269,6 +269,11 @@ fn groups_reach_members_and_removals_cut_off() {
     bob.note_with("after the laptop");
     bob.note_with("group after the laptop");
     laptop.note_with("before the laptop goes");
+    // The removed laptop can't connect to the desk any more (audit finding
+    // 2): its open connection was closed, and a new one is refused.
+    let ticket_a = alice.expect("netTicket", &[], "meshTicket")["ticket"].clone();
+    let err = laptop.expect("netPing", &[ticket_a.as_str().unwrap()], "meshError");
+    assert_eq!(err["kind"], "unreachable", "{err}");
 
     let stderr = [alice, laptop, bob, carol].map(Helper::quit).concat();
     check_nothing_leaked(

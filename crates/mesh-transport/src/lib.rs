@@ -125,19 +125,20 @@ impl TestOptions {
 }
 
 /// Who may connect: checked in the handshake, before this node shows its
-/// certificate (SPEC-routing D9: only contacts and your own devices).
+/// certificate (SPEC-routing D9: only contacts and your own devices), with
+/// the device, so a removed one can be refused.
 #[derive(Clone, Default)]
 pub struct Allow(Option<Arc<AllowFn>>);
 
-type AllowFn = dyn Fn(&MeshId) -> bool + Send + Sync;
+type AllowFn = dyn Fn(&MeshId, &iroh::PublicKey) -> bool + Send + Sync;
 
 impl Allow {
-    pub fn only(check: impl Fn(&MeshId) -> bool + Send + Sync + 'static) -> Self {
+    pub fn only(check: impl Fn(&MeshId, &iroh::PublicKey) -> bool + Send + Sync + 'static) -> Self {
         Self(Some(Arc::new(check)))
     }
 
-    pub fn allows(&self, id: &MeshId) -> bool {
-        self.0.as_ref().is_none_or(|check| check(id))
+    pub fn allows(&self, id: &MeshId, device: &iroh::PublicKey) -> bool {
+        self.0.as_ref().is_none_or(|check| check(id, device))
     }
 }
 

@@ -250,6 +250,19 @@ impl Node {
         });
     }
 
+    /// Closes every connection `allow` no longer lets in: call it after the
+    /// allowed set changes (a contact or a device removed).
+    pub fn prune(&self) {
+        let allow = &self.shared.allow;
+        lock(&self.shared.conns).retain(|_, (peer, conn)| {
+            let keep = allow.allows(&peer.id, &peer.device);
+            if !keep {
+                conn.close(HandshakeError::NotAllowed.code().into(), b"not-allowed");
+            }
+            keep
+        });
+    }
+
     /// Closes every connection, saying it's locked, then the endpoint.
     pub async fn close(&self) {
         for (_, (_, conn)) in lock(&self.shared.conns).drain() {
@@ -307,7 +320,7 @@ impl Shared {
     /// removed must not leave a connection behind.
     fn add(self: &Arc<Self>, peer: Peer, conn: Connection) -> Result<(), HandshakeError> {
         let mut conns = lock(&self.conns);
-        if !self.allow.allows(&peer.id) {
+        if !self.allow.allows(&peer.id, &peer.device) {
             HandshakeError::NotAllowed.close(&conn);
             return Err(HandshakeError::NotAllowed);
         }
