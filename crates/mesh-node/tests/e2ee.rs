@@ -105,6 +105,19 @@ impl Helper {
         identity["devices"].as_array().unwrap().len()
     }
 
+    /// Waits until this device can encrypt to `n` of `id`'s devices (it
+    /// learns a newly linked one at its next key fetch), with 1:1 test notes.
+    fn reaches(&mut self, id: &str, n: u64) {
+        let started = Instant::now();
+        while self.note(&[id], "are you there", None)["devices"] != n {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "never reached {n}"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
     /// Waits until this device knows of `n` devices of its own.
     fn knows_devices(&mut self, n: usize) {
         let started = Instant::now();
@@ -214,6 +227,9 @@ fn groups_reach_members_and_removals_cut_off() {
         assert_eq!(note["conversation"], group);
         assert_eq!(note["group"].as_array().unwrap().len(), 3);
     }
+    // Bob and Carol may not have fetched the laptop's keys yet.
+    bob.reaches(&id_a, 2);
+    carol.reaches(&id_a, 2);
     bob.note(&[&id_a, &id_c], "from bob", Some(&group));
     carol.note(&[&id_a, &id_b], "from carol", Some(&group));
     for h in [&mut alice, &mut laptop] {
