@@ -889,10 +889,11 @@ impl Keystore {
     /// Takes in another device's account state (SPEC-social D11). True if
     /// anything changed here.
     pub fn merge_account(&mut self, other: &Account) -> Result<bool, KeystoreError> {
-        if !self.account.merge(other) {
+        let now = unix_now();
+        if !self.account.merge(other, now) {
             return Ok(false);
         }
-        self.account.prune(unix_now());
+        self.account.prune(now);
         self.follow_account();
         self.save()?;
         Ok(true)

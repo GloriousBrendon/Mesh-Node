@@ -150,8 +150,10 @@ impl Account {
     }
 
     /// Takes whatever is newer in `other`, entry by entry. True if anything
-    /// changed here.
-    pub fn merge(&mut self, other: &Account) -> bool {
+    /// changed here. An entry we don't have that would let someone in, last
+    /// changed a tombstone's life ago, isn't taken: we may have removed them
+    /// and since dropped the tombstone (audit finding 14).
+    pub fn merge(&mut self, other: &Account, now: u64) -> bool {
         let mut changed = false;
         for theirs in &other.entries {
             match self.entries.iter_mut().find(|e| e.id == theirs.id) {
@@ -160,6 +162,8 @@ impl Account {
                     *ours = theirs.clone();
                     changed = true;
                 }
+                None if theirs.kind != Kind::Blocked
+                    && theirs.changed.saturating_add(TOMBSTONE_LIFE) <= now => {}
                 None => {
                     self.entries.push(theirs.clone());
                     changed = true;
@@ -221,9 +225,9 @@ mod tests {
         laptop.set_status(Status::Dnd, LAPTOP, 10);
 
         let mut a = desk.clone();
-        assert!(a.merge(&laptop));
+        assert!(a.merge(&laptop, 0));
         let mut b = laptop.clone();
-        b.merge(&desk);
+        b.merge(&desk, 0);
         // Same entries whichever way round (order in the list aside).
         for who in [&alice, &bob] {
             assert_eq!(a.get(who), b.get(who));
@@ -234,8 +238,8 @@ mod tests {
 
         // Idempotent.
         let before = a.clone();
-        assert!(!a.merge(&laptop));
-        assert!(!a.merge(&before));
+        assert!(!a.merge(&laptop, 0));
+        assert!(!a.merge(&before, 0));
         assert_eq!(a, before);
     }
 
@@ -247,15 +251,15 @@ mod tests {
         let mut laptop = Account::default();
         laptop.change(&alice, LAPTOP, 100, kind(Kind::Blocked));
         let mut a = desk.clone();
-        a.merge(&laptop);
+        a.merge(&laptop, 0);
         assert_eq!(a.kind(&alice), Some(Kind::Blocked));
-        laptop.merge(&desk);
+        laptop.merge(&desk, 0);
         assert_eq!(laptop.kind(&alice), Some(Kind::Blocked));
 
         // A device whose clock is behind still makes a newer change.
         a.change(&alice, DESK, 5, kind(Kind::Friend));
         let mut b = laptop.clone();
-        assert!(b.merge(&a));
+        assert!(b.merge(&a, 0));
         assert_eq!(b.kind(&alice), Some(Kind::Friend));
     }
 
@@ -267,7 +271,7 @@ mod tests {
         let mut new = Account::default();
         new.change(&alice, LAPTOP, 200, kind(Kind::Removed));
         let mut merged = new.clone();
-        assert!(!merged.merge(&old));
+        assert!(!merged.merge(&old, 0));
         assert_eq!(merged.kind(&alice), Some(Kind::Removed));
 
         merged.prune(200 + TOMBSTONE_LIFE - 1);
@@ -277,6 +281,28 @@ mod tests {
         // Other kinds are never pruned.
         old.prune(u64::MAX / 2);
         assert_eq!(old.kind(&alice), Some(Kind::Friend));
+    }
+
+    /// A laptop unused past a tombstone's life still says "friend" about
+    /// someone the desk removed and has since forgotten removing. That
+    /// mustn't bring them back (audit finding 14).
+    #[test]
+    fn a_stale_device_cant_bring_back_an_expired_removal() {
+        let (alice, eve) = (id(), id());
+        let mut laptop = Account::default();
+        laptop.change(&alice, LAPTOP, 100, kind(Kind::Friend));
+        laptop.change(&eve, LAPTOP, 100, kind(Kind::Blocked));
+        let mut desk = Account::default();
+        let now = 100 + TOMBSTONE_LIFE;
+        // Its tombstone for Alice is gone: it has no entry at all.
+        assert!(desk.merge(&laptop, now));
+        assert_eq!(desk.kind(&alice), None, "an old friend came back");
+        // A block only ever keeps someone out: it still comes across.
+        assert_eq!(desk.kind(&eve), Some(Kind::Blocked));
+        // A recent add still does, as does one we already hold.
+        laptop.change(&alice, LAPTOP, now, kind(Kind::Friend));
+        assert!(desk.merge(&laptop, now));
+        assert_eq!(desk.kind(&alice), Some(Kind::Friend));
     }
 
     #[test]
