@@ -43,6 +43,9 @@ pub const FALLBACK_LIFE: u64 = 7 * 24 * 3600;
 const SESSIONS_PER_DEVICE: usize = 4;
 /// First messages remembered per person, so one isn't opened twice.
 const FIRST_MESSAGES_KEPT: usize = 1000;
+/// How often a device may get a fresh session after a first message we
+/// couldn't open.
+const UNWEDGE_EVERY: u64 = 3600;
 /// The longest record field.
 pub const MAX_FIELD_LEN: usize = MAX_BUNDLE_LEN + 64;
 const _: () = assert!(MAX_FIELD_LEN <= mesh_identity::MAX_E2EE_FIELD);
@@ -190,6 +193,9 @@ pub struct E2ee {
     /// 1:1 conversation IDs, to place our own devices' copies.
     direct: HashMap<[u8; 16], MeshId>,
     pub(crate) groups: Groups,
+    /// When each device last got a fresh session from `unwedge`. In memory:
+    /// a restart allowing one more is fine.
+    unwedged: HashMap<Key, u64>,
     /// `None` keeps everything in memory (tests).
     store: Option<Store>,
     pub(crate) dirty: Dirty,
@@ -264,6 +270,7 @@ impl E2ee {
             people: HashMap::new(),
             direct: HashMap::new(),
             groups: Groups::default(),
+            unwedged: HashMap::new(),
             store: None,
             dirty: Dirty::default(),
         };
@@ -349,6 +356,7 @@ impl E2ee {
             people,
             direct,
             groups,
+            unwedged: HashMap::new(),
             store: Some(store),
             dirty: Dirty::default(),
         })
@@ -504,7 +512,16 @@ impl E2ee {
         }
         let key = |at: usize| -> Key { field[at..at + 32].try_into().expect("32 bytes") };
         let fallback = key(MAX_BUNDLE_LEN);
-        let one_time = (field.len() == MAX_FIELD_LEN).then(|| key(MAX_BUNDLE_LEN + 32));
+        // The key is reserved per person, so only our first device takes it;
+        // the others start on the fallback key (finding 1).
+        // ponytail: until records carry one key per reader device.
+        let first = self.people.get(&self.me).and_then(|me| {
+            let mut ours = me.devices.devices().iter().map(|c| *c.device());
+            ours.find(|d| d != device)
+        });
+        let takes_it = first == Some(self.device.public());
+        let one_time = (field.len() == MAX_FIELD_LEN && takes_it).then(|| key(MAX_BUNDLE_LEN + 32));
+        let person = self.people.get_mut(id).expect("taken above");
         let entry = person.keys.entry(device.to_bytes());
         let keys = entry.or_insert(Keys {
             bundle,
@@ -610,21 +627,10 @@ impl E2ee {
         let plain = self.claim(inside);
         self.dirty.people.insert(*id);
         let person = self.people.get_mut(id).ok_or(E2eeError::NoKeys)?;
-        let sessions = person.sessions.entry(*device).or_default();
-        if sessions.is_empty() {
-            let keys = person.keys.get_mut(device).ok_or(E2eeError::NoKeys)?;
-            let one_time = keys.one_time.take().unwrap_or(keys.fallback);
-            keys.used = Some(one_time);
-            let session = self
-                .account
-                .create_outbound_session(
-                    SessionConfig::version_1(),
-                    Curve25519PublicKey::from_bytes(keys.bundle.curve),
-                    Curve25519PublicKey::from_bytes(one_time),
-                )
-                .map_err(|_| E2eeError::NoKeys)?;
-            sessions.push_front(session);
+        if person.sessions.get(device).is_none_or(VecDeque::is_empty) {
+            start_session(&self.account, person, device)?;
         }
+        let sessions = person.sessions.get_mut(device).expect("a session");
         let session = sessions.front_mut().expect("a session");
         let (kind, message) = match session.encrypt(&plain).map_err(|_| E2eeError::NoKeys)? {
             OlmMessage::PreKey(m) => (EnvelopeType::OlmFirst, m.to_bytes()),
@@ -772,7 +778,12 @@ impl E2ee {
             self.save()?;
             return Ok(out);
         }
-        let (sender, device, inside) = self.open_olm(&envelope)?;
+        let (sender, device, inside) = match self.open_olm(&envelope) {
+            Err(E2eeError::CantOpen) if envelope.kind == EnvelopeType::OlmFirst => {
+                return self.unwedge(&envelope, now);
+            }
+            opened => opened?,
+        };
         match inside.kind {
             Kind::KeyShare => self.take_share(sender, &inside, now, &mut out)?,
             Kind::KeyRequest => {
@@ -782,6 +793,39 @@ impl E2ee {
         }
         self.save()?;
         Ok(out)
+    }
+
+    /// A first message from a known device that we can't open: it was
+    /// started from a key we no longer hold. Answer on a fresh session, so
+    /// the sender moves to it (Olm uses the newest session that worked). At
+    /// most once an hour per device, since the sender's curve key is outside
+    /// the encryption and anyone who can reach us could claim it.
+    fn unwedge(&mut self, envelope: &Envelope, now: u64) -> Result<Received, E2eeError> {
+        let curve: Key = envelope.payload[..32]
+            .try_into()
+            .expect("checked by open_olm");
+        let [(id, device)] = self.candidates(&curve)?[..] else {
+            return Err(E2eeError::CantOpen);
+        };
+        let current = self.people[&id].devices.is_current(&key_of(&device)?);
+        let recent = self
+            .unwedged
+            .get(&device)
+            .is_some_and(|at| now < at + UNWEDGE_EVERY);
+        if !current || recent {
+            return Err(E2eeError::CantOpen);
+        }
+        self.unwedged.insert(device, now);
+        let person = self.people.get_mut(&id).expect("a candidate");
+        start_session(&self.account, person, &device).map_err(|_| E2eeError::CantOpen)?;
+        // A key request for no chain: the reader opens it and does nothing.
+        let inside = self.inside([0; 16], Kind::KeyRequest, &[0; 36])?;
+        let reply = self.encrypt_to(&id, &device, &inside)?;
+        self.save()?;
+        Ok(Received {
+            opened: Vec::new(),
+            replies: vec![(key_of(&device)?, reply)],
+        })
     }
 
     /// Checks a 1:1 message's conversation and places it.
@@ -811,6 +855,25 @@ impl E2ee {
             body: inside.body,
         })
     }
+}
+
+/// Starts a new outbound session with `device`, in front of any others:
+/// from its one-time key if we hold one, else its fallback key.
+fn start_session(account: &Account, person: &mut Person, device: &Key) -> Result<(), E2eeError> {
+    let keys = person.keys.get_mut(device).ok_or(E2eeError::NoKeys)?;
+    let one_time = keys.one_time.take().unwrap_or(keys.fallback);
+    keys.used = Some(one_time);
+    let session = account
+        .create_outbound_session(
+            SessionConfig::version_1(),
+            Curve25519PublicKey::from_bytes(keys.bundle.curve),
+            Curve25519PublicKey::from_bytes(one_time),
+        )
+        .map_err(|_| E2eeError::NoKeys)?;
+    let sessions = person.sessions.entry(*device).or_default();
+    sessions.push_front(session);
+    sessions.truncate(SESSIONS_PER_DEVICE);
+    Ok(())
 }
 
 fn decrypt(session: &mut Session, message: &OlmMessage) -> Result<Vec<u8>, E2eeError> {
@@ -869,9 +932,13 @@ pub(crate) mod tests {
     }
 
     impl E2ee {
-        /// Opens an envelope that holds exactly one message.
+        /// Opens an envelope that holds exactly one message. One that opens
+        /// nothing (a fresh session was sent back instead) is `CantOpen`.
         pub fn open1(&mut self, envelope: &[u8]) -> Result<Opened, E2eeError> {
             let mut got = self.decrypt(envelope, NOW)?;
+            if got.opened.is_empty() {
+                return Err(E2eeError::CantOpen);
+            }
             assert_eq!(got.opened.len(), 1);
             Ok(got.opened.pop().unwrap())
         }
@@ -1220,5 +1287,84 @@ pub(crate) mod tests {
             .unwrap();
         assert_ne!(first[MAX_BUNDLE_LEN..][..32], later[MAX_BUNDLE_LEN..][..32]);
         assert_eq!(first[..MAX_BUNDLE_LEN], later[..MAX_BUNDLE_LEN]);
+    }
+
+    /// Alice's laptop, linked after her first device. With `alone`, the
+    /// laptop's own list doesn't have the first device yet (a list still on
+    /// its way), so it takes itself for her first device.
+    fn laptop_of(alice: &mut Device, alone: bool) -> Device {
+        let key = DeviceKey::generate().unwrap();
+        let cert = DeviceCert::issue(&alice.who.root, &key.public(), "laptop", NOW).unwrap();
+        let root = &alice.who.root;
+        let two = alice.who.devices.with_device(root, cert.clone()).unwrap();
+        let own = if alone {
+            DeviceList::first(root, cert).unwrap()
+        } else {
+            two.clone()
+        };
+        let laptop = Device {
+            e2ee: E2ee::new(root, &key, &own, NOW).unwrap(),
+            who: Who {
+                root: RootKey::from_secret_bytes(*root.secret_bytes()),
+                device: key,
+                devices: two.clone(),
+            },
+        };
+        alice.who.devices = two;
+        laptop
+    }
+
+    fn to(out: Vec<(VerifyingKey, Vec<u8>)>, device: &VerifyingKey) -> Vec<u8> {
+        out.into_iter().find(|(d, _)| d == device).unwrap().1
+    }
+
+    #[test]
+    fn two_devices_of_one_person_each_start_a_session() {
+        let (mut alice, mut bob) = (device(), device());
+        let mut laptop = laptop_of(&mut alice, false);
+        friends(&mut alice, &mut bob);
+        friends(&mut laptop, &mut bob);
+        let (bob_id, bob_key) = (bob.who.root.id(), bob.who.device.public());
+        let a = alice
+            .e2ee
+            .encrypt_direct(&bob_id, Kind::TestNote, b"desktop");
+        let b = laptop
+            .e2ee
+            .encrypt_direct(&bob_id, Kind::TestNote, b"laptop");
+        assert!(bob.e2ee.open1(&to(a.unwrap(), &bob_key)).is_ok());
+        let second = bob.e2ee.open1(&to(b.unwrap(), &bob_key));
+        assert!(second.is_ok(), "the second device's message was lost");
+    }
+
+    #[test]
+    fn a_first_message_that_cant_open_gets_a_fresh_session_back() {
+        let (mut alice, mut bob) = (device(), device());
+        // Both of Alice's devices take Bob's one-time key.
+        let mut laptop = laptop_of(&mut alice, true);
+        friends(&mut alice, &mut bob);
+        friends(&mut laptop, &mut bob);
+        let (bob_id, bob_key) = (bob.who.root.id(), bob.who.device.public());
+        let laptop_key = laptop.who.device.public();
+        let a = alice
+            .e2ee
+            .encrypt_direct(&bob_id, Kind::TestNote, b"desktop");
+        bob.e2ee.open1(&to(a.unwrap(), &bob_key)).unwrap();
+        let lost = laptop.e2ee.encrypt_direct(&bob_id, Kind::TestNote, b"lost");
+        let lost = to(lost.unwrap(), &bob_key);
+        let got = bob.e2ee.decrypt(&lost, NOW).unwrap();
+        assert!(got.opened.is_empty());
+        let (device, reply) = got.replies.into_iter().next().expect("a reply");
+        assert_eq!(device, laptop_key);
+        assert!(laptop.e2ee.decrypt(&reply, NOW).unwrap().opened.is_empty());
+        // The laptop now sends on Bob's session, and Bob can read it.
+        let next = laptop.e2ee.encrypt_direct(&bob_id, Kind::TestNote, b"next");
+        let opened = bob.e2ee.open1(&to(next.unwrap(), &bob_key)).unwrap();
+        assert_eq!(opened.body, b"next");
+        // The same broken message again, within the hour, gets no second
+        // session: a forged one can't make Bob start sessions without end.
+        assert_eq!(
+            bob.e2ee.decrypt(&lost, NOW).err(),
+            Some(E2eeError::CantOpen)
+        );
     }
 }
