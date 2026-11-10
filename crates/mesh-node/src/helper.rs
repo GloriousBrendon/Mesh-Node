@@ -306,7 +306,8 @@ enum Back {
     /// Another of our devices sent its account state.
     Synced(Box<(Account, MeshAddr)>),
     /// A device of someone's said what it shows, or went quiet.
-    Presence(Box<(MeshId, [u8; 32], Option<Presence>)>),
+    /// Their username comes with it (empty from an older helper).
+    Presence(Box<(MeshId, [u8; 32], Option<Presence>, String)>),
 }
 
 /// One code's requests, from every seed that answered.
@@ -931,8 +932,8 @@ impl Helper {
                 return self.synced(&theirs, &from);
             }
             Back::Presence(heard) => {
-                let (id, device, heard) = *heard;
-                return self.presence_heard(id, device, heard);
+                let (id, device, heard, name) = *heard;
+                return self.presence_heard(id, device, heard, &name);
             }
             Back::Resolved(resolved) => {
                 let (id, lookup_id, note) = *resolved;
@@ -1056,12 +1057,14 @@ impl Helper {
             }
             let (node, presenting) = (net.node.clone(), net.presenting.clone());
             let mut shown = self.shown.subscribe();
+            let name = store.username().as_bytes().to_vec();
             tokio::spawn(async move {
                 let sent = async {
                     let (_, mut send, _recv) = node.open(&addr, PRESENCE).await.ok()?;
                     loop {
-                        let now = *shown.borrow_and_update() as u8;
-                        mesh_transport::frame::write_frame(&mut send, &[now])
+                        // The status byte, then our username (SPEC-social D12).
+                        let now = [&[*shown.borrow_and_update() as u8][..], &name].concat();
+                        mesh_transport::frame::write_frame(&mut send, &now)
                             .await
                             .ok()?;
                         tokio::select! {
@@ -1077,7 +1080,13 @@ impl Helper {
     }
 
     /// A friend's device said what it shows, or went quiet (`None`).
-    fn presence_heard(&mut self, id: MeshId, device: [u8; 32], heard: Option<Presence>) {
+    fn presence_heard(
+        &mut self,
+        id: MeshId,
+        device: [u8; 32],
+        heard: Option<Presence>,
+        name: &str,
+    ) {
         // Their stream came over a connection that passed the handshake, which
         // may get here before our own dial's answer does.
         if heard.is_some() && self.connected(&id) {
@@ -1087,13 +1096,26 @@ impl Helper {
             .store
             .as_ref()
             .is_some_and(|s| s.account().kind(&id) == Some(Kind::Friend));
+        let renamed = match self.store.as_mut() {
+            Some(store) if friend && heard.is_some() => match store.heard_name(&id, name) {
+                Ok(renamed) => renamed,
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't save a friend's name: {e}");
+                    false
+                }
+            },
+            _ => false,
+        };
         let before = self.presence_of(&id);
         let devices = self.presence.entry(id.to_bytes()).or_default();
         match heard {
             Some(p) if friend => drop(devices.insert(device, p)),
             _ => drop(devices.remove(&device)),
         }
-        if self.presence_of(&id) != before {
+        // One `meshSocial` for both: a rename also goes to our other devices.
+        if renamed {
+            self.changed(None);
+        } else if self.presence_of(&id) != before {
             self.emit_social(None);
         }
         // They hear from us too, whoever connected first.
@@ -1561,14 +1583,17 @@ async fn serve_streams(
                 let (id, device) = (stream.peer.id, *stream.peer.device.as_bytes());
                 loop {
                     let read = mesh_transport::frame::read_frame(&mut stream.recv);
-                    let heard = match tokio::time::timeout(PRESENCE_SILENCE, read).await {
-                        Ok(Ok(Some(frame))) => match frame[..] {
-                            [byte] => Presence::from_byte(byte),
-                            _ => None,
+                    let (heard, name) = match tokio::time::timeout(PRESENCE_SILENCE, read).await {
+                        Ok(Ok(Some(frame))) => match &frame[..] {
+                            [byte, name @ ..] => (
+                                Presence::from_byte(*byte),
+                                String::from_utf8_lossy(name).into_owned(),
+                            ),
+                            [] => (None, String::new()),
                         },
-                        _ => None,
+                        _ => (None, String::new()),
                     };
-                    let _ = back.send(Back::Presence(Box::new((id, device, heard))));
+                    let _ = back.send(Back::Presence(Box::new((id, device, heard, name))));
                     if heard.is_none() {
                         break;
                     }

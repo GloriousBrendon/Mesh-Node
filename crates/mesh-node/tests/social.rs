@@ -253,6 +253,9 @@ fn friends_see_presence() {
     bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
     sees(&mut alice, &id_b, "online");
     sees(&mut bob, &id_a, "online");
+    // Added by ID, no request: each learns the other's name from presence.
+    alice.social_until(|s| s["friends"][0]["name"] == "bob");
+    bob.social_until(|s| s["friends"][0]["name"] == "alice");
 
     // Bob's status shows on Alice's side.
     bob.expect("statusSet", &["dnd"], "meshSocial");

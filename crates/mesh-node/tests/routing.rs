@@ -105,8 +105,8 @@ fn contacts_reach_each_other_by_id() {
     let pong = b.ping_id(&id_a);
     assert_eq!(pong["id"], id_a);
     // Reached: Alice is Bob's friend now, seen just now.
-    let social = b.expect("socialList", &[], "meshSocial");
-    assert!(social["friends"][0]["seen"].is_u64(), "{social}");
+    // Waits it out: Alice's presence (and her name) may answer first.
+    b.social_until(|s| s["friends"][0]["seen"].is_u64());
     // And the other way, by ID too.
     b.published();
     assert_eq!(a.ping_id(&id_b)["id"], id_b);

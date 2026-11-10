@@ -842,6 +842,20 @@ impl Keystore {
         self.set_kind(id, Kind::Friend, |_| {}).map(|()| true)
     }
 
+    /// A friend's own name, as their presence carries it: the request only
+    /// carried the sender's, so this is how the sender learns theirs. True if
+    /// it changed.
+    pub fn heard_name(&mut self, id: &MeshId, name: &str) -> Result<bool, KeystoreError> {
+        let name = name.trim();
+        let current = self.account.get(id).filter(|e| e.kind == Kind::Friend);
+        if !crate::password::valid_username(name) || current.is_none_or(|e| e.name == name) {
+            return Ok(false);
+        }
+        let name = name.to_owned();
+        self.set_kind(id, Kind::Friend, |e| e.name = name)
+            .map(|()| true)
+    }
+
     /// Takes in another device's account state (SPEC-social D11). True if
     /// anything changed here.
     pub fn merge_account(&mut self, other: &Account) -> Result<bool, KeystoreError> {
