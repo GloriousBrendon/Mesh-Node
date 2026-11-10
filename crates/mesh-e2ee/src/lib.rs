@@ -5,12 +5,14 @@
 
 mod bundle;
 mod envelope;
+mod group;
 mod session;
 
 pub use bundle::{Bundle, MAX_BUNDLE_LEN};
 pub use envelope::{
     Envelope, EnvelopeType, Inside, Kind, MAX_BODY, MAX_INSIDE, open_sealed, seal_for,
 };
+pub use group::{Deliveries, MAX_MEMBERS, ROTATE_AFTER, ROTATE_MESSAGES, WAIT_FOR_KEY};
 pub use session::{
     Conversation, E2ee, FALLBACK_LIFE, MAX_FIELD_LEN, MAX_ONE_TIME_KEYS, Opened, Received,
 };

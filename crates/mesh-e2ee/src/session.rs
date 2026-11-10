@@ -29,6 +29,7 @@ use vodozemac::olm::{
 use crate::E2eeError;
 use crate::bundle::{Bundle, MAX_BUNDLE_LEN};
 use crate::envelope::{Envelope, EnvelopeType, Inside, Kind};
+use crate::group::Groups;
 
 /// One-time keys kept reserved for contacts, at most (D4).
 pub const MAX_ONE_TIME_KEYS: usize = 200;
@@ -101,12 +102,14 @@ impl Person {
     }
 
     /// Current devices we can encrypt to: with a session or keys.
-    fn reachable(&self) -> Vec<Key> {
+    /// Current devices we can encrypt to (a session or keys), as bytes and
+    /// as keys: decompressing a key costs more than encrypting a message.
+    fn reachable(&self) -> Vec<(Key, VerifyingKey)> {
         self.devices
             .devices()
             .iter()
-            .map(|cert| cert.device().to_bytes())
-            .filter(|d| self.keys.contains_key(d) || self.sessions.contains_key(d))
+            .map(|cert| (cert.device().to_bytes(), *cert.device()))
+            .filter(|(d, _)| self.keys.contains_key(d) || self.sessions.contains_key(d))
             .collect()
     }
 }
@@ -125,6 +128,7 @@ pub struct E2ee {
     pub(crate) people: HashMap<MeshId, Person>,
     /// 1:1 conversation IDs, to place our own devices' copies.
     direct: HashMap<[u8; 16], MeshId>,
+    pub(crate) groups: Groups,
 }
 
 impl E2ee {
@@ -154,6 +158,7 @@ impl E2ee {
             reserved: HashMap::new(),
             people: HashMap::new(),
             direct: HashMap::new(),
+            groups: Groups::default(),
         };
         e2ee.renew_fallback(now);
         e2ee.learn_devices(&root.id(), devices);
@@ -301,22 +306,28 @@ impl E2ee {
             return Err(E2eeError::NoKeys);
         }
         let inside = self.inside(conversation, kind, body)?;
-        let mut targets: Vec<(MeshId, Key)> = theirs.into_iter().map(|d| (*peer, d)).collect();
+        let mut targets: Vec<_> = theirs.into_iter().map(|d| (*peer, d)).collect();
         targets.extend(self.own_devices().into_iter().map(|d| (self.me, d)));
         targets
             .into_iter()
-            .map(|(id, device)| Ok((key_of(&device)?, self.encrypt_to(&id, &device, &inside)?)))
+            .map(|(id, (device, key))| Ok((key, self.encrypt_to(&id, &device, &inside)?)))
             .collect()
     }
 
+    /// `id`'s current devices we can reach.
+    pub(crate) fn reachable_of(&self, id: &MeshId) -> Vec<(Key, VerifyingKey)> {
+        self.people
+            .get(id)
+            .map(Person::reachable)
+            .unwrap_or_default()
+    }
+
     /// Our other current devices we can reach.
-    pub(crate) fn own_devices(&self) -> Vec<Key> {
-        let me = self.device.public().to_bytes();
-        let own = self.people.get(&self.me).map(Person::reachable);
-        own.unwrap_or_default()
-            .into_iter()
-            .filter(|d| *d != me)
-            .collect()
+    pub(crate) fn own_devices(&self) -> Vec<(Key, VerifyingKey)> {
+        let me = self.device_bytes();
+        let mut own = self.reachable_of(&self.me);
+        own.retain(|(d, _)| *d != me);
+        own
     }
 
     pub(crate) fn inside(
@@ -497,14 +508,22 @@ impl E2ee {
     /// Opens an envelope that came straight over a connection, or out of a
     /// seal, and checks where it belongs (D11). What it holds, and anything
     /// it means sending back, is in the answer.
-    pub fn decrypt(&mut self, envelope: &[u8], now: u64) -> Result<Received, E2eeError> {
-        let _ = now;
-        let envelope = Envelope::from_bytes(envelope)?;
+    pub fn decrypt(&mut self, bytes: &[u8], now: u64) -> Result<Received, E2eeError> {
+        let envelope = Envelope::from_bytes(bytes)?;
+        let mut out = Received::default();
+        if envelope.kind == EnvelopeType::Group {
+            self.open_group(bytes, &envelope, now, &mut out)?;
+            return Ok(out);
+        }
         let (sender, device, inside) = self.open_olm(&envelope)?;
-        Ok(Received {
-            opened: vec![self.place_direct(sender, device, inside)?],
-            replies: Vec::new(),
-        })
+        match inside.kind {
+            Kind::KeyShare => self.take_share(sender, &inside, now, &mut out)?,
+            Kind::KeyRequest => {
+                self.answer_request(sender, device.to_bytes(), &inside, &mut out)?
+            }
+            _ => out.opened.push(self.place_direct(sender, device, inside)?),
+        }
+        Ok(out)
     }
 
     /// Checks a 1:1 message's conversation and places it.
