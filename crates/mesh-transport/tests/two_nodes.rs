@@ -365,3 +365,21 @@ async fn only_allowed_identities_get_in() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(b.status().connections, 0);
 }
+
+#[tokio::test]
+async fn disconnect_closes_connections_made_both_ways_at_once() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let (a, b) = (alice.node("laptop").await, bob.node("desktop").await);
+    // Each dials the other at the same moment: one connection each way.
+    let (to_b, to_a) = (addr_of(&b), addr_of(&a));
+    let (x, y) = tokio::join!(a.dial(&to_b), b.dial(&to_a));
+    x.unwrap();
+    y.unwrap();
+    b.disconnect(&alice.id());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        a.connected(&bob.id()).is_empty(),
+        "a connection was left open"
+    );
+    assert_eq!(b.status().connections, 0);
+}

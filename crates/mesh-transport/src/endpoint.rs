@@ -46,7 +46,9 @@ struct Shared {
     /// Our certificate, as sent in every hello.
     cert: Vec<u8>,
     /// Authenticated connections, by device.
-    conns: Mutex<HashMap<iroh::PublicKey, (Peer, Connection)>>,
+    /// Every live connection, by device and connection: two devices that
+    /// dial each other at once have two, and `disconnect` must close both.
+    conns: Mutex<HashMap<(iroh::PublicKey, usize), (Peer, Connection)>>,
     /// Incoming connections still in their handshake.
     pending: AtomicUsize,
     limits: Limits,
@@ -140,11 +142,12 @@ impl Node {
             .values()
             .filter(|(_, c)| c.close_reason().is_none())
             .collect();
+        let devices: std::collections::HashSet<_> = open.iter().map(|(p, _)| p.device).collect();
         Status {
             online: relay.is_some(),
             relay,
             direct: open.iter().any(|(_, c)| path(c) == Path::Direct),
-            connections: open.len(),
+            connections: devices.len(),
         }
     }
 
@@ -220,11 +223,17 @@ impl Node {
 
     /// `id`'s devices we have an open connection with.
     pub fn connected(&self, id: &MeshId) -> Vec<MeshAddr> {
-        lock(&self.shared.conns)
+        let mut devices: Vec<_> = lock(&self.shared.conns)
             .values()
             .filter(|(peer, conn)| peer.id == *id && conn.close_reason().is_none())
-            .map(|(peer, _)| MeshAddr {
-                device: peer.device,
+            .map(|(peer, _)| peer.device)
+            .collect();
+        devices.sort_by_key(|d| *d.as_bytes());
+        devices.dedup();
+        devices
+            .into_iter()
+            .map(|device| MeshAddr {
+                device,
                 relay: None,
                 direct: Vec::new(),
             })
@@ -277,7 +286,7 @@ impl Node {
                 return Err(TransportError::Timeout);
             }
         };
-        self.shared.add(peer.clone(), conn.clone());
+        self.shared.add(peer.clone(), conn.clone())?;
         Ok((peer, conn))
     }
 }
@@ -285,22 +294,30 @@ impl Node {
 impl Shared {
     fn open(&self, device: &iroh::PublicKey) -> Option<(Peer, Connection)> {
         let mut conns = lock(&self.conns);
-        match conns.get(device) {
-            Some((peer, conn)) if conn.close_reason().is_none() => {
-                Some((peer.clone(), conn.clone()))
-            }
-            Some(_) => {
-                conns.remove(device);
-                None
-            }
-            None => None,
-        }
+        conns.retain(|_, (_, conn)| conn.close_reason().is_none());
+        conns
+            .iter()
+            .find(|((d, _), _)| d == device)
+            .map(|(_, (peer, conn))| (peer.clone(), conn.clone()))
     }
 
     /// Keeps an authenticated connection and starts answering its streams.
-    fn add(self: &Arc<Self>, peer: Peer, conn: Connection) {
-        lock(&self.conns).insert(peer.device, (peer.clone(), conn.clone()));
+    /// The peer is checked against `allow` again under the lock that
+    /// `disconnect` takes: a handshake that was under way when its peer was
+    /// removed must not leave a connection behind.
+    fn add(self: &Arc<Self>, peer: Peer, conn: Connection) -> Result<(), HandshakeError> {
+        let mut conns = lock(&self.conns);
+        if !self.allow.allows(&peer.id) {
+            HandshakeError::NotAllowed.close(&conn);
+            return Err(HandshakeError::NotAllowed);
+        }
+        conns.insert(
+            (peer.device, conn.stable_id()),
+            (peer.clone(), conn.clone()),
+        );
+        drop(conns);
         tokio::spawn(serve(self.clone(), peer, conn));
+        Ok(())
     }
 
     fn full(&self) -> bool {
@@ -344,8 +361,9 @@ async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
             };
             let accepted = accepted.await;
             shared.pending.fetch_sub(1, Ordering::Relaxed);
-            if let Some((peer, conn)) = accepted {
-                shared.add(peer.clone(), conn);
+            if let Some((peer, conn)) = accepted
+                && shared.add(peer.clone(), conn).is_ok()
+            {
                 let _ = shared.accepted.try_send(peer);
             }
         });
@@ -388,13 +406,7 @@ async fn serve(shared: Arc<Shared>, peer: Peer, conn: Connection) {
             }
         });
     }
-    let mut conns = lock(&shared.conns);
-    if conns
-        .get(&device)
-        .is_some_and(|(_, c)| c.stable_id() == conn.stable_id())
-    {
-        conns.remove(&device);
-    }
+    lock(&shared.conns).remove(&(device, conn.stable_id()));
 }
 
 /// Whether the connection's current path is direct or through a relay.
