@@ -27,7 +27,7 @@ pub use code::{
 };
 pub use contacts::{Contact, LastAddr, MAX_CONTACT_NAME, MAX_CONTACTS};
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
-pub use id::{DeviceKey, IdError, Link, MeshId, RootKey};
+pub use id::{DeviceKey, IdError, Link, MeshId, RootKey, verify_device};
 pub use keystore::{KdfParams, Keystore, KeystoreError};
 pub use knock::{
     Knock, KnockError, KnockFrom, MAX_KNOCK_LEN, MAX_KNOCK_NAME, MAX_NOTE, knock_outer, open_knock,

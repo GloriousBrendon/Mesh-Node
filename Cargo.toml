@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mesh-identity", "crates/mesh-node", "crates/mesh-transport"]
+members = ["crates/mesh-e2ee", "crates/mesh-identity", "crates/mesh-node", "crates/mesh-transport"]
 
 [workspace.package]
 version = "0.1.0"
@@ -46,7 +46,11 @@ proptest = "1"
 iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring", "portmapper"] }
 # The async runtime iroh runs on (SPEC-transport D8).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
+# Olm sessions and Megolm sender chains for end-to-end encryption (SPEC-e2ee D1).
+# Pinned; no libolm compatibility, no precomputed tables.
+vodozemac = { version = "=0.11.2", default-features = false }
 
+mesh-e2ee = { path = "crates/mesh-e2ee" }
 mesh-identity = { path = "crates/mesh-identity" }
 mesh-transport = { path = "crates/mesh-transport" }
 

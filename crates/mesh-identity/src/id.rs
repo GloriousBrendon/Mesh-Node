@@ -98,10 +98,17 @@ impl DeviceKey {
     pub fn sign(&self, domain: &str, body: &[u8]) -> Signature {
         self.0.sign(&signed_bytes(domain, body))
     }
+
+    /// X25519 between this device key and `their` device key (the e2ee seal,
+    /// SPEC-e2ee D8). `None` for a weak key, whose result would be predictable.
+    pub fn diffie_hellman(&self, their: &VerifyingKey) -> Option<Zeroizing<[u8; 32]>> {
+        let shared = Zeroizing::new((their.to_montgomery() * self.0.to_scalar()).to_bytes());
+        (*shared != [0; 32]).then_some(shared)
+    }
 }
 
 /// Whether `signature` is `device` signing `body` under `domain` (strict).
-pub(crate) fn verify_device(
+pub fn verify_device(
     device: &VerifyingKey,
     domain: &str,
     body: &[u8],

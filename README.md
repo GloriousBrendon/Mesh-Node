@@ -21,4 +21,6 @@ cargo fmt --all --check
 
 - `crates/mesh-identity`: keys and IDs, devices, the password keystore, friend
   codes, safety numbers, device linking.
+- `crates/mesh-e2ee`: end-to-end encryption: e2ee bundles, 1:1 sessions and
+  sender chains (vodozemac), the sealed envelope, its store.
 - `crates/mesh-node`: the binary.
