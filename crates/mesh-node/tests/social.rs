@@ -180,3 +180,50 @@ fn requests_go_through_a_live_code() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[test]
+fn own_devices_keep_the_same_lists() {
+    let dirs = ["seed", "alice", "desk", "laptop"].map(|n| temp_dir(&format!("sync-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut desk, id_b) = helper(&dirs[2], &relay, &ticket, "bob");
+    alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
+    desk.expect("friendAdd", &[&id_a, ""], "meshSocial");
+    desk.until("friends", &id_a);
+
+    // The laptop starts from a backup; then the desk blocks someone.
+    let backup = dirs[2].join("bob.mkb");
+    let backup = backup.to_str().unwrap();
+    desk.expect("idExport", &[backup, "bob", PASSWORD], "meshDone");
+    let mut laptop =
+        Helper::start_with(&dirs[3], &relay, &["--seed", &ticket, "--record-ttl", TTL]);
+    assert_eq!(laptop.event().0, "meshIdentity");
+    laptop.expect(
+        "idImport",
+        &[backup, "bob", PASSWORD, PASSWORD],
+        "meshIdentity",
+    );
+    assert_eq!(laptop.event().0, "meshCodes");
+    let stranger = mesh_identity::RootKey::generate().unwrap().id().to_string();
+    desk.expect("block", &[&stranger], "meshSocial");
+
+    // The laptop finds the desk through the seed and takes the block in.
+    laptop.until("blocked", &stranger);
+    assert!(has(&laptop.list(), "friends", &id_a));
+
+    // A change on the laptop reaches the desk.
+    laptop.expect("friendRename", &[&id_a, "Ali"], "meshSocial");
+    desk.social_until(|s| s["friends"][0]["nick"] == "Ali");
+    laptop.expect("unblock", &[&stranger], "meshSocial");
+    desk.social_until(|s| !has(s, "blocked", &stranger));
+
+    let stderr = [alice, desk, laptop].map(Helper::quit).concat();
+    assert!(!stderr.contains(PASSWORD));
+    seed.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

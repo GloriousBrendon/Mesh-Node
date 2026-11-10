@@ -31,10 +31,10 @@ use crate::codes::{Get, Hold};
 use crate::routing::{self, ReachError, Reached, Target};
 use crate::{knocks, seed};
 use mesh_identity::{
-    CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey, DeviceList, FriendCode,
-    HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr, Link, MAX_DEVICE_NAME,
-    MAX_NOTE, MeshId, RootKey, SafetyNumber, check_password, is_kept, keyring_status, open_knock,
-    seal_knock,
+    Account, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey, DeviceList,
+    FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr, Link,
+    MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, check_password, is_kept,
+    keyring_status, open_knock, seal_knock,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -183,6 +183,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             _ = refresh.tick() => {
                 helper.publish();
                 helper.dial_contacts();
+                helper.sync_own();
                 continue;
             }
             _ = collect.tick() => {
@@ -243,6 +244,8 @@ struct Net {
     watch: tokio::task::JoinHandle<()>,
     /// Reports who connected to us.
     peers: tokio::task::JoinHandle<()>,
+    /// Answers the streams they open.
+    streams: tokio::task::JoinHandle<()>,
     /// Every contact's record is on a seed (`meshNet`'s `published`).
     published: Arc<AtomicBool>,
 }
@@ -266,6 +269,8 @@ enum Back {
     Requested(MeshId),
     /// What the seeds hold for our codes.
     Collected(Vec<Collected>),
+    /// Another of our devices sent its account state.
+    Synced(Box<(Account, MeshAddr)>),
 }
 
 /// One code's requests, from every seed that answered.
@@ -451,7 +456,7 @@ impl Helper {
                 self.unlocked()?.add_contact(id, arg(1).unwrap_or(""))?;
                 self.contacts_changed();
                 self.dial(&id);
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "friendAccept" => {
                 let id = parse_id(arg(0)?)?;
@@ -460,39 +465,39 @@ impl Helper {
                 // Their device lets us in (they asked), so this connection
                 // makes us friends on their side too (D8, D9).
                 self.dial(&id);
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "friendDecline" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.decline(&id)?;
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "friendCancel" | "friendRemove" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.remove_contact(&id)?;
                 self.cut_off(&id);
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "friendRename" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.rename_contact(&id, arg(1)?)?;
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "friendVerify" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.verify(&id, arg(1)? == "true")?;
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "block" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.block(&id)?;
                 self.cut_off(&id);
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "unblock" => {
                 let id = parse_id(arg(0)?)?;
                 self.unlocked()?.unblock(&id)?;
-                self.emit_social(Some(func));
+                self.changed(Some(func));
             }
             "socialList" => {
                 self.unlocked()?;
@@ -818,6 +823,7 @@ impl Helper {
             Back::Held(answers) => answers,
             Back::Relay => {
                 self.publish();
+                self.sync_own();
                 return self.dial_contacts();
             }
             Back::Republish => return self.publish(),
@@ -846,14 +852,25 @@ impl Helper {
                 {
                     eprintln!("mesh-node: couldn't save a contact's address: {e}");
                 }
-                self.connected(&id);
+                if self.connected(&id) {
+                    return self.changed(None);
+                }
                 return self.emit_social(None);
             }
             Back::Connected(id) => {
+                if self.store.as_ref().is_some_and(|s| s.id() == id) {
+                    // Another of our devices: it sends its state; we answer
+                    // with ours if it's missing something (`Back::Synced`).
+                    return;
+                }
                 if self.connected(&id) {
-                    self.emit_social(None);
+                    self.changed(None);
                 }
                 return;
+            }
+            Back::Synced(synced) => {
+                let (theirs, from) = *synced;
+                return self.synced(&theirs, &from);
             }
             Back::Resolved(resolved) => {
                 let (id, lookup_id, note) = *resolved;
@@ -876,7 +893,7 @@ impl Helper {
                 }
                 self.contacts_changed();
                 self.dial(&id);
-                return self.emit_social(Some("friendRequest"));
+                return self.changed(Some("friendRequest"));
             }
             Back::Collected(found) => return self.collected(found),
         };
@@ -931,11 +948,73 @@ impl Helper {
             // A request from someone we'd asked made them a friend.
             self.contacts_changed();
             self.dial_contacts();
-            self.emit_social(None);
+            self.changed(None);
         }
         if dropped {
             self.emit_codes(None);
         }
+    }
+
+    /// The account state changed here: tell Mesh-Voice, and our other
+    /// devices that are connected (D11).
+    fn changed(&self, answers: Option<&str>) {
+        self.emit_social(answers);
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        for addr in net.node.connected(&store.id()) {
+            push_account(net.node.clone(), addr, store.account().to_bytes());
+        }
+    }
+
+    /// Another of our devices sent its account state: take in what's newer,
+    /// and send ours back if it's missing something.
+    fn synced(&mut self, theirs: &Account, from: &MeshAddr) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        let merged = match store.merge_account(theirs) {
+            Ok(merged) => merged,
+            Err(e) => return eprintln!("mesh-node: couldn't save a synced change: {e}"),
+        };
+        let ours = store.account().clone();
+        if merged {
+            self.contacts_changed();
+            // Whoever is no longer a contact (removed, blocked elsewhere) goes.
+            if let Some(net) = &self.net {
+                for e in ours.entries() {
+                    if !matches!(e.kind, Kind::Outgoing | Kind::Friend) {
+                        net.node.disconnect(&e.id());
+                    }
+                }
+            }
+            self.dial_contacts();
+            self.changed(None);
+        }
+        if ours != *theirs
+            && let Some(net) = &self.net
+        {
+            push_account(net.node.clone(), from.clone(), ours.to_bytes());
+        }
+    }
+
+    /// Finds our other devices through the seeds and sends each our account
+    /// state; they answer with theirs if it's newer (D11).
+    fn sync_own(&self) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        let Some(own) = Target::own(store) else {
+            return;
+        };
+        let this = *store.device_key().public().as_bytes();
+        let account = store.account().to_bytes();
+        let (node, anon, seeds) = (net.node.clone(), net.anon.clone(), self.seeds.clone());
+        tokio::spawn(async move {
+            for addr in routing::own_devices(&anon, &seeds, &own, &this, unix_now()).await {
+                push_account(node.clone(), addr, account.clone());
+            }
+        });
     }
 
     /// Someone we know connected: an `outgoing` contact becomes a friend (D8).
@@ -976,6 +1055,7 @@ impl Helper {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains(&id.to_bytes())
             }),
+            services: vec![SYNC.to_owned()],
             ..Config::default()
         };
         self.allow_contacts();
@@ -996,11 +1076,14 @@ impl Helper {
                     self.back.clone(),
                 ));
                 let peers = tokio::spawn(watch_peers(node.clone(), self.back.clone()));
+                let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
+                let streams = tokio::spawn(serve_streams(node.clone(), own, self.back.clone()));
                 self.net = Some(Net {
                     node,
                     anon: Arc::new(anon),
                     watch,
                     peers,
+                    streams,
                     published,
                 });
                 self.hold_codes(false);
@@ -1015,6 +1098,7 @@ impl Helper {
         if let Some(net) = self.net.take() {
             net.watch.abort();
             net.peers.abort();
+            net.streams.abort();
             net.anon.close().await;
             net.node.close().await;
             self.held.clear();
@@ -1276,6 +1360,60 @@ fn emit_fail(func: &str, kind: &str, message: &str) {
         "meshError",
         json!({ "fn": func, "kind": kind, "message": message }),
     );
+}
+
+/// The account-state service between our own devices (D11).
+const SYNC: &str = "sync";
+/// How long a device has to send its state.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Sends our account state to another of our devices, in the background.
+fn push_account(node: Arc<Node>, addr: MeshAddr, account: Vec<u8>) {
+    tokio::spawn(async move {
+        let sent = async {
+            let (_, mut send, _recv) = node.open(&addr, SYNC).await.ok()?;
+            mesh_transport::frame::write_frame(&mut send, &account)
+                .await
+                .ok()?;
+            send.finish().ok()?;
+            send.stopped().await.ok()
+        };
+        // ponytail: a state over a frame (1 MiB, ~10,000 entries) can't sync; split it if lists get that long.
+        if tokio::time::timeout(SYNC_TIMEOUT, sent).await.is_err() {
+            eprintln!("mesh-node: another of our devices didn't take our lists");
+        }
+    });
+}
+
+/// Answers the streams other devices open to us: only our own devices may
+/// sync, and only one frame each.
+async fn serve_streams(
+    node: Arc<Node>,
+    own: MeshId,
+    back: tokio::sync::mpsc::UnboundedSender<Back>,
+) {
+    while let Some(mut stream) = node.next_stream().await {
+        if stream.service != SYNC || stream.peer.id != own {
+            let _ = stream.send.reset(0u32.into());
+            continue;
+        }
+        let back = back.clone();
+        tokio::spawn(async move {
+            let read = mesh_transport::frame::read_frame(&mut stream.recv);
+            let Ok(Ok(Some(bytes))) = tokio::time::timeout(SYNC_TIMEOUT, read).await else {
+                return;
+            };
+            let Some(theirs) = Account::from_bytes(&bytes) else {
+                return eprintln!("mesh-node: another of our devices sent unreadable lists");
+            };
+            let from = MeshAddr {
+                device: stream.peer.device,
+                relay: None,
+                direct: Vec::new(),
+            };
+            let _ = back.send(Back::Synced(Box::new((theirs, from))));
+        });
+    }
 }
 
 /// Reports every device that connects to us and passes the handshake.

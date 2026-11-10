@@ -18,13 +18,14 @@ pub const RECORD_TTL: u64 = 2 * 3600;
 /// How often records are refreshed, at most (D4).
 pub const REFRESH_EVERY: u64 = 30 * 60;
 
-/// This device's record for each contact, on `relay`.
+/// This device's record for each contact, and one under the self pair for
+/// our other devices (SPEC-social D11), on `relay`.
 pub fn records(store: &Keystore, relay: &RelayUrl, now: u64, ttl: u64) -> Vec<Vec<u8>> {
-    store
-        .contacts()
-        .iter()
-        .filter_map(|c| {
-            let keys = store.pair_keys(&c.id())?;
+    let ids = store.contacts().iter().map(|c| c.id());
+    std::iter::once(store.id())
+        .chain(ids)
+        .filter_map(|id| {
+            let keys = store.pair_keys(&id)?;
             let sealed = seal_addr(
                 &keys,
                 store.device_key(),
@@ -69,6 +70,16 @@ impl Target {
             keys: store.pair_keys(id)?,
             last: contact.last.clone(),
             known: contact.devices(),
+        })
+    }
+
+    /// Our own identity, to find our other devices.
+    pub fn own(store: &Keystore) -> Option<Self> {
+        Some(Self {
+            id: store.id(),
+            keys: store.pair_keys(&store.id())?,
+            last: None,
+            known: Some(store.devices().clone()),
         })
     }
 }
@@ -155,6 +166,25 @@ pub async fn reach(
         }
     }
     Err(ReachError::Unreachable)
+}
+
+/// Our other devices the seeds have records for (under the self pair), not
+/// counting this one.
+pub async fn own_devices(
+    anon: &Node,
+    seeds: &[MeshAddr],
+    own: &Target,
+    this: &[u8; 32],
+    now: u64,
+) -> Vec<MeshAddr> {
+    let Ok((records, _)) = find(anon, seeds, own, now).await else {
+        return Vec::new();
+    };
+    records
+        .into_iter()
+        .filter(|r| r.device.as_bytes() != this)
+        .filter_map(|r| MeshAddr::from_parts(r.device.as_bytes(), &r.relay))
+        .collect()
 }
 
 /// The contact's records on the seeds for today and yesterday (midnight, and
