@@ -1,0 +1,28 @@
+# Tests, lint, format and the RustSec advisories on every push (audit
+# finding 15). Linux only: Windows minutes cost double on a private repo,
+# and the Windows checkpoints are run by hand.
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
