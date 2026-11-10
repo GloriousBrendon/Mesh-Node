@@ -3,6 +3,7 @@
 //! safety numbers and device linking. See `design/mesh/SPEC-identity.md` in
 //! Mesh-Voice. No networking here.
 
+mod account;
 mod addr;
 mod code;
 mod contacts;
@@ -16,6 +17,7 @@ mod password;
 mod remember;
 mod safety;
 
+pub use account::{Account, Entry, Kind, Status, TOMBSTONE_LIFE};
 pub use addr::{
     AddrError, AddrRecord, MAX_RECORD_LEN, MAX_RELAY_LEN, addr_outer, open_addr, seal_addr,
 };
