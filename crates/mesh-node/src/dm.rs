@@ -281,6 +281,12 @@ impl Helper {
                 .collect();
             match history.receive(&at, from, events, unix_now() * 1000) {
                 Ok(taken) => {
+                    // Not known as a member yet: the sender keeps it (D7).
+                    for (t, i) in taken.iter().zip(&frames) {
+                        if *t == Taken::Refused(mesh_dm::chat::Refusal::NotYetMember) {
+                            answers[*i] = FAILED;
+                        }
+                    }
                     let refused = taken
                         .iter()
                         .filter(|t| matches!(t, Taken::Refused(_)))
@@ -669,10 +675,19 @@ impl Helper {
         }
         let mut chats = Vec::new();
         for (at, author, frames, events) in runs {
-            if let Err(e) = history.receive_synced(&at, author, *via, events, now) {
-                eprintln!("mesh-node: couldn't store synced history: {e}");
-                for i in frames {
-                    answers[i] = FAILED;
+            match history.receive_synced(&at, author, *via, events, now) {
+                Ok(taken) => {
+                    for (t, i) in taken.iter().zip(&frames) {
+                        if *t == Taken::Refused(mesh_dm::chat::Refusal::NotYetMember) {
+                            answers[*i] = FAILED;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't store synced history: {e}");
+                    for i in frames {
+                        answers[i] = FAILED;
+                    }
                 }
             }
             if !chats.contains(&at) {

@@ -650,9 +650,13 @@ impl History {
             return (crate::group_id(&from.person, nonce) != *id).then_some(Refusal::NotInChat);
         }
         match self.chats[chat].chat.group(id) {
-            Some(version) => {
-                (!version.members.contains(&from.person)).then_some(Refusal::NotInChat)
+            Some(version) if version.members.contains(&from.person) => None,
+            // Was a member once, and left or was removed: for good. Never
+            // one: their add may not have reached us yet.
+            Some(version) if version.audience.values().any(|a| a.contains(&from.person)) => {
+                Some(Refusal::NotInChat)
             }
+            Some(_) => Some(Refusal::NotYetMember),
             None => {
                 let count = self
                     .before_creation
@@ -1431,7 +1435,11 @@ mod tests {
             .history
             .receive(&group, carol.me, vec![out], NOW)
             .unwrap();
-        assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
+        assert_eq!(
+            taken,
+            [Taken::Refused(Refusal::NotYetMember)],
+            "never a member: maybe not yet"
+        );
         // A creation, properly signed by Carol, that doesn't hash to the
         // group's ID from her: she can't make herself its creator.
         let Where::Group(id) = group else {
@@ -1746,6 +1754,44 @@ mod tests {
         let (theirs, ours) = (n.version(&group).unwrap(), a.version(&group).unwrap());
         assert_eq!(theirs, ours);
         assert_eq!((theirs.name.as_str(), theirs.members.len()), ("trip", 3));
+    }
+
+    /// D's message arrives before the add of D: refused for now, so the
+    /// sender keeps it (answered `failed`), and it shows when it comes again
+    /// after the add. Someone who was a member and left is refused for good.
+    #[test]
+    fn a_message_before_its_senders_add_waits_on_the_sender() {
+        let (mut c, mut a, mut d) = (
+            Member::new("na-c"),
+            Member::new("na-a"),
+            Member::new("na-d"),
+        );
+        let group = make_group(&mut c, &[&a]);
+        c.pass_to(&mut a);
+        c.pass_to(&mut d);
+        c.change(&group, crate::event::Change::Add(d.me.person));
+        c.pass_to(&mut d);
+        let early = d.history.send(&group, text("hi from D"), NOW).unwrap();
+        let taken = a
+            .history
+            .receive(&group, d.me, vec![early.clone()], NOW)
+            .unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::NotYetMember)]);
+        assert!(
+            a.history.page(&group, None, 50, NOW).unwrap().0.is_empty(),
+            "not stored"
+        );
+        c.pass_to(&mut a);
+        assert_eq!(
+            a.history.receive(&group, d.me, vec![early], NOW).unwrap(),
+            [Taken::Shown]
+        );
+        // Someone who was a member and left is refused for good.
+        d.change(&group, crate::event::Change::Leave);
+        d.pass_to(&mut a);
+        let late = d.history.send(&group, text("I left"), NOW).unwrap();
+        let taken = a.history.receive(&group, d.me, vec![late], NOW).unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
     }
 
     /// A member passes on a change claiming the creator made it: refused.

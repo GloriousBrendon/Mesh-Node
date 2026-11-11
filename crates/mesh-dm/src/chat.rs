@@ -70,6 +70,9 @@ pub enum Refusal {
     NotInChat,
     /// A group change whose author's signature doesn't check out (D7).
     BadSignature,
+    /// From someone this device doesn't know as a member yet (their add
+    /// hasn't arrived): answered `failed`, so the sender keeps it.
+    NotYetMember,
 }
 
 struct Held {

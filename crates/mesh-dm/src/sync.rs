@@ -46,6 +46,10 @@ pub struct Log {
     /// Each event's number, by ID: what refuses a late copy.
     #[serde(skip)]
     ids: HashMap<EventId, u64>,
+    /// The numbers of group changes, which a device may come to need after
+    /// its counter has passed them (someone added to a group, D7).
+    #[serde(skip)]
+    changes: Vec<u64>,
 }
 
 impl Log {
@@ -55,6 +59,9 @@ impl Log {
             return None;
         }
         self.ids.insert(entry.id, self.len() + 1);
+        if entry.change {
+            self.changes.push(self.len() + 1);
+        }
         self.entries.push(entry);
         Some(self.len())
     }
@@ -82,6 +89,10 @@ impl Log {
         self.ids = (self.entries.iter().enumerate())
             .map(|(i, e)| (e.id, i as u64 + 1))
             .collect();
+        self.changes = (self.entries.iter().enumerate())
+            .filter(|(_, e)| e.change)
+            .map(|(i, _)| i as u64 + 1)
+            .collect();
         self
     }
 }
@@ -97,6 +108,10 @@ struct Counter {
     // ponytail: kept for good; only a friend's device away 30 days or 2,000 events behind adds to it.
     #[serde(default)]
     given_up: BTreeSet<u64>,
+    /// Group changes this device took. A change can come to be meant for a
+    /// device after its counter passed it (its person added to a group), so
+    /// these are tracked one by one; they're few.
+    changes_taken: BTreeSet<u64>,
 }
 
 /// What to send a device now, and what's given up for it.
@@ -141,6 +156,7 @@ impl Counters {
             upto,
             above: BTreeSet::new(),
             given_up: BTreeSet::new(),
+            changes_taken: BTreeSet::new(),
         };
         self.devices.insert(device, counter);
     }
@@ -188,6 +204,16 @@ impl Counters {
         let mut waiting: Vec<u64> = (counter.upto + 1..=log.len())
             .filter(|n| !counter.above.contains(n) && meant(*n))
             .collect();
+        // Group changes behind the counter that are meant for it now.
+        let behind = log
+            .changes
+            .iter()
+            .copied()
+            .take_while(|n| *n <= counter.upto);
+        let behind: Vec<u64> = behind
+            .filter(|n| !counter.changes_taken.contains(n) && meant(*n))
+            .collect();
+        waiting.splice(0..0, behind);
         let mut given_up = Vec::new();
         if counter.person != me {
             let (old, kept): (Vec<u64>, Vec<u64>) = waiting.into_iter().partition(|&n| {
@@ -225,6 +251,9 @@ impl Counters {
         let Some(counter) = self.devices.get_mut(device) else {
             return;
         };
+        if ok && log.get(number).is_some_and(|e| e.change) {
+            counter.changes_taken.insert(number);
+        }
         if ok && number > counter.upto {
             counter.above.insert(number);
         }
