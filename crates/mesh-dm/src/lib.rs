@@ -41,6 +41,13 @@ pub fn group_id(creator: &Person, nonce: &[u8; 16]) -> [u8; 16] {
     key[..16].try_into().expect("16 bytes")
 }
 
+/// A new group's random value, and its ID with `creator` as the creator.
+pub fn new_group(creator: &Person) -> Option<([u8; 16], [u8; 16])> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).ok()?;
+    Some((nonce, group_id(creator, &nonce)))
+}
+
 /// A person: their Mesh ID's 32 bytes.
 pub type Person = [u8; 32];
 /// One of a person's devices: its device key's 32 bytes.

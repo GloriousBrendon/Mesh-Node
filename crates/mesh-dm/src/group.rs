@@ -23,6 +23,10 @@ pub struct Version {
     /// The change each member joined at: the creation, or their add. A new
     /// member gets the group's events from there on.
     pub joined: BTreeMap<Person, EventId>,
+    /// Who each change on the winning line goes to: everyone in the version
+    /// before it or after it, so a removal reaches the person removed and
+    /// an add the person added.
+    pub audience: BTreeMap<EventId, BTreeSet<Person>>,
 }
 
 struct Node {
@@ -80,6 +84,7 @@ impl Group {
             name: name.clone(),
             head: *root,
             joined: BTreeMap::new(),
+            audience: BTreeMap::new(),
         };
         start.members.extend(members.iter().take(MAX_MEMBERS - 1));
         start.joined = start.members.iter().map(|m| (*m, *root)).collect();
@@ -128,11 +133,15 @@ impl Group {
             best.insert(*id, (next.copied(), first));
         }
         let mut at = *root;
+        let mut audience = BTreeMap::from([(*root, versions[root].members.clone())]);
         while let Some(next) = best[&at].0 {
+            let both = &versions[&at].members | &versions[&next].members;
+            audience.insert(next, both);
             at = next;
         }
         let mut version = versions.remove(&at)?;
         version.head = at;
+        version.audience = audience;
         Some(version)
     }
 }
@@ -368,6 +377,21 @@ mod tests {
         assert_eq!(v.joined[&C], [1; 16]);
         assert_eq!(v.joined[&B], [1; 16]);
         assert_eq!(v.joined[&D], [2; 16]);
+    }
+
+    /// A change goes to everyone in the version before it or after it: a
+    /// removal reaches the person removed, an add the person added.
+    #[test]
+    fn a_change_reaches_who_it_concerns() {
+        let v = group(&[
+            create(),
+            (2, A, Some(1), Change::Add(D), 2),
+            (3, C, Some(2), Change::Remove(B), 3),
+        ])
+        .unwrap();
+        assert!(v.audience[&[2; 16]].contains(&D), "the added");
+        assert!(v.audience[&[3; 16]].contains(&B), "the removed");
+        assert!(!v.members.contains(&B));
     }
 
     #[test]

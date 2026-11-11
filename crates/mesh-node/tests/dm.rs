@@ -53,7 +53,12 @@ fn until(h: &mut Helper, binding: &str, done: impl Fn(&Value) -> bool) -> Value 
 /// by themselves meanwhile (a chat list, another page).
 fn ask(h: &mut Helper, func: &str, args: &[&str], binding: &str) -> Value {
     h.send(func, args);
+    let started = std::time::Instant::now();
     loop {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{func}: no {binding}"
+        );
         let (got, payload) = h.event();
         if got == binding || got == "meshError" {
             assert_eq!(got, binding, "{func} answered {payload}");
@@ -170,6 +175,126 @@ fn two_friends_chat() {
         assert!(!stderr.contains(secret), "a helper logged {secret:?}");
         assert!(!seed_log.contains(secret), "the seed logged {secret:?}");
     }
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Makes every pair of helpers friends.
+fn all_friends(people: &mut [(&mut Helper, &str)]) {
+    for i in 0..people.len() {
+        for j in 0..people.len() {
+            if i != j {
+                let other = people[j].1.to_owned();
+                people[i].0.expect("friendAdd", &[&other, ""], "meshSocial");
+            }
+        }
+    }
+    for i in 0..people.len() {
+        for j in 0..people.len() {
+            if i != j {
+                let other = people[j].1.to_owned();
+                people[i].0.social_until(|s| has(s, "friends", &other));
+            }
+        }
+    }
+}
+
+/// A group DM over the 1:1 sessions (e2ee D6): created, messaged both
+/// ways, renamed; only the creator removes; a removed member is out.
+#[test]
+fn a_group_of_three() {
+    let dirs = ["seed", "alice", "bob", "carol"].map(|n| temp_dir(&format!("group-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob");
+    let (mut carol, id_c) = helper(&dirs[3], &relay, &ticket, "carol");
+    all_friends(&mut [(&mut alice, &id_a), (&mut bob, &id_b), (&mut carol, &id_c)]);
+
+    let stranger = mesh_identity::RootKey::generate().unwrap().id().to_string();
+    let err = ask(
+        &mut alice,
+        "dmGroupCreate",
+        &[&format!("{id_b},{stranger}"), "hike"],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "not-a-friend", "{err}");
+    let made = ask(
+        &mut alice,
+        "dmGroupCreate",
+        &[&format!("{id_b},{id_c}"), "hike"],
+        "meshDmChats",
+    );
+    let group = made["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "group")
+        .unwrap();
+    assert_eq!(
+        (
+            group["name"].as_str(),
+            group["members"].as_array().unwrap().len()
+        ),
+        (Some("hike"), 3)
+    );
+    let g = group["id"].as_str().unwrap().to_owned();
+
+    ask(&mut alice, "dmSend", &[&g, "hi all"], "meshDmMessages");
+    for h in [&mut bob, &mut carol] {
+        let told = until(h, "meshDmNotify", |n| n["text"] == "hi all");
+        assert_eq!(
+            (told["id"].as_str(), told["from"].as_str()),
+            (Some(&*g), Some(&*id_a))
+        );
+    }
+    ask(
+        &mut carol,
+        "dmSend",
+        &[&g, "hello from Carol"],
+        "meshDmMessages",
+    );
+    until(&mut bob, "meshDmNotify", |n| {
+        n["text"] == "hello from Carol"
+    });
+    until(&mut alice, "meshDmMessages", |m| {
+        texts(m).contains(&"hello from Carol".to_owned())
+    });
+
+    // Bob renames it; only Alice, the creator, removes.
+    ask(&mut bob, "dmGroupRename", &[&g, "trip"], "meshDmChats");
+    until(&mut alice, "meshDmChats", |c| {
+        c["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "trip")
+    });
+    let err = ask(&mut bob, "dmGroupRemove", &[&g, &id_c], "meshError");
+    assert_eq!(err["kind"], "not-creator", "{err}");
+    ask(&mut alice, "dmGroupRemove", &[&g, &id_c], "meshDmChats");
+
+    // Carol learns she's out, and can't send to it any more.
+    let out = |c: &Value| {
+        let chats = c["chats"].as_array().unwrap();
+        chats
+            .iter()
+            .any(|c| c["members"].as_array().is_some_and(|m| m.len() == 2))
+    };
+    until(&mut carol, "meshDmChats", out);
+    let err = ask(&mut carol, "dmSend", &[&g, "still here?"], "meshError");
+    assert_eq!(err["kind"], "not-member", "{err}");
+    ask(&mut alice, "dmSend", &[&g, "just us"], "meshDmMessages");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "just us");
+
+    let stderr = [alice, bob, carol].map(Helper::quit).concat();
+    for secret in ["hi all", "hello from Carol", "just us", "hike"] {
+        assert!(!stderr.contains(secret), "a helper logged {secret:?}");
+    }
+    seed.stop();
     drop(relay.runtime);
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);

@@ -18,7 +18,7 @@
 //!   `n` and `seq`, so a chat opened from its newest segment alone still
 //!   checks "late and low" and "out of step" (D2).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,8 @@ pub struct History {
     /// Each group chat's members in its current version; none before its
     /// creation has arrived.
     members: HashMap<Conversation, BTreeMap<Person, EventId>>,
+    /// Who each group change goes to (group.rs `audience`).
+    audience: HashMap<Conversation, BTreeMap<EventId, BTreeSet<Person>>>,
     /// Events each sender has waiting for a group's creation.
     // ponytail: in memory, so a restart lets a sender start over at MAX_BEFORE_CREATION.
     before_creation: HashMap<(Conversation, Person), usize>,
@@ -151,6 +153,48 @@ pub fn forward(t: &ToSend) -> Vec<u8> {
     postcard::to_stdvec(&forward).expect("to memory")
 }
 
+/// What a friend's device gets: the event, and its group if it's in one.
+/// Group DMs go over the 1:1 sessions (e2ee D6), so the group is named here.
+#[derive(Serialize, Deserialize)]
+struct Friend {
+    /// First, so a newer layout is told apart from garbage.
+    version: u8,
+    group: Option<[u8; 16]>,
+    event: Vec<u8>,
+}
+
+/// The friend layout's version.
+pub const FRIEND_VERSION: u8 = 1;
+
+/// The body that carries `event` in chat `at` to a friend's device.
+pub fn to_friend(at: &Where, event: &Event) -> Vec<u8> {
+    let group = match at {
+        Where::Group(id) => Some(*id),
+        Where::Direct(_) => None,
+    };
+    let friend = Friend {
+        version: FRIEND_VERSION,
+        group,
+        event: event.to_bytes().expect("checked when stored"),
+    };
+    postcard::to_stdvec(&friend).expect("to memory")
+}
+
+/// A friend's body: the group, if it's a group's, and the event.
+pub fn from_friend(bytes: &[u8]) -> Result<(Option<[u8; 16]>, Event), Unread> {
+    match bytes.first() {
+        Some(&v) if is_newer(v, FRIEND_VERSION) => return Err(Unread::Newer),
+        Some(&v) if v == FRIEND_VERSION => {}
+        _ => return Err(Unread::Garbage),
+    }
+    let f: Friend = postcard::from_bytes(bytes).map_err(|_| Unread::Garbage)?;
+    if f.event.first().is_some_and(|&v| is_newer(v, VERSION)) {
+        return Err(Unread::Newer);
+    }
+    let event = Event::from_bytes(&f.event).map_err(|_| Unread::Garbage)?;
+    Ok((f.group, event))
+}
+
 /// The forwarded layout's version.
 pub const FORWARD_VERSION: u8 = 1;
 /// How far above ours a version byte may be and still mean "newer", not
@@ -202,6 +246,7 @@ impl History {
             deleted: HashMap::new(),
             known: HashMap::new(),
             members: HashMap::new(),
+            audience: HashMap::new(),
             before_creation: HashMap::new(),
             counters: Counters::new(me.person),
             chats: HashMap::new(),
@@ -243,6 +288,7 @@ impl History {
             }
             if let Some(version) = group.version(&id) {
                 self.members.insert(key, version.joined);
+                self.audience.insert(key, version.audience);
             }
         }
         Ok(())
@@ -519,6 +565,7 @@ impl History {
                         open.chat.wipe_senders_not_in(&version.members);
                     }
                     self.members.insert(*chat, version.joined);
+                    self.audience.insert(*chat, version.audience);
                 }
                 None => {
                     self.members.remove(chat);
@@ -656,7 +703,7 @@ impl History {
 
     /// What `device` gets next, read back from disk.
     pub fn outgoing(&mut self, device: &Device, now: u64) -> Result<Vec<ToSend>, HistoryError> {
-        let (known, members, log) = (&self.known, &self.members, &self.log);
+        let (known, members, log) = (&self.known, (&self.members, &self.audience), &self.log);
         let shares = |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
         let Outgoing { send, .. } = self.counters.to_send(device, &self.log, shares, now);
         let mut segments: HashMap<(Conversation, u32), Vec<Vec<u8>>> = HashMap::new();
@@ -689,7 +736,8 @@ impl History {
                 }
                 // Wiped since: there's nothing to send, so it counts as taken.
                 None => {
-                    let (known, members, log) = (&self.known, &self.members, &self.log);
+                    let (known, members, log) =
+                        (&self.known, (&self.members, &self.audience), &self.log);
                     let shares =
                         |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
                     self.counters.acked(device, number, true, &self.log, shares)
@@ -701,7 +749,7 @@ impl History {
 
     /// The device answered for event `number`.
     pub fn acked(&mut self, device: &Device, number: u64, ok: bool) {
-        let (known, members, log) = (&self.known, &self.members, &self.log);
+        let (known, members, log) = (&self.known, (&self.members, &self.audience), &self.log);
         let shares = |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
         self.counters.acked(device, number, ok, &self.log, shares);
     }
@@ -758,7 +806,7 @@ impl History {
 
     /// Whether one of the other person's devices has taken our event (D5).
     pub fn is_sent(&self, id: &EventId) -> bool {
-        let (known, members, log) = (&self.known, &self.members, &self.log);
+        let (known, members, log) = (&self.known, (&self.members, &self.audience), &self.log);
         let shares = |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
         self.log
             .number_of(id)
@@ -817,9 +865,15 @@ impl History {
 /// Whether event `n` (`e`) is for `person`: the person of a 1:1; in a
 /// group, a member of its current version, for its changes always and for
 /// the rest from the change they joined at on.
+/// A group's members with their join points, and who each change goes to.
+type Groups<'a> = (
+    &'a HashMap<Conversation, BTreeMap<Person, EventId>>,
+    &'a HashMap<Conversation, BTreeMap<EventId, BTreeSet<Person>>>,
+);
+
 fn in_chat(
     known: &HashMap<Conversation, Where>,
-    members: &HashMap<Conversation, BTreeMap<Person, EventId>>,
+    (members, audience): Groups<'_>,
     log: &Log,
     e: &Entry,
     n: u64,
@@ -827,11 +881,17 @@ fn in_chat(
 ) -> bool {
     match known.get(&e.chat) {
         Some(Where::Direct(p)) => p == person,
+        // A change goes to who it concerns, the person removed included.
+        Some(Where::Group(_)) if e.change => {
+            let concerns = audience.get(&e.chat).and_then(|a| a.get(&e.id));
+            concerns.is_some_and(|a| a.contains(person))
+                || members.get(&e.chat).is_some_and(|m| m.contains_key(person))
+        }
         Some(Where::Group(_)) => {
             let Some(joined) = members.get(&e.chat).and_then(|m| m.get(person)) else {
                 return false;
             };
-            e.change || log.number_of(joined).is_none_or(|from| n >= from)
+            log.number_of(joined).is_none_or(|from| n >= from)
         }
         None => false,
     }
@@ -1415,6 +1475,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The removal reaches the person removed, though they're no longer a
+    /// member; later messages don't.
+    #[test]
+    fn a_removal_reaches_the_removed() {
+        let root = dir("group-remove");
+        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let made = h
+            .send(&group, create(vec![BOB.person, CAROL.person]), NOW)
+            .unwrap();
+        let remove = Body::Group(crate::event::GroupChange {
+            after: Some(made.id),
+            change: crate::event::Change::Remove(CAROL.person),
+        });
+        h.send(&group, remove.clone(), NOW).unwrap();
+        h.send(&group, text("just us"), NOW).unwrap();
+        h.add_device(CAROL.device, CAROL.person);
+        let carol: Vec<Body> = h
+            .outgoing(&CAROL.device, NOW)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.event.body)
+            .collect();
+        assert!(carol.contains(&remove), "{carol:?}");
+        assert!(!carol.contains(&text("just us")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The group's state comes back with the chat, though its creation is
     /// in a segment the reopened chat doesn't read.
     #[test]
@@ -1435,6 +1523,26 @@ mod tests {
             [Taken::Shown]
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// What a friend's device gets: the event, and the group it's in if
+    /// any (group DMs go over the 1:1 sessions, e2ee D6).
+    #[test]
+    fn a_friend_body_names_its_group() {
+        let event = bobs(1, NOW, 1, text("hi"));
+        let group = Where::Group([5; 16]);
+        assert_eq!(
+            from_friend(&to_friend(&group, &event)),
+            Ok((Some([5; 16]), event.clone()))
+        );
+        assert_eq!(
+            from_friend(&to_friend(&CHAT, &event)),
+            Ok((None, event.clone()))
+        );
+        let mut newer = to_friend(&CHAT, &event);
+        newer[0] = FRIEND_VERSION + 1;
+        assert_eq!(from_friend(&newer).err(), Some(Unread::Newer));
+        assert_eq!(from_friend(b"junk").err(), Some(Unread::Garbage));
     }
 
     /// An event's author comes from the log, with no chat loaded.

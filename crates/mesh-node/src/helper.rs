@@ -292,7 +292,7 @@ struct Helper {
     dm_flight: HashSet<[u8; 32]>,
     /// The chat open on screen (`dmOpen`), which gets its page again when
     /// it changes; others get a note.
-    dm_open: Option<MeshId>,
+    dm_open: Option<mesh_dm::Where>,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -1183,8 +1183,8 @@ impl Helper {
                             }
                             // A bad event is dropped and counted (dm D14);
                             // a newer one waits on its sender.
-                            match dm::read_event(&opened.body) {
-                                Ok(event) => events.push((i, event)),
+                            match dm::read_friend(&opened.body) {
+                                Ok((group, event)) => events.push((i, group, event)),
                                 Err(answer) => {
                                     eprintln!("mesh-node: a chat event didn't read");
                                     answers[i] = answer;

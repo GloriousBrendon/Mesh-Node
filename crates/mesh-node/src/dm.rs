@@ -1,19 +1,20 @@
-//! The helper's side of `dm` delivery (SPEC-dm D5; PLAN-dm Task 9). Events
-//! wait in the sealed history, not as envelopes. When a friend's device is
-//! connected, or a fresh session arrives from it, the helper reads what that
-//! device hasn't acknowledged, encrypts it for that device alone and sends
-//! it on the `e2ee` service with the "answer" flag. The reader opens and
-//! stores the events, then answers each frame `ok` or `failed`; the
-//! counters move past what's `ok`. A child of `helper`, so it works on the
-//! same `Helper`. Our own devices get everything, forwarded with its chat,
-//! author and first arrival (D8, Task 10). 1:1 chats; groups wait on a
-//! decision about how their events are encrypted.
+//! The helper's side of `dm` (SPEC-dm). Events wait in the sealed history,
+//! not as envelopes. When a device is connected, or a fresh session arrives
+//! from it, the helper reads what that device hasn't acknowledged, encrypts
+//! it for that device alone and sends it on the `e2ee` service with the
+//! "answer" flag. The reader stores the events and answers each frame `ok`
+//! or `failed`; the counters move past what's `ok` (D5).
+//!
+//! A friend's device gets each event with the group it's in, if any: group
+//! DMs go over the 1:1 sessions (e2ee D6), and History checks membership
+//! (D7). Our own devices get everything, forwarded with its chat, author and
+//! first arrival (D8). A child of `helper`, so it works on the same `Helper`.
 
 use super::*;
 use mesh_dm::Sender as DmSender;
 use mesh_dm::Where;
 use mesh_dm::chat::Taken;
-use mesh_dm::event::{Body, Event, EventId};
+use mesh_dm::event::{Body, Change, Event, EventId, GroupChange, MAX_MEMBERS};
 use mesh_dm::history::History;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -23,9 +24,30 @@ pub(super) const ANSWER: u8 = 2;
 const OK: u8 = 0;
 /// The answer for a frame that couldn't be opened or stored: send it again.
 const FAILED: u8 = 1;
+/// Shown text in a notification, at most (as WhatsApp's).
+const NOTIFY_CHARS: usize = 100;
+/// Messages in one page of `dmOpen`.
+const PAGE: usize = 50;
+
 /// Where a 1:1 chat with `peer` is kept on our devices.
 pub(super) fn direct_chat(peer: &MeshId) -> Where {
     Where::Direct(peer.to_bytes())
+}
+
+/// A chat as Mesh-Voice names it: a friend's ID, or a group's 32 hex.
+fn chat_text(at: &Where) -> String {
+    match at {
+        Where::Direct(p) => MeshId::from_bytes(p)
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        Where::Group(id) => e2ee::hex(id),
+    }
+}
+
+fn person_text(p: &[u8; 32]) -> String {
+    MeshId::from_bytes(p)
+        .map(|p| p.to_string())
+        .unwrap_or_default()
 }
 
 /// Writes the frames, finishes, and reads the reader's answers: one byte
@@ -56,6 +78,41 @@ pub(super) async fn answer(mut send: impl AsyncWrite + Unpin, answers: &[u8]) {
     let _ = send.shutdown().await;
 }
 
+/// A friend's body, or the answer it gets if it doesn't read: `failed` for
+/// a newer version (the sender keeps it until we update), `ok` for garbage,
+/// which is dropped and counted (D14).
+pub(super) fn read_friend(body: &[u8]) -> Result<(Option<[u8; 16]>, Event), u8> {
+    mesh_dm::history::from_friend(body).map_err(unread_answer)
+}
+
+/// History from another of our devices, or the answer if it doesn't read.
+pub(super) fn read_forward(body: &[u8]) -> Result<(Where, DmSender, u64, Event), u8> {
+    mesh_dm::history::unforward(body).map_err(unread_answer)
+}
+
+fn unread_answer(e: mesh_dm::history::Unread) -> u8 {
+    match e {
+        mesh_dm::history::Unread::Newer => FAILED,
+        mesh_dm::history::Unread::Garbage => OK,
+    }
+}
+
+fn dm_fail(e: impl std::fmt::Display) -> Fail {
+    Fail(
+        "unavailable",
+        format!("the chat history isn't working: {e}"),
+    )
+}
+
+fn not_found() -> Fail {
+    Fail("not-found", "no such message or chat".to_owned())
+}
+
+fn parse_event_id(text: &str) -> Result<EventId, Fail> {
+    e2ee::parse_conversation(text)
+        .ok_or_else(|| Fail("bad-args", "that isn't a message ID".to_owned()))
+}
+
 impl Helper {
     /// Opens this device's history, as networking starts.
     pub(super) fn open_dm(&mut self) {
@@ -78,6 +135,24 @@ impl Helper {
         }
     }
 
+    /// The people a chat's events go to, besides our own devices: the
+    /// friend of a 1:1, the members of a group's version we hold.
+    fn dm_recipients(&self, at: &Where) -> Vec<MeshId> {
+        let me = self.store.as_ref().map(Keystore::id);
+        let people = match at {
+            Where::Direct(p) => vec![*p],
+            Where::Group(_) => self
+                .dm
+                .as_ref()
+                .and_then(|h| h.members(at))
+                .unwrap_or_default(),
+        };
+        (people.iter())
+            .filter_map(|p| MeshId::from_bytes(p).ok())
+            .filter(|p| Some(*p) != me)
+            .collect()
+    }
+
     /// One device's next batch, if none is in flight to it.
     fn dm_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
         let device = *addr.device.as_bytes();
@@ -98,15 +173,15 @@ impl Helper {
         if out.is_empty() {
             return;
         }
-        // Our own devices get each event with its chat and author (D8).
+        // Our own devices get each event with its chat and author (D8); a
+        // friend's, with its group if it's in one (e2ee D6).
         let bodies: Vec<Vec<u8>> = if own {
             out.iter().map(mesh_dm::history::forward).collect()
         } else {
-            out.iter().filter_map(|t| t.event.to_bytes().ok()).collect()
+            out.iter()
+                .map(|t| mesh_dm::history::to_friend(&t.at, &t.event))
+                .collect()
         };
-        if bodies.len() != out.len() {
-            return eprintln!("mesh-node: a stored message didn't encode");
-        }
         let sealed = e2ee.encrypt_device_batch(id, &device, NoteKind::Message, &bodies);
         let envelopes = match sealed {
             Ok(envelopes) => envelopes,
@@ -148,146 +223,126 @@ impl Helper {
             eprintln!("mesh-node: couldn't save the delivery counters: {e}");
         }
         // "Sent" may have changed on the open chat.
-        if self.dm_open == Some(id) && answers.iter().any(|ok| *ok) {
-            let _ = self.emit_page(&id, None);
+        if let Some(open) = self.dm_open
+            && answers.iter().any(|ok| *ok)
+        {
+            let _ = self.emit_page(&open, None);
         }
         if answers.iter().all(|ok| *ok) {
             self.dm_deliver_to(&id, addr);
         }
     }
 
-    /// Takes in the dm events of one stream from `id`'s device: stores them
-    /// with one sync per chat, and gives each frame's answer.
+    /// Takes in the dm events of one stream from `id`'s device, each with
+    /// its group if it's in one: stored with one sync per chat, and each
+    /// frame's answer.
     pub(super) fn dm_take(
         &mut self,
         id: &MeshId,
         device: &[u8; 32],
-        events: Vec<(usize, Event)>,
+        events: Vec<(usize, Option<[u8; 16]>, Event)>,
         answers: &mut [u8],
     ) {
-        let Some(history) = &mut self.dm else {
-            for (i, _) in events {
-                answers[i] = FAILED;
-            }
-            return;
-        };
         let from = DmSender {
             person: id.to_bytes(),
             device: *device,
         };
-        let chat = direct_chat(id);
-        let (frames, events): (Vec<usize>, Vec<Event>) = events.into_iter().unzip();
-        let texts: Vec<Option<String>> = (events.iter())
-            .map(|e| match &e.body {
-                Body::Text { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        match history.receive(&chat, from, events, unix_now() * 1000) {
-            Ok(taken) => {
-                let refused = taken
-                    .iter()
-                    .filter(|t| matches!(t, Taken::Refused(_)))
-                    .count();
-                if refused > 0 {
-                    eprintln!("mesh-node: {refused} chat events refused");
+        let mut runs: Vec<(Where, Vec<usize>, Vec<Event>)> = Vec::new();
+        for (i, group, event) in events {
+            let at = group.map_or(direct_chat(id), Where::Group);
+            match runs.last_mut() {
+                Some(run) if run.0 == at => {
+                    run.1.push(i);
+                    run.2.push(event);
                 }
-                let new = (taken.iter().zip(texts))
-                    .filter(|(t, _)| **t == Taken::Shown)
-                    .filter_map(|(_, text)| text)
-                    .collect();
-                self.dm_changed(id, new);
+                _ => runs.push((at, vec![i], vec![event])),
             }
-            Err(e) => {
-                eprintln!("mesh-node: couldn't store chat events: {e}");
+        }
+        for (at, frames, events) in runs {
+            let Some(history) = &mut self.dm else {
                 for i in frames {
                     answers[i] = FAILED;
                 }
+                continue;
+            };
+            let texts: Vec<Option<String>> = (events.iter())
+                .map(|e| match &e.body {
+                    Body::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            match history.receive(&at, from, events, unix_now() * 1000) {
+                Ok(taken) => {
+                    let refused = taken
+                        .iter()
+                        .filter(|t| matches!(t, Taken::Refused(_)))
+                        .count();
+                    if refused > 0 {
+                        eprintln!("mesh-node: {refused} chat events refused");
+                    }
+                    let new = (taken.iter().zip(texts))
+                        .filter(|(t, _)| **t == Taken::Shown)
+                        .filter_map(|(_, text)| text)
+                        .collect();
+                    self.dm_changed(&at, id, new);
+                }
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't store chat events: {e}");
+                    for i in frames {
+                        answers[i] = FAILED;
+                    }
+                }
             }
         }
     }
-}
 
-/// A chat event from a friend's device, or the answer it gets if it
-/// doesn't read: `failed` for a newer version (the sender keeps it until we
-/// update), `ok` for garbage, which is dropped and counted (D14).
-pub(super) fn read_event(body: &[u8]) -> Result<Event, u8> {
-    if body
-        .first()
-        .is_some_and(|&v| mesh_dm::history::is_newer(v, mesh_dm::event::VERSION))
-    {
-        return Err(FAILED);
+    /// A chat named by Mesh-Voice: a friend's ID (they must be a friend), or
+    /// a group's hex ID (it must be listed).
+    fn dm_chat(&mut self, text: &str) -> Result<Where, Fail> {
+        if let Some(id) = e2ee::parse_conversation(text) {
+            let at = Where::Group(id);
+            let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
+            if !history.chats().contains(&at) {
+                return Err(not_found());
+            }
+            return Ok(at);
+        }
+        let peer = parse_id(text)?;
+        self.friend(&peer)?;
+        Ok(direct_chat(&peer))
     }
-    Event::from_bytes(body).map_err(|_| OK)
-}
 
-/// History from another of our devices, or the answer if it doesn't read.
-pub(super) fn read_forward(body: &[u8]) -> Result<(Where, DmSender, u64, Event), u8> {
-    mesh_dm::history::unforward(body).map_err(|e| match e {
-        mesh_dm::history::Unread::Newer => FAILED,
-        mesh_dm::history::Unread::Garbage => OK,
-    })
-}
-
-/// Shown text in a notification, at most (as WhatsApp's).
-const NOTIFY_CHARS: usize = 100;
-/// Messages in one page of `dmOpen`.
-const PAGE: usize = 50;
-
-fn dm_fail(e: impl std::fmt::Display) -> Fail {
-    Fail(
-        "unavailable",
-        format!("the chat history isn't working: {e}"),
-    )
-}
-
-fn parse_event_id(text: &str) -> Result<EventId, Fail> {
-    e2ee::parse_conversation(text)
-        .ok_or_else(|| Fail("bad-args", "that isn't a message ID".to_owned()))
-}
-
-impl Helper {
-    /// The 1:1 chat named by a friend's ID; refused unless they're a friend
-    /// (D6 for groups, and Q1).
-    fn dm_chat_with(&mut self, id: &str) -> Result<(MeshId, Where), Fail> {
-        let peer = parse_id(id)?;
-        let store = self.unlocked()?;
-        if store.account().kind(&peer) != Some(Kind::Friend) {
+    fn friend(&mut self, peer: &MeshId) -> Result<(), Fail> {
+        if self.unlocked()?.account().kind(peer) != Some(Kind::Friend) {
             return Err(Fail(
                 "not-a-friend",
-                "you can only message friends".to_owned(),
+                format!("{peer} isn't a friend; you can only message friends"),
             ));
         }
-        Ok((peer, direct_chat(&peer)))
+        Ok(())
     }
 
     /// `meshDmMessages` for one chat: its newest page, or the page before
     /// `before`.
-    fn emit_page(&mut self, peer: &MeshId, before: Option<EventId>) -> Result<(), Fail> {
+    fn emit_page(&mut self, at: &Where, before: Option<EventId>) -> Result<(), Fail> {
         let me = self.unlocked()?.id().to_bytes();
         let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
         let (page, more) = history
-            .page(&direct_chat(peer), before, PAGE, unix_now() * 1000)
+            .page(at, before, PAGE, unix_now() * 1000)
             .map_err(dm_fail)?;
         let events: Vec<Value> = page
             .iter()
             .map(|m| {
-                let from = MeshId::from_bytes(&m.author)
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
                 let reactions: Vec<Value> = (m.reactions.iter())
                     .map(|(emoji, who)| {
-                        let who: Vec<String> = (who.iter())
-                            .filter_map(|p| MeshId::from_bytes(p).ok())
-                            .map(|p| p.to_string())
-                            .collect();
+                        let who: Vec<String> = who.iter().map(person_text).collect();
                         json!({ "emoji": emoji, "who": who })
                     })
                     .collect();
                 let sent = m.author == me && history.is_sent(&m.id);
                 json!({
                     "id": e2ee::hex(&m.id),
-                    "from": from,
+                    "from": person_text(&m.author),
                     "text": m.text,
                     "edited": m.edited,
                     "replyTo": m.reply_to.map(|r| e2ee::hex(&r)),
@@ -300,7 +355,7 @@ impl Helper {
             .collect();
         emit(
             "meshDmMessages",
-            json!({ "id": peer.to_string(), "events": events, "more": more }),
+            json!({ "id": chat_text(at), "events": events, "more": more }),
         );
         Ok(())
     }
@@ -325,9 +380,18 @@ impl Helper {
         let mut chats = Vec::new();
         // ponytail: loads every chat's newest segment for the list; keep last activity and unread in each index if lists grow long.
         for at in history.chats() {
-            let Where::Direct(person) = at else { continue };
-            let Ok(peer) = MeshId::from_bytes(&person) else {
-                continue;
+            let (kind, name, members) = match at {
+                Where::Direct(p) => (
+                    "direct",
+                    names.get(&p).cloned().unwrap_or_default(),
+                    vec![p],
+                ),
+                Where::Group(_) => {
+                    let Some(version) = history.group(&at, now).map_err(dm_fail)? else {
+                        continue;
+                    };
+                    ("group", version.name, version.members.into_iter().collect())
+                }
             };
             let chat = history.chat(&at, now).map_err(dm_fail)?;
             let last = chat
@@ -335,11 +399,12 @@ impl Helper {
                 .last()
                 .and_then(|m| chat.display_time(&m.id))
                 .unwrap_or(0);
+            let members: Vec<String> = members.iter().map(person_text).collect();
             chats.push(json!({
-                "id": peer.to_string(),
-                "kind": "direct",
-                "name": names.get(&person).cloned().unwrap_or_default(),
-                "members": [peer.to_string()],
+                "id": chat_text(&at),
+                "kind": kind,
+                "name": name,
+                "members": members,
                 "last": last,
                 "unread": chat.unread(),
                 "mentions": 0,
@@ -350,12 +415,20 @@ impl Helper {
         Ok(())
     }
 
-    /// Stores and sends one of our events in a 1:1 chat, then answers with
-    /// the chat's page.
-    fn dm_send_body(&mut self, peer: MeshId, body: Body) -> Result<(), Fail> {
-        let at = direct_chat(&peer);
+    /// Stores one of our events and sends it to the chat's people and our
+    /// own devices. For a group, we must be in the version we hold, and it
+    /// goes to that version's members (D7).
+    fn dm_store_and_send(&mut self, at: &Where, body: Body) -> Result<(), Fail> {
+        let me = self.unlocked()?.id().to_bytes();
         let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
-        match history.send(&at, body, unix_now() * 1000) {
+        let creation = matches!(body, Body::Group(GroupChange { after: None, .. }));
+        if matches!(at, Where::Group(_))
+            && !creation
+            && !history.members(at).is_some_and(|m| m.contains(&me))
+        {
+            return Err(Fail("not-member", "you're not in this group".to_owned()));
+        }
+        match history.send(at, body, unix_now() * 1000) {
             Ok(_) => {}
             Err(mesh_dm::history::HistoryError::Event(e)) => {
                 let kind = match e {
@@ -367,31 +440,67 @@ impl Helper {
             }
             Err(e) => return Err(dm_fail(e)),
         }
-        self.dm_deliver(&peer);
+        for person in self.dm_recipients(at) {
+            self.dm_deliver(&person);
+        }
         if let Some(me) = self.store.as_ref().map(Keystore::id) {
             self.dm_deliver(&me);
         }
-        self.emit_page(&peer, None)
+        Ok(())
     }
 
-    /// The chat an event of ours is in, and that it's ours to change.
-    fn dm_own_event(&mut self, id: &str) -> Result<(MeshId, EventId), Fail> {
+    /// Stores and sends one of our events, then answers with the chat's page.
+    fn dm_send_body(&mut self, at: &Where, body: Body) -> Result<(), Fail> {
+        self.dm_store_and_send(at, body)?;
+        self.emit_page(at, None)
+    }
+
+    /// The chat an event is in; with `own`, refused unless it's ours.
+    fn dm_event(&mut self, id: &str, own: bool) -> Result<(Where, EventId), Fail> {
         let event = parse_event_id(id)?;
         let me = self.unlocked()?.id().to_bytes();
-        let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
-        let Some(Where::Direct(person)) = history.where_of(&event) else {
-            return Err(Fail("not-found", "no such message".to_owned()));
-        };
-        let peer = MeshId::from_bytes(&person)
-            .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
-        let author = history.author_of(&event);
-        if author != Some(me) {
+        let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
+        let at = history.where_of(&event).ok_or_else(not_found)?;
+        if own && history.author_of(&event) != Some(me) {
             return Err(Fail(
                 "not-author",
                 "only the author can change a message".to_owned(),
             ));
         }
-        Ok((peer, event))
+        Ok((at, event))
+    }
+
+    /// A group change of ours, following the version we hold.
+    fn dm_group_change(&mut self, group: &str, change: Change) -> Result<(), Fail> {
+        let at = self.dm_chat(group)?;
+        let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
+        let version = history
+            .group(&at, unix_now() * 1000)
+            .map_err(dm_fail)?
+            .ok_or_else(not_found)?;
+        if let Change::Remove(_) = change
+            && self.store.as_ref().map(|s| s.id().to_bytes()) != Some(version.creator)
+        {
+            return Err(Fail(
+                "not-creator",
+                "only the group's creator removes people".to_owned(),
+            ));
+        }
+        // A removal also goes to the person removed (they're not a member
+        // after it, so the members alone wouldn't send it to them).
+        let removed = match &change {
+            Change::Remove(p) => MeshId::from_bytes(p).ok(),
+            _ => None,
+        };
+        let body = Body::Group(GroupChange {
+            after: Some(version.head),
+            change,
+        });
+        self.dm_store_and_send(&at, body)?;
+        if let Some(removed) = removed {
+            self.dm_deliver(&removed);
+        }
+        self.emit_chats()
     }
 
     /// The dm commands (SPEC-dm *Client side*).
@@ -401,100 +510,116 @@ impl Helper {
                 .map(String::as_str)
                 .ok_or_else(|| Fail("bad-args", format!("{func} is missing argument {}", i + 1)))
         };
+        let optional_id = |i: usize| -> Result<Option<EventId>, Fail> {
+            args.get(i)
+                .filter(|a| !a.is_empty())
+                .map(|a| parse_event_id(a))
+                .transpose()
+        };
         match func {
             "dmList" => self.emit_chats(),
             "dmOpen" => {
-                let (peer, _) = self.dm_chat_with(arg(0)?)?;
-                let before = args
-                    .get(1)
-                    .filter(|b| !b.is_empty())
-                    .map(|b| parse_event_id(b))
-                    .transpose()?;
-                self.dm_open = Some(peer);
-                self.emit_page(&peer, before)
+                let at = self.dm_chat(arg(0)?)?;
+                self.dm_open = Some(at);
+                self.emit_page(&at, optional_id(1)?)
             }
             "dmSend" => {
-                let (peer, _) = self.dm_chat_with(arg(0)?)?;
+                let at = self.dm_chat(arg(0)?)?;
                 // Sending in a chat means it's open on screen.
-                self.dm_open = Some(peer);
-                let reply_to = args
-                    .get(2)
-                    .filter(|r| !r.is_empty())
-                    .map(|r| parse_event_id(r))
-                    .transpose()?;
+                self.dm_open = Some(at);
                 let body = Body::Text {
                     text: arg(1)?.to_owned(),
-                    reply_to,
+                    reply_to: optional_id(2)?,
                     attachments: Vec::new(),
                 };
-                self.dm_send_body(peer, body)
+                self.dm_send_body(&at, body)
             }
             "dmEdit" => {
-                let (peer, target) = self.dm_own_event(arg(0)?)?;
-                let body = Body::Edit {
-                    target,
-                    text: arg(1)?.to_owned(),
-                };
-                self.dm_send_body(peer, body)
+                let (at, target) = self.dm_event(arg(0)?, true)?;
+                let text = arg(1)?.to_owned();
+                self.dm_send_body(&at, Body::Edit { target, text })
             }
             "dmDelete" => {
                 let everyone = arg(1)? == "true";
-                let (peer, target) = if everyone {
-                    self.dm_own_event(arg(0)?)?
-                } else {
-                    let target = parse_event_id(arg(0)?)?;
-                    let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
-                    let Some(Where::Direct(p)) = history.where_of(&target) else {
-                        return Err(Fail("not-found", "no such message".to_owned()));
-                    };
-                    let peer = MeshId::from_bytes(&p)
-                        .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
-                    (peer, target)
-                };
-                self.dm_send_body(peer, Body::Delete { target, everyone })
+                let (at, target) = self.dm_event(arg(0)?, everyone)?;
+                self.dm_send_body(&at, Body::Delete { target, everyone })
             }
             "dmReact" => {
-                let target = parse_event_id(arg(0)?)?;
-                let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
-                let Some(Where::Direct(p)) = history.where_of(&target) else {
-                    return Err(Fail("not-found", "no such message".to_owned()));
-                };
-                let peer = MeshId::from_bytes(&p)
-                    .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
+                let (at, target) = self.dm_event(arg(0)?, false)?;
                 let body = Body::React {
                     target,
                     emoji: arg(1)?.to_owned(),
                     on: arg(2)? == "true",
                 };
-                self.dm_send_body(peer, body)
+                self.dm_send_body(&at, body)
             }
             "dmRead" => {
-                let (_, at) = self.dm_chat_with(arg(0)?)?;
+                let at = self.dm_chat(arg(0)?)?;
                 let up_to = parse_event_id(arg(1)?)?;
-                let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
-                history
-                    .send(&at, Body::Read { up_to }, unix_now() * 1000)
-                    .map_err(dm_fail)?;
-                if let Some(me) = self.store.as_ref().map(Keystore::id) {
-                    self.dm_deliver(&me);
-                }
+                self.dm_store_and_send(&at, Body::Read { up_to })?;
                 self.emit_chats()
             }
+            "dmGroupCreate" => {
+                let mut members = Vec::new();
+                for id in arg(0)?.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let peer = parse_id(id)?;
+                    self.friend(&peer)?;
+                    if !members.contains(&peer.to_bytes()) {
+                        members.push(peer.to_bytes());
+                    }
+                }
+                if members.is_empty() || members.len() >= MAX_MEMBERS {
+                    return Err(Fail(
+                        "too-many",
+                        format!("a group has 2 to {MAX_MEMBERS} people"),
+                    ));
+                }
+                let me = self.unlocked()?.id().to_bytes();
+                let (nonce, id) = mesh_dm::new_group(&me).ok_or_else(|| {
+                    Fail(
+                        "random",
+                        "couldn't get randomness from the system".to_owned(),
+                    )
+                })?;
+                let at = Where::Group(id);
+                let change = Change::Create {
+                    name: arg(1)?.to_owned(),
+                    members,
+                    nonce,
+                };
+                let body = Body::Group(GroupChange {
+                    after: None,
+                    change,
+                });
+                self.dm_store_and_send(&at, body)?;
+                self.emit_chats()
+            }
+            "dmGroupAdd" => {
+                let peer = parse_id(arg(1)?)?;
+                self.friend(&peer)?;
+                self.dm_group_change(arg(0)?, Change::Add(peer.to_bytes()))
+            }
+            "dmGroupRemove" => {
+                let peer = parse_id(arg(1)?)?;
+                self.dm_group_change(arg(0)?, Change::Remove(peer.to_bytes()))
+            }
+            "dmGroupLeave" => self.dm_group_change(arg(0)?, Change::Leave),
+            "dmGroupRename" => self.dm_group_change(arg(0)?, Change::Rename(arg(1)?.to_owned())),
             _ => Err(Fail("unknown-fn", format!("unknown command {func}"))),
         }
     }
 
-    /// After events came in: the open chat's page again, or a note for each
-    /// new message from someone else, and the list.
-    pub(super) fn dm_changed(&mut self, peer: &MeshId, new: Vec<String>) {
-        if self.dm_open == Some(*peer) {
-            let _ = self.emit_page(peer, None);
+    /// After events came in from `from`: the open chat's page again, or a
+    /// note for each new message, and the list.
+    pub(super) fn dm_changed(&mut self, at: &Where, from: &MeshId, new: Vec<String>) {
+        if self.dm_open == Some(*at) {
+            let _ = self.emit_page(at, None);
         } else {
             for text in new {
                 let text: String = text.chars().take(NOTIFY_CHARS).collect();
                 emit(
                     "meshDmNotify",
-                    json!({ "id": peer.to_string(), "from": peer.to_string(), "text": text }),
+                    json!({ "id": chat_text(at), "from": from.to_string(), "text": text }),
                 );
             }
         }
@@ -540,18 +665,15 @@ impl Helper {
                     answers[i] = FAILED;
                 }
             }
-            if let Where::Direct(p) = at
-                && let Ok(peer) = MeshId::from_bytes(&p)
-                && !chats.contains(&peer)
-            {
-                chats.push(peer);
+            if !chats.contains(&at) {
+                chats.push(at);
             }
         }
         // Our own devices' history isn't news: no notes, just what's open.
-        for peer in chats {
-            if self.dm_open == Some(peer) {
-                let _ = self.emit_page(&peer, None);
-            }
+        if let Some(open) = self.dm_open
+            && chats.contains(&open)
+        {
+            let _ = self.emit_page(&open, None);
         }
     }
 }
@@ -602,11 +724,13 @@ mod tests {
             n: 1,
             body: Body::Read { up_to: [2; 16] },
         };
-        assert!(read_event(&event.to_bytes().unwrap()).is_ok());
-        let mut newer = event.to_bytes().unwrap();
-        newer[0] = VERSION + 1;
-        assert_eq!(read_event(&newer).err(), Some(FAILED));
-        assert_eq!(read_event(b"junk").err(), Some(OK));
+        let body = mesh_dm::history::to_friend(&Where::Direct([3; 32]), &event);
+        assert!(read_friend(&body).is_ok());
+        let mut newer = body.clone();
+        newer[0] = mesh_dm::history::FRIEND_VERSION + 1;
+        assert_eq!(read_friend(&newer).err(), Some(FAILED));
+        assert_eq!(read_friend(b"junk").err(), Some(OK));
+        let _ = VERSION;
     }
 
     #[test]
