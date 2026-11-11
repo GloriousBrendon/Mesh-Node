@@ -587,7 +587,9 @@ impl E2ee {
 
     /// Encrypts each body for one of `peer`'s current devices only, saving
     /// once before any ciphertext is handed out. dm sends each device what
-    /// it hasn't acknowledged, device by device (SPEC-dm D5).
+    /// it hasn't acknowledged, device by device (SPEC-dm D5). With `peer` our
+    /// own ID, it's for another of our devices, in the self pair's
+    /// conversation (history sync, dm D8).
     pub fn encrypt_device_batch(
         &mut self,
         peer: &MeshId,
@@ -595,17 +597,17 @@ impl E2ee {
         kind: Kind,
         bodies: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, E2eeError> {
-        if *peer == self.me {
-            return Err(E2eeError::NotMember);
-        }
         let conversation = PairKeys::new(&self.root, peer)
             .ok_or(E2eeError::NoKeys)?
             .conversation();
-        let theirs = self
-            .people
-            .get(peer)
-            .map(Person::reachable)
-            .unwrap_or_default();
+        let theirs = if *peer == self.me {
+            self.own_devices()
+        } else {
+            self.people
+                .get(peer)
+                .map(Person::reachable)
+                .unwrap_or_default()
+        };
         let (curve, _) = theirs
             .into_iter()
             .find(|(_, key)| key.as_bytes() == device)
@@ -902,10 +904,17 @@ impl E2ee {
         inside: Inside,
     ) -> Result<Opened, E2eeError> {
         let peer = if sender == self.me {
-            *self
-                .direct
-                .get(&inside.conversation)
-                .ok_or(E2eeError::NotMember)?
+            // From another of our devices: a chat with someone, or history
+            // in the self pair's conversation, which only our devices hold.
+            let own = PairKeys::new(&self.root, &self.me).map(|k| k.conversation());
+            if own == Some(inside.conversation) {
+                self.me
+            } else {
+                *self
+                    .direct
+                    .get(&inside.conversation)
+                    .ok_or(E2eeError::NotMember)?
+            }
         } else {
             let ours = PairKeys::new(&self.root, &sender).map(|k| k.conversation());
             if ours != Some(inside.conversation) {
@@ -1382,6 +1391,36 @@ pub(crate) mod tests {
 
     fn to(out: Vec<(VerifyingKey, Vec<u8>)>, device: &VerifyingKey) -> Vec<u8> {
         out.into_iter().find(|(d, _)| d == device).unwrap().1
+    }
+
+    /// Own-device sync (SPEC-dm D8): history goes to our other devices
+    /// over the self pair's conversation, which only our devices hold.
+    #[test]
+    fn history_goes_to_our_own_devices_over_the_self_pair() {
+        let mut alice = device();
+        let mut laptop = laptop_of(&mut alice, false);
+        introduce(&mut alice, &mut laptop);
+        introduce(&mut laptop, &mut alice);
+        let me = alice.who.root.id();
+        let device = laptop.who.device.public().to_bytes();
+        let body = vec![b"history".to_vec()];
+        let sealed = alice
+            .e2ee
+            .encrypt_device_batch(&me, &device, Kind::Message, &body)
+            .unwrap();
+        let opened = laptop.e2ee.open1(&sealed[0]).unwrap();
+        assert_eq!(opened.conversation, Conversation::Direct(me));
+        assert_eq!((opened.sender, &opened.body[..]), (me, &b"history"[..]));
+        // Only to our own devices: a stranger's device isn't one.
+        let stranger = device_key_bytes();
+        let refused = alice
+            .e2ee
+            .encrypt_device_batch(&me, &stranger, Kind::Message, &body);
+        assert!(refused.is_err());
+    }
+
+    fn device_key_bytes() -> [u8; 32] {
+        DeviceKey::generate().unwrap().public().to_bytes()
     }
 
     #[test]
