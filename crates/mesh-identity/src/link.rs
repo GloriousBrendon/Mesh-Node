@@ -334,6 +334,11 @@ impl LinkedIdentity {
     pub fn id(&self) -> crate::id::MeshId {
         self.root.id()
     }
+
+    /// The identity's username, to ask for before saving the keystore.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
 }
 
 /// Where E leaves its link node's address for N (PLAN-link L1): an ordinary

@@ -50,6 +50,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
+#[path = "link.rs"]
+mod link;
 #[path = "social.rs"]
 mod social;
 use social::{
@@ -282,6 +284,9 @@ struct Helper {
     /// Envelopes for devices we couldn't reach, until they connect. In memory
     /// only: locking drops them (`mailbox` keeps them later).
     waiting: HashMap<[u8; 32], Vec<Vec<u8>>>,
+    /// A device link in progress (PLAN-link), and which session it is.
+    link: Option<link::Linking>,
+    link_session: u64,
 }
 
 struct Net {
@@ -338,6 +343,8 @@ enum Back {
     /// A device of someone's said what it shows, or went quiet.
     /// Their username comes with it (empty from an older helper).
     Presence(Box<(MeshId, [u8; 32], Option<Presence>, String)>),
+    /// A link session's news, with the session it's from.
+    Link(u64, link::LinkEvent),
 }
 
 impl Helper {
@@ -366,6 +373,8 @@ impl Helper {
             devices_at: HashMap::new(),
             waiting: HashMap::new(),
             unopened: Vec::new(),
+            link: None,
+            link_session: 0,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -401,6 +410,7 @@ impl Helper {
             }
             "idLock" => {
                 self.store = None;
+                self.link = None;
                 self.stop_net().await;
                 self.emit_identity();
             }
@@ -650,6 +660,11 @@ impl Helper {
             }
             "e2eeNote" => self.note(arg(0)?, arg(1)?, args.get(2).map(String::as_str))?,
             "deviceRemove" => self.remove_device(arg(0)?)?,
+            "linkStart" => self.link_start()?,
+            "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
+            "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
+            "linkCancel" => self.link_cancel()?,
+            "linkFinish" => self.link_finish(arg(0)?, arg(1)?).await?,
             "netStatus" => self.emit_net(),
             "netTicket" => {
                 let ticket = self
@@ -801,6 +816,7 @@ impl Helper {
     fn answered(&mut self, back: Back) {
         let answers = match back {
             Back::Held(answers) => answers,
+            Back::Link(session, event) => return self.link_back(session, event),
             Back::Relay => {
                 self.publish();
                 self.sync_own();
@@ -1518,6 +1534,12 @@ impl Helper {
 
 /// A node with a fresh identity nobody knows, for talking to seeds (D7b).
 async fn anon_node(relays: Relays) -> Result<Node, String> {
+    throwaway_node(relays, Vec::new()).await
+}
+
+/// A node with a fresh, unsaved identity that admits anyone and answers
+/// `services`: for seeds (D7b) and linking (PLAN-link L2, L3).
+async fn throwaway_node(relays: Relays, services: Vec<String>) -> Result<Node, String> {
     let (root, key) = RootKey::generate()
         .and_then(|r| Ok((r, DeviceKey::generate()?)))
         .map_err(|e| format!("no randomness: {e}"))?;
@@ -1525,6 +1547,7 @@ async fn anon_node(relays: Relays) -> Result<Node, String> {
     let cert = DeviceCert::issue(&root, &key.public(), "mesh", 0).map_err(|e| e.to_string())?;
     let config = Config {
         relays,
+        services,
         ..Config::default()
     };
     Node::start(&key, &cert, config)
