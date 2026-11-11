@@ -180,6 +180,9 @@ impl Person {
 
 /// This device's end-to-end state.
 pub struct E2ee {
+    /// Saves that wrote something (tests count them).
+    #[cfg(test)]
+    pub(crate) saves: usize,
     root: RootKey,
     device: DeviceKey,
     pub(crate) me: MeshId,
@@ -273,6 +276,8 @@ impl E2ee {
             unwedged: HashMap::new(),
             store: None,
             dirty: Dirty::default(),
+            #[cfg(test)]
+            saves: 0,
         };
         e2ee.renew_fallback(now);
         e2ee.take_devices(&root.id(), devices);
@@ -359,6 +364,8 @@ impl E2ee {
             unwedged: HashMap::new(),
             store: Some(store),
             dirty: Dirty::default(),
+            #[cfg(test)]
+            saves: 0,
         })
     }
 
@@ -366,6 +373,10 @@ impl E2ee {
     /// lists them. Called before any ciphertext or plaintext is handed out.
     pub(crate) fn save(&mut self) -> Result<(), E2eeError> {
         let dirty = std::mem::take(&mut self.dirty);
+        #[cfg(test)]
+        if dirty.account || !dirty.people.is_empty() || !dirty.groups.is_empty() {
+            self.saves += 1;
+        }
         let Some(store) = &self.store else {
             return Ok(());
         };
@@ -771,11 +782,34 @@ impl E2ee {
     /// seal, and checks where it belongs (D11). What it holds, and anything
     /// it means sending back, is in the answer.
     pub fn decrypt(&mut self, bytes: &[u8], now: u64) -> Result<Received, E2eeError> {
+        let opened = self.open_envelope(bytes, now);
+        self.save()?;
+        opened
+    }
+
+    /// Opens many envelopes, then saves the state once before handing any
+    /// of it up: 10,000 events mustn't mean 10,000 rewrites of the state
+    /// (SPEC-dm D11). Each envelope gets its own result; a failed save fails
+    /// the batch, and nothing in it is handed up.
+    pub fn decrypt_batch(
+        &mut self,
+        envelopes: &[Vec<u8>],
+        now: u64,
+    ) -> Result<Vec<Result<Received, E2eeError>>, E2eeError> {
+        let opened = envelopes
+            .iter()
+            .map(|e| self.open_envelope(e, now))
+            .collect();
+        self.save()?;
+        Ok(opened)
+    }
+
+    /// `decrypt` without the save.
+    fn open_envelope(&mut self, bytes: &[u8], now: u64) -> Result<Received, E2eeError> {
         let envelope = Envelope::from_bytes(bytes)?;
         let mut out = Received::default();
         if envelope.kind == EnvelopeType::Group {
             self.open_group(bytes, &envelope, now, &mut out)?;
-            self.save()?;
             return Ok(out);
         }
         let (sender, device, inside) = match self.open_olm(&envelope) {
@@ -791,7 +825,6 @@ impl E2ee {
             }
             _ => out.opened.push(self.place_direct(sender, device, inside)?),
         }
-        self.save()?;
         Ok(out)
     }
 
@@ -821,7 +854,6 @@ impl E2ee {
         // A key request for no chain: the reader opens it and does nothing.
         let inside = self.inside([0; 16], Kind::KeyRequest, &[0; 36])?;
         let reply = self.encrypt_to(&id, &device, &inside)?;
-        self.save()?;
         Ok(Received {
             opened: Vec::new(),
             replies: vec![(key_of(&device)?, reply)],

@@ -185,6 +185,58 @@ mod tests {
         got.opened.pop().unwrap().body
     }
 
+    /// 1,000 envelopes from one sender: one save, not 1,000 (PLAN-dm Task
+    /// 8), and the state on disk still opens the next message.
+    #[test]
+    fn a_batch_is_saved_once() {
+        let (mut alice, mut bob) = (Stored::new(), Stored::new());
+        friends(&mut alice, &mut bob);
+        let bob_id = bob.id();
+        let notes: Vec<Vec<u8>> = (0..1000)
+            .map(|i| {
+                let text = format!("note {i}");
+                one(alice
+                    .e2ee
+                    .encrypt_direct(&bob_id, Kind::TestNote, text.as_bytes())
+                    .unwrap())
+            })
+            .collect();
+        bob.e2ee.saves = 0;
+        let got = bob.e2ee.decrypt_batch(&notes, NOW).unwrap();
+        assert_eq!(bob.e2ee.saves, 1);
+        let bodies: Vec<Vec<u8>> = got
+            .into_iter()
+            .map(|r| r.unwrap().opened.pop().unwrap().body)
+            .collect();
+        assert_eq!(bodies[999], b"note 999");
+        bob.restart();
+        let next = one(alice
+            .e2ee
+            .encrypt_direct(&bob_id, Kind::TestNote, b"after")
+            .unwrap());
+        assert_eq!(body(&mut bob.e2ee, &next), b"after");
+    }
+
+    /// Nothing opened is handed up unless the state that opened it is on
+    /// disk: a failed save fails the whole batch.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_hands_nothing_up_if_its_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut alice, mut bob) = (Stored::new(), Stored::new());
+        friends(&mut alice, &mut bob);
+        let bob_id = bob.id();
+        let note = one(alice
+            .e2ee
+            .encrypt_direct(&bob_id, Kind::TestNote, b"x")
+            .unwrap());
+        let dir = bob.dir.join("e2ee");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let got = bob.e2ee.decrypt_batch(&[note], NOW);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(got.is_err());
+    }
+
     #[test]
     fn state_survives_a_restart() {
         let (mut alice, mut bob) = (Stored::new(), Stored::new());
