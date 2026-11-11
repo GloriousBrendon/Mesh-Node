@@ -217,6 +217,31 @@ mod tests {
         assert_eq!(body(&mut bob.e2ee, &next), b"after");
     }
 
+    /// dm sends each device what it hasn't acknowledged (SPEC-dm D5): many
+    /// bodies for one device, saved once, opened only by that device.
+    #[test]
+    fn a_batch_for_one_device() {
+        let (mut alice, mut bob) = (Stored::new(), Stored::new());
+        friends(&mut alice, &mut bob);
+        let (bob_id, device) = (bob.id(), bob.who.device.public());
+        let bodies: Vec<Vec<u8>> = (0..3).map(|i| vec![i; 10]).collect();
+        alice.e2ee.saves = 0;
+        let sealed = alice
+            .e2ee
+            .encrypt_device_batch(&bob_id, &device, Kind::Message, &bodies)
+            .unwrap();
+        assert_eq!((sealed.len(), alice.e2ee.saves), (3, 1));
+        for (envelope, body) in sealed.iter().zip(&bodies) {
+            let mut got = bob.e2ee.decrypt(envelope, NOW).unwrap();
+            assert_eq!(&got.opened.pop().unwrap().body, body);
+        }
+        let stranger = Stored::new().who.device.public();
+        let none = alice
+            .e2ee
+            .encrypt_device_batch(&bob_id, &stranger, Kind::Message, &bodies);
+        assert!(none.is_err(), "not one of Bob's devices");
+    }
+
     /// Nothing opened is handed up unless the state that opened it is on
     /// disk: a failed save fails the whole batch.
     #[cfg(unix)]

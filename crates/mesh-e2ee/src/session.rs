@@ -585,6 +585,40 @@ impl E2ee {
         Ok(out)
     }
 
+    /// Encrypts each body for one of `peer`'s current devices only, saving
+    /// once before any ciphertext is handed out. dm sends each device what
+    /// it hasn't acknowledged, device by device (SPEC-dm D5).
+    pub fn encrypt_device_batch(
+        &mut self,
+        peer: &MeshId,
+        device: &VerifyingKey,
+        kind: Kind,
+        bodies: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, E2eeError> {
+        if *peer == self.me {
+            return Err(E2eeError::NotMember);
+        }
+        let conversation = PairKeys::new(&self.root, peer)
+            .ok_or(E2eeError::NoKeys)?
+            .conversation();
+        let theirs = self
+            .people
+            .get(peer)
+            .map(Person::reachable)
+            .unwrap_or_default();
+        let (curve, _) = theirs
+            .into_iter()
+            .find(|(_, key)| key == device)
+            .ok_or(E2eeError::NoKeys)?;
+        let mut out = Vec::with_capacity(bodies.len());
+        for body in bodies {
+            let inside = self.inside(conversation, kind, body)?;
+            out.push(self.encrypt_to(peer, &curve, &inside)?);
+        }
+        self.save()?;
+        Ok(out)
+    }
+
     /// Whether we can encrypt to any of `id`'s devices.
     pub fn knows(&self, id: &MeshId) -> bool {
         !self.reachable_of(id).is_empty()
