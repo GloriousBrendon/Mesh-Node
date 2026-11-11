@@ -298,6 +298,8 @@ struct Helper {
     /// The chat open on screen (`dmOpen`), which gets its page again when
     /// it changes; others get a note.
     dm_open: Option<mesh_dm::Where>,
+    /// When each device last said it was typing (rate limit, D10).
+    typing_last: HashMap<[u8; 32], std::time::Instant>,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -354,6 +356,8 @@ enum Back {
     Envelopes(Box<Incoming>),
     /// A device answered a batch of chat events, or didn't (`None`).
     DmAnswered(Box<Answered>),
+    /// A typing signal: whose, which device, the frame (D10).
+    Typing(Box<(MeshId, [u8; 32], Vec<u8>)>),
     /// A device didn't take these envelopes: they wait for it.
     Unsent(Box<([u8; 32], Vec<Vec<u8>>)>),
     /// A contact answered through this address.
@@ -407,6 +411,7 @@ impl Helper {
             dm: None,
             dm_flight: HashSet::new(),
             dm_open: None,
+            typing_last: HashMap::new(),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -887,6 +892,10 @@ impl Helper {
             Back::Envelopes(got) => {
                 let (id, from, frames, reply) = *got;
                 return self.envelopes(id, from, frames, reply);
+            }
+            Back::Typing(got) => {
+                let (id, device, frame) = *got;
+                return self.typing_heard(id, device, frame);
             }
             Back::DmAnswered(got) => {
                 let (id, addr, numbers, answers) = *got;
@@ -1441,6 +1450,7 @@ impl Helper {
                 SYNC.to_owned(),
                 PRESENCE.to_owned(),
                 e2ee::SERVICE.to_owned(),
+                dm::TYPING.to_owned(),
             ],
             ..Config::default()
         };
@@ -1784,6 +1794,18 @@ async fn serve_streams(
                     if heard.is_none() {
                         break;
                     }
+                }
+            });
+            continue;
+        }
+        if stream.service == dm::TYPING {
+            tokio::spawn(async move {
+                let read = mesh_transport::frame::read_frame(&mut stream.recv);
+                if let Ok(Ok(Some(frame))) = tokio::time::timeout(SYNC_TIMEOUT, read).await
+                    && frame.len() <= 16
+                {
+                    let (id, device) = (stream.peer.id, *stream.peer.device.as_bytes());
+                    let _ = back.send(Back::Typing(Box::new((id, device, frame))));
                 }
             });
             continue;

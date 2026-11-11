@@ -109,6 +109,14 @@ fn two_friends_chat() {
     assert_eq!(texts(&open), [HELLO]);
     assert_eq!(open["events"][0]["from"], id_a.as_str());
 
+    // Typing goes over the live connection only (D10).
+    alice.send("dmTyping", &[&id_b]);
+    let typing = until(&mut bob, "meshDmTyping", |_| true);
+    assert_eq!(
+        (typing["id"].as_str(), typing["who"][0].as_str()),
+        (Some(&*id_a), Some(&*id_a))
+    );
+
     // "Sent" once Bob's device took it.
     let sent = until(&mut alice, "meshDmMessages", |m| {
         m["events"][0]["sent"] == true
@@ -251,6 +259,12 @@ fn a_group_of_three() {
             (Some(&*g), Some(&*id_a))
         );
     }
+    carol.send("dmTyping", &[&g]);
+    let typing = until(&mut alice, "meshDmTyping", |_| true);
+    assert_eq!(
+        (typing["id"].as_str(), typing["who"][0].as_str()),
+        (Some(&*g), Some(&*id_c))
+    );
     ask(
         &mut carol,
         "dmSend",

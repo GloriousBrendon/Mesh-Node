@@ -29,6 +29,12 @@ const NOTIFY_CHARS: usize = 100;
 /// Messages in one page of `dmOpen`.
 const PAGE: usize = 50;
 
+/// The transport service typing goes on (D10): one frame per signal, empty
+/// for a 1:1 chat or a group's ID, never stored or queued.
+pub(super) const TYPING: &str = "typing";
+/// A device's typing signals closer together than this are dropped.
+const TYPING_GAP: Duration = Duration::from_secs(2);
+
 /// Where a 1:1 chat with `peer` is kept on our devices.
 pub(super) fn direct_chat(peer: &MeshId) -> Where {
     Where::Direct(peer.to_bytes())
@@ -574,6 +580,11 @@ impl Helper {
                 self.dm_store_and_send(&at, Body::Read { up_to })?;
                 self.emit_chats()
             }
+            "dmTyping" => {
+                let at = self.dm_chat(arg(0)?)?;
+                self.send_typing(&at);
+                Ok(())
+            }
             "dmGroupCreate" => {
                 let mut members = Vec::new();
                 for id in arg(0)?.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -640,6 +651,64 @@ impl Helper {
             }
         }
         let _ = self.emit_chats();
+    }
+}
+
+impl Helper {
+    /// "Typing" to the chat's people's connected devices, on the live
+    /// connection only (D10).
+    fn send_typing(&mut self, at: &Where) {
+        let Some(net) = &self.net else { return };
+        let frame = match at {
+            Where::Direct(_) => Vec::new(),
+            Where::Group(id) => id.to_vec(),
+        };
+        for person in self.dm_recipients(at) {
+            for addr in net.node.connected(&person) {
+                let (node, frame) = (net.node.clone(), frame.clone());
+                tokio::spawn(async move {
+                    if let Ok((_, mut send, _)) = node.open(&addr, TYPING).await {
+                        let _ = mesh_transport::frame::write_frame(&mut send, &frame).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+        }
+    }
+
+    /// A typing signal from `id`'s device: `meshDmTyping` if it's from a
+    /// friend in that 1:1 chat or a member of that group.
+    pub(super) fn typing_heard(&mut self, id: MeshId, device: [u8; 32], frame: Vec<u8>) {
+        let now = std::time::Instant::now();
+        if self
+            .typing_last
+            .get(&device)
+            .is_some_and(|at| now.duration_since(*at) < TYPING_GAP)
+        {
+            return;
+        }
+        let at = match <[u8; 16]>::try_from(&frame[..]) {
+            Ok(group) => Where::Group(group),
+            Err(_) if frame.is_empty() => direct_chat(&id),
+            Err(_) => return,
+        };
+        let allowed = match at {
+            Where::Direct(_) => self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.account().kind(&id) == Some(Kind::Friend)),
+            Where::Group(_) => (self.dm.as_ref())
+                .and_then(|h| h.members(&at))
+                .is_some_and(|m| m.contains(&id.to_bytes())),
+        };
+        if !allowed {
+            return;
+        }
+        self.typing_last.insert(device, now);
+        emit(
+            "meshDmTyping",
+            json!({ "id": chat_text(&at), "who": [id.to_string()] }),
+        );
     }
 }
 
