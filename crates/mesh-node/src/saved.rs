@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-const FORMAT_V1: u8 = 1;
+/// The format the stores without their own use.
+pub const FORMAT_V1: u8 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct File<T> {
@@ -30,6 +31,7 @@ pub enum StoreError {
 pub fn load<T: DeserializeOwned>(
     path: &Path,
     what: &'static str,
+    format: u8,
     valid: impl Fn(&T) -> bool,
 ) -> Result<Vec<T>, StoreError> {
     let bytes = match std::fs::read(path) {
@@ -39,19 +41,26 @@ pub fn load<T: DeserializeOwned>(
     };
     let corrupt = || StoreError::Corrupt(what, path.to_owned());
     let file: File<T> = postcard::from_bytes(&bytes).map_err(|_| corrupt())?;
-    if file.format != FORMAT_V1 || !file.entries.iter().all(valid) {
+    if file.format != format || !file.entries.iter().all(valid) {
         return Err(corrupt());
     }
     Ok(file.entries)
 }
 
 /// The file's bytes for `entries` (references serialise as the values do).
-pub fn encode<T: Serialize>(entries: Vec<T>) -> Vec<u8> {
-    let file = File {
-        format: FORMAT_V1,
-        entries,
-    };
+pub fn encode<T: Serialize>(format: u8, entries: Vec<T>) -> Vec<u8> {
+    let file = File { format, entries };
     postcard::to_stdvec(&file).expect("serialising to memory")
+}
+
+/// The format byte of the file at `path`, none if there's no file or it's
+/// empty (postcard writes a `u8` as itself, first).
+pub fn format(path: &Path) -> Result<Option<u8>, StoreError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes.first().copied()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A store's file as it was when taken, to write without holding the store.

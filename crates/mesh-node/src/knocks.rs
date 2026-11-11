@@ -141,10 +141,15 @@ impl Store {
     /// Loads the store at `path`, or starts empty. A damaged file is an
     /// error, never silently replaced.
     pub fn load(path: &Path) -> Result<Self, StoreError> {
-        let boxes = saved::load(path, WHAT, |(lookup, b): &([u8; 16], CodeBox)| {
-            b.knocks.len() <= PER_CODE
-                && (b.knocks.iter()).all(|k| knock_outer(&k.knock) == Some((*lookup, k.slot)))
-        })?;
+        let boxes = saved::load(
+            path,
+            WHAT,
+            saved::FORMAT_V1,
+            |(lookup, b): &([u8; 16], CodeBox)| {
+                b.knocks.len() <= PER_CODE
+                    && (b.knocks.iter()).all(|k| knock_outer(&k.knock) == Some((*lookup, k.slot)))
+            },
+        )?;
         let boxes: HashMap<_, CodeBox> = boxes.into_iter().collect();
         Ok(Self {
             path: path.to_owned(),
@@ -170,7 +175,7 @@ impl Store {
         saved::Snapshot {
             path: self.path.clone(),
             what: WHAT,
-            bytes: saved::encode(self.boxes.iter().collect()),
+            bytes: saved::encode(saved::FORMAT_V1, self.boxes.iter().collect()),
         }
     }
 

@@ -64,6 +64,10 @@ const RELAY_SETTLE: Duration = Duration::from_secs(10);
 const NET_POLL: Duration = Duration::from_secs(1);
 /// How often codes no seed holds yet are offered again.
 const HOLD_RETRY: Duration = Duration::from_secs(600);
+/// How often every code is held again, so a seed keeps it (it drops a code
+/// `codes::HOLD_LIFE` after its last hold).
+const REHOLD_EVERY: Duration = Duration::from_secs(24 * 3600);
+const _: () = assert!(REHOLD_EVERY.as_secs() * 7 <= crate::codes::HOLD_LIFE);
 /// A failed publish is tried again after this, doubling up to the refresh.
 const PUBLISH_RETRY: Duration = Duration::from_secs(60);
 /// Seeds every install knows (SPEC-seed D6); `--seed` replaces them.
@@ -175,6 +179,8 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
     });
     let mut retry = tokio::time::interval(HOLD_RETRY);
     retry.tick().await;
+    let mut rehold = tokio::time::interval(REHOLD_EVERY);
+    rehold.tick().await;
     let mut refresh = tokio::time::interval(Duration::from_secs(
         routing::REFRESH_EVERY.min(record_ttl / 4).max(1),
     ));
@@ -193,6 +199,10 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             }
             _ = retry.tick() => {
                 helper.hold_codes(true);
+                continue;
+            }
+            _ = rehold.tick() => {
+                helper.hold_codes(false);
                 continue;
             }
             _ = refresh.tick() => {

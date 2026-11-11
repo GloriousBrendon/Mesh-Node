@@ -23,9 +23,19 @@ pub const LOOKUPS_RELAYED: u32 = LOOKUPS_TOTAL / 2;
 pub const LOOKUPS_TOTAL: u32 = 600;
 /// New codes one device may hold an hour.
 pub const HOLDS_PER_DEVICE: u32 = 20;
+/// Holds, new or again, one network may make an hour.
+pub const HOLDS_PER_NETWORK: u32 = 60;
+/// Holds everyone reaching the seed through a relay may make an hour, together.
+pub const HOLDS_RELAYED: u32 = 1000;
+/// How long a held code stays after its last hold, whatever its own expiry:
+/// junk drains by itself, and owners hold their codes again well before
+/// (audit finding 3, part 2).
+pub const HOLD_LIFE: u64 = 30 * 24 * 3600;
 /// Records and markers the seed keeps at most.
 pub const MAX_ENTRIES: usize = 100_000;
 
+/// The file format: 2 added each code's `until`.
+const FORMAT: u8 = 2;
 const MINUTE: u64 = 60;
 const HOUR: u64 = 3600;
 /// The store's name in errors.
@@ -129,22 +139,20 @@ enum Entry {
         held: Vec<u8>,
         /// `None` is unlimited.
         uses_left: Option<u32>,
+        /// Gone at this time: the code's expiry, or [`HOLD_LIFE`] after its
+        /// last hold if sooner.
+        until: u64,
     },
-    /// Used up or revoked: kept until the record would have expired, so the
-    /// owner holding it again can't bring it back.
-    Gone {
-        tag: [u8; 32],
-        expires_at: Option<u64>,
-    },
+    /// Used up or revoked: kept as long as the record would have been, so
+    /// the owner holding it again can't bring it back.
+    Gone { tag: [u8; 32], until: u64 },
 }
 
 impl Entry {
     fn expired(&self, now: u64) -> bool {
-        let at = match self {
-            Entry::Live { held, .. } => held_code(held).expires_at(),
-            Entry::Gone { expires_at, .. } => *expires_at,
-        };
-        at.is_some_and(|at| at <= now)
+        match self {
+            Entry::Live { until, .. } | Entry::Gone { until, .. } => *until <= now,
+        }
     }
 
     fn tag(&self) -> [u8; 32] {
@@ -155,13 +163,49 @@ impl Entry {
     }
 
     fn gone(&self) -> Entry {
-        let expires_at = match self {
-            Entry::Live { held, .. } => held_code(held).expires_at(),
-            Entry::Gone { expires_at, .. } => *expires_at,
-        };
+        let (Entry::Live { until, .. } | Entry::Gone { until, .. }) = self;
         Entry::Gone {
             tag: self.tag(),
-            expires_at,
+            until: *until,
+        }
+    }
+}
+
+/// When a code held at `now` goes.
+fn until(held: &HeldCode, now: u64) -> u64 {
+    let life = now.saturating_add(HOLD_LIFE);
+    held.expires_at().map_or(life, |at| at.min(life))
+}
+
+/// The entries as the first file format kept them, before [`HOLD_LIFE`].
+#[derive(Deserialize)]
+enum EntryV1 {
+    Live {
+        held: Vec<u8>,
+        uses_left: Option<u32>,
+    },
+    Gone {
+        tag: [u8; 32],
+        expires_at: Option<u64>,
+    },
+}
+
+impl EntryV1 {
+    /// As if every code was held again at `now`.
+    fn upgrade(self, now: u64) -> Entry {
+        match self {
+            EntryV1::Live { held, uses_left } => Entry::Live {
+                until: until(&held_code(&held), now),
+                held,
+                uses_left,
+            },
+            EntryV1::Gone { tag, expires_at } => {
+                let life = now.saturating_add(HOLD_LIFE);
+                Entry::Gone {
+                    tag,
+                    until: expires_at.map_or(life, |at| at.min(life)),
+                }
+            }
         }
     }
 }
@@ -212,11 +256,27 @@ impl Store {
     /// Loads the store at `path`, or starts empty if there's none. A damaged
     /// file is an error, never silently replaced.
     pub fn load(path: &Path) -> Result<Self, StoreError> {
-        let entries = saved::load(path, WHAT, |(_, e): &([u8; 16], Entry)| match e {
-            Entry::Live { held, .. } => HeldCode::from_bytes(held).is_ok(),
-            Entry::Gone { .. } => true,
-        })?;
-        let entries = entries.into_iter().collect();
+        let live = |held: &Vec<u8>| HeldCode::from_bytes(held).is_ok();
+        let entries = match saved::load(
+            path,
+            WHAT,
+            FORMAT,
+            |(_, e): &([u8; 16], Entry)| !matches!(e, Entry::Live { held, .. } if !live(held)),
+        ) {
+            Ok(entries) => entries.into_iter().collect(),
+            Err(StoreError::Corrupt(..)) if saved::format(path)? == Some(1) => {
+                let old = saved::load(
+                    path,
+                    WHAT,
+                    1,
+                    |(_, e): &([u8; 16], EntryV1)| !matches!(e, EntryV1::Live { held, .. } if !live(held)),
+                )?;
+                let now = mesh_identity::unix_now();
+                let entries = old.into_iter().map(|(k, e)| (k, e.upgrade(now)));
+                entries.collect()
+            }
+            Err(e) => return Err(e),
+        };
         Ok(Self {
             path: path.to_owned(),
             entries,
@@ -240,7 +300,7 @@ impl Store {
         saved::Snapshot {
             path: self.path.clone(),
             what: WHAT,
-            bytes: saved::encode(self.entries.iter().collect()),
+            bytes: saved::encode(FORMAT, self.entries.iter().collect()),
         }
     }
 
@@ -256,17 +316,26 @@ impl Store {
             return Hold::Bad;
         }
         let lookup_id = held.lookup_id();
-        if let Some(entry) = self.entries.get(&lookup_id).filter(|e| !e.expired(now)) {
-            return match (entry, entry.tag() == held.revoke_tag()) {
-                (_, false) => Hold::Taken,
-                (Entry::Live { .. }, true) => Hold::Ok,
-                (Entry::Gone { .. }, true) => Hold::Gone,
+        let network = caller.network_limit(HOLDS_PER_NETWORK, HOLDS_RELAYED);
+        if let Some(entry) = self.entries.get_mut(&lookup_id).filter(|e| !e.expired(now)) {
+            return match (entry, held.revoke_tag()) {
+                (entry, tag) if entry.tag() != tag => Hold::Taken,
+                (Entry::Gone { .. }, _) => Hold::Gone,
+                // Held again: it stays another HOLD_LIFE. Only the network
+                // limits apply, so junk can't be kept alive for free.
+                (Entry::Live { until: at, .. }, _) => {
+                    if !self.holds.allow(now, HOUR, &[network]) {
+                        return Hold::SlowDown;
+                    }
+                    let later = until(&held, now).max(*at);
+                    self.dirty |= later != *at;
+                    *at = later;
+                    Hold::Ok
+                }
             };
         }
-        if !self
-            .holds
-            .allow(now, HOUR, &[(caller.device.to_vec(), HOLDS_PER_DEVICE)])
-        {
+        let device = (caller.device.to_vec(), HOLDS_PER_DEVICE);
+        if !self.holds.allow(now, HOUR, &[device, network]) {
             return Hold::SlowDown;
         }
         if self.entries.len() >= MAX_ENTRIES {
@@ -275,14 +344,12 @@ impl Store {
                 return Hold::Full;
             }
         }
-        let uses_left = held.max_uses();
-        self.entries.insert(
-            lookup_id,
-            Entry::Live {
-                held: bytes.to_vec(),
-                uses_left,
-            },
-        );
+        let entry = Entry::Live {
+            held: bytes.to_vec(),
+            uses_left: held.max_uses(),
+            until: until(&held, now),
+        };
+        self.entries.insert(lookup_id, entry);
         self.dirty = true;
         Hold::Ok
     }
@@ -633,6 +700,83 @@ mod tests {
         );
     }
 
+    /// Even a "never" code goes 30 days after its last hold; holding it
+    /// again keeps it (audit finding 3, part 2).
+    #[test]
+    fn a_held_code_lasts_thirty_days_from_its_last_hold() {
+        let mut s = store("life");
+        let root = RootKey::generate().unwrap();
+        let (_, never) = code(&root, None, None);
+        let (_, kept) = code(&root, None, None);
+        s.hold(&caller(1), never.as_bytes(), NOW);
+        s.hold(&caller(1), kept.as_bytes(), NOW);
+        assert_eq!(
+            s.hold(&caller(2), kept.as_bytes(), NOW + HOLD_LIFE - 1),
+            Hold::Ok
+        );
+        let later = NOW + HOLD_LIFE;
+        assert_eq!(s.get(&caller(3), &never.lookup_id(), later), Get::None);
+        assert!(matches!(
+            s.get(&caller(3), &kept.lookup_id(), later),
+            Get::Found(_)
+        ));
+        // Held again at HOLD_LIFE - 1, so it goes a HOLD_LIFE after that.
+        s.sweep(NOW + 2 * HOLD_LIFE - 2);
+        assert_eq!(s.len(), 1);
+        s.sweep(NOW + 2 * HOLD_LIFE - 1);
+        assert_eq!(s.len(), 0);
+
+        // A used-up marker drains the same way.
+        let (_, used) = code(&root, None, Some(1));
+        s.hold(&caller(1), used.as_bytes(), later);
+        s.spend(&used.lookup_id(), later);
+        s.sweep(later + HOLD_LIFE);
+        assert_eq!(s.len(), 0);
+    }
+
+    /// Fresh keys don't get round the hold limits: a network, and everyone
+    /// relayed together, have one each. Holding a code again counts too.
+    #[test]
+    fn hold_limits_per_network_and_relayed() {
+        let mut s = store("hold-nets");
+        let root = RootKey::generate().unwrap();
+        let net = Some(network("203.0.113.9".parse().unwrap()));
+        let (_, again) = code(&root, None, None);
+        let first = Caller {
+            device: [9; 32],
+            network: net,
+        };
+        assert_eq!(s.hold(&first, again.as_bytes(), NOW), Hold::Ok);
+        for i in 1..HOLDS_PER_NETWORK {
+            let c = Caller {
+                device: (i + 1).to_be_bytes().repeat(8).try_into().unwrap(),
+                network: net,
+            };
+            assert_eq!(s.hold(&c, again.as_bytes(), NOW), Hold::Ok);
+        }
+        let (_, extra) = code(&root, None, None);
+        let fresh = Caller {
+            device: [250; 32],
+            network: net,
+        };
+        assert_eq!(s.hold(&fresh, extra.as_bytes(), NOW), Hold::SlowDown);
+        let direct = Caller {
+            network: Some(network("198.51.100.1".parse().unwrap())),
+            ..fresh
+        };
+        assert_eq!(s.hold(&direct, extra.as_bytes(), NOW), Hold::Ok);
+
+        let (_, shared) = code(&root, None, None);
+        for i in 0..HOLDS_RELAYED {
+            assert_eq!(s.hold(&relayed(i), shared.as_bytes(), NOW), Hold::Ok);
+        }
+        let (_, late) = code(&root, None, None);
+        assert_eq!(
+            s.hold(&relayed(HOLDS_RELAYED), late.as_bytes(), NOW),
+            Hold::SlowDown
+        );
+    }
+
     #[test]
     fn answers_on_the_wire() {
         for h in [
@@ -705,6 +849,58 @@ mod tests {
 
         std::fs::write(&s.path, b"not a store").unwrap();
         assert!(matches!(Store::load(&s.path), Err(StoreError::Corrupt(..))));
+        std::fs::write(&s.path, [1u8, 1, 2]).unwrap();
+        assert!(matches!(Store::load(&s.path), Err(StoreError::Corrupt(..))));
+        let _ = std::fs::remove_dir_all(s.path.parent().unwrap());
+    }
+
+    /// A file from before HOLD_LIFE still loads: each code counts as held
+    /// again at load.
+    #[test]
+    fn a_first_format_file_loads() {
+        #[derive(Serialize)]
+        enum Old<'a> {
+            Live {
+                held: &'a [u8],
+                uses_left: Option<u32>,
+            },
+            Gone {
+                tag: [u8; 32],
+                expires_at: Option<u64>,
+            },
+        }
+        let s = store("v1");
+        let root = RootKey::generate().unwrap();
+        let (_, live) = code(&root, None, Some(5));
+        let entries = vec![
+            (
+                live.lookup_id(),
+                Old::Live {
+                    held: live.as_bytes(),
+                    uses_left: Some(2),
+                },
+            ),
+            (
+                [7; 16],
+                Old::Gone {
+                    tag: [1; 32],
+                    expires_at: None,
+                },
+            ),
+        ];
+        std::fs::write(&s.path, saved::encode(1, entries)).unwrap();
+        let mut back = Store::load(&s.path).unwrap();
+        let now = mesh_identity::unix_now();
+        assert_eq!(back.len(), 2);
+        assert!(back.spend(&live.lookup_id(), now).is_some());
+        assert!(back.spend(&live.lookup_id(), now).is_some());
+        assert_eq!(
+            back.spend(&live.lookup_id(), now),
+            None,
+            "the count came across"
+        );
+        back.sweep(now + HOLD_LIFE + 1);
+        assert_eq!(back.len(), 0, "and the markers drain");
         let _ = std::fs::remove_dir_all(s.path.parent().unwrap());
     }
 }
