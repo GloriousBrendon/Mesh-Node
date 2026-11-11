@@ -363,11 +363,7 @@ impl Helper {
         };
         let peer = MeshId::from_bytes(&person)
             .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
-        let page = history
-            .page(&direct_chat(&peer), None, usize::MAX, unix_now() * 1000)
-            .map_err(dm_fail)?
-            .0;
-        let author = page.iter().find(|m| m.id == event).map(|m| m.author);
+        let author = history.author_of(&event);
         if author != Some(me) {
             return Err(Fail(
                 "not-author",

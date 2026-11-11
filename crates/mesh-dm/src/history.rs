@@ -571,6 +571,11 @@ impl History {
         self.known.get(&chat).copied()
     }
 
+    /// Who wrote a stored event, from its log entry: no chat is loaded.
+    pub fn author_of(&self, id: &EventId) -> Option<Person> {
+        Some(self.log.get(self.log.number_of(id)?)?.author)
+    }
+
     /// Whether one of the other person's devices has taken our event (D5).
     pub fn is_sent(&self, id: &EventId) -> bool {
         let (known, members) = (&self.known, &self.members);
@@ -1038,6 +1043,23 @@ mod tests {
         h.acked(&BOB.device, out[0].number, true);
         assert!(h.is_sent(&to_bob.id));
         assert!(!h.is_sent(&to_carol.id), "Carol is offline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An event's author comes from the log, with no chat loaded.
+    #[test]
+    fn the_author_is_in_the_log() {
+        let root = dir("author");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let mine = h.send(&CHAT, text("mine"), NOW).unwrap();
+        h.receive(&CHAT, BOB, vec![bobs(1, NOW + 1, 1, text("his"))], NOW)
+            .unwrap();
+        drop(h);
+        let again = History::open(&root, &KEY, ME).unwrap();
+        assert_eq!(again.author_of(&mine.id), Some(ME.person));
+        assert_eq!(again.author_of(&[1; 16]), Some(BOB.person));
+        assert_eq!(again.author_of(&[9; 16]), None);
+        assert!(again.chats.is_empty(), "no chat was loaded");
         let _ = std::fs::remove_dir_all(root);
     }
 
