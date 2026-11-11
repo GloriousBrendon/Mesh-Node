@@ -6,9 +6,11 @@
 //! damaged, moved or swapped file is refused.
 //!
 //! Appends add to the newest segment and are synced to disk before they
-//! return, once per call. A crash mid-append leaves a torn last record,
-//! which is ignored and cut off at the next append. Rewriting a segment (a
-//! delete, D3) seals it again and replaces it atomically.
+//! return, once per call. In the newest segment, the first record that is
+//! too short, has a bad length or doesn't open ends the file: a crash can
+//! leave a torn record, zeros or junk there. The next append cuts it off.
+//! Older segments stay strict: any such record is damage. Rewriting a
+//! segment (a delete, D3) seals it again and replaces it atomically.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -179,21 +181,25 @@ impl ChatFiles {
                 break;
             };
             if len < TAG_LEN {
-                return Err(StoreError::Damaged);
+                torn()?;
+                break;
             }
             let nonce: [u8; NONCE_LEN] = head[4..].try_into().expect("24 bytes");
             let position = u32::try_from(events.len()).map_err(|_| StoreError::Damaged)?;
             let aad = self.aad(n, position);
-            let event = self
-                .cipher()
-                .decrypt(
-                    &XNonce::from(nonce),
-                    Payload {
-                        msg: sealed,
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| StoreError::Damaged)?;
+            let opened = self.cipher().decrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: sealed,
+                    aad: &aad,
+                },
+            );
+            // In the newest segment, a record that doesn't open is where a
+            // crash stopped the file (zeros or junk): the end.
+            let Ok(event) = opened else {
+                torn()?;
+                break;
+            };
             events.push(event);
             at += 4 + NONCE_LEN + len;
         }
@@ -416,7 +422,10 @@ mod tests {
     fn a_damaged_or_swapped_file_is_refused() {
         let (store, dir) = store("damaged");
         let mut files = store.open(&CHAT).unwrap();
-        files.append(&events(0..SEGMENT_EVENTS as u32 + 3)).unwrap();
+        // Three segments: the strict checks are for the older ones.
+        files
+            .append(&events(0..2 * SEGMENT_EVENTS as u32 + 3))
+            .unwrap();
         // Segment 0 copied over segment 1: positions and number don't match.
         let (zero, one) = (segment_path(&dir, 0), segment_path(&dir, 1));
         let saved = fs::read(&one).unwrap();
@@ -450,6 +459,31 @@ mod tests {
             store.open(&CHAT).and_then(|mut f| f.read(1)),
             Err(StoreError::Damaged)
         ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// What some filesystems leave after a power cut: the file grew, but the
+    /// last record's bytes are zeros or junk. The newest segment ends at the
+    /// first record that doesn't open, and the next append cuts it off.
+    #[test]
+    fn a_newest_segment_ending_in_zeros_or_junk_opens() {
+        let (store, dir) = store("junk");
+        let mut files = store.open(&CHAT).unwrap();
+        files.append(&events(0..3)).unwrap();
+        let path = segment_path(&dir, 0);
+        let good = fs::read(&path).unwrap();
+        let record = good.len() / 3;
+        // A full-length record of junk: a real record's length, then noise.
+        let mut junk_record = good[..4].to_vec();
+        junk_record.extend((0..record - 4).map(|i| (i * 7 + 3) as u8));
+        for tail in [vec![0u8; 4096], junk_record] {
+            fs::write(&path, [&good[..], &tail].concat()).unwrap();
+            let mut again = store.open(&CHAT).unwrap();
+            assert_eq!(again.read(0).unwrap(), events(0..3));
+            again.append(&events(3..4)).unwrap();
+            assert_eq!(store.open(&CHAT).unwrap().read(0).unwrap(), events(0..4));
+            fs::write(&path, &good).unwrap();
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
