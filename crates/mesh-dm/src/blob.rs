@@ -154,6 +154,18 @@ impl Opener {
     }
 }
 
+fn parse_hash(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in bytes.chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Chunk `index`'s plain length in a file of `size` bytes.
 fn expected(size: u64, index: u64) -> usize {
     let start = index * CHUNK as u64;
@@ -177,6 +189,185 @@ fn aad(index: u64, size: u64) -> [u8; 16] {
     aad[..8].copy_from_slice(&index.to_be_bytes());
     aad[8..].copy_from_slice(&size.to_be_bytes());
     aad
+}
+
+/// The most kept files take on disk, together (D13).
+pub const MAX_KEPT: u64 = 10 * 1000 * 1000 * 1000;
+/// A sealed chunk's length: the plain chunk and its tag.
+const SEALED_CHUNK: u64 = CHUNK as u64 + 16;
+const META_FORMAT: u8 = 1;
+
+/// Which chats hold a kept file, and whether we sent it (D13).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Kept {
+    pub ours: bool,
+    pub chats: Vec<crate::Where>,
+}
+
+/// Files kept sealed on disk, by their hash (D13): ones sent here and ones
+/// fetched, so this device can pass them on to others in the chat.
+pub struct Blobs {
+    dir: std::path::PathBuf,
+}
+
+impl Blobs {
+    pub fn new(dir: &std::path::Path) -> Self {
+        Self {
+            dir: dir.to_owned(),
+        }
+    }
+
+    fn path(&self, hash: &[u8; 32], ext: &str) -> std::path::PathBuf {
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        self.dir.join(format!("{hex}.{ext}"))
+    }
+
+    /// Seals the file at `source` with a fresh key and keeps it as ours, for
+    /// `chat`: its key, the encrypted file's hash and the plain size.
+    pub fn add_file(
+        &self,
+        source: &std::path::Path,
+        chat: crate::Where,
+    ) -> std::io::Result<([u8; 32], [u8; 32], u64)> {
+        use std::io::{Read, Write};
+        let size = std::fs::metadata(source)?.len();
+        let mut sealer = Sealer::new(size).map_err(std::io::Error::other)?;
+        std::fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join(format!("sending-{}.tmp", std::process::id()));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let mut input = std::io::BufReader::new(std::fs::File::open(source)?);
+        let mut buffer = vec![0u8; CHUNK];
+        for index in 0..chunks(size) {
+            let len = expected(size, index);
+            input.read_exact(&mut buffer[..len])?;
+            out.write_all(
+                &sealer
+                    .chunk(&buffer[..len])
+                    .map_err(std::io::Error::other)?,
+            )?;
+        }
+        let key = sealer.key();
+        let hash = sealer.finish().map_err(std::io::Error::other)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&tmp, self.path(&hash, "blob"))?;
+        self.write_kept(&hash, true, chat)?;
+        Ok((key, hash, size))
+    }
+
+    fn write_kept(&self, hash: &[u8; 32], ours: bool, chat: crate::Where) -> std::io::Result<()> {
+        let mut kept = self.kept(hash)?.unwrap_or_default();
+        kept.ours |= ours;
+        if !kept.chats.contains(&chat) {
+            kept.chats.push(chat);
+        }
+        let mut bytes = vec![META_FORMAT];
+        bytes.extend(postcard::to_stdvec(&kept).expect("to memory"));
+        mesh_identity::write_atomically(&self.path(hash, "kept"), &bytes)
+    }
+
+    /// Keeps a file fetched from someone, chunk by chunk as they came, once
+    /// the caller has checked it whole (`Opener::finish`).
+    pub fn add_fetched(
+        &self,
+        hash: &[u8; 32],
+        chunks: &[Vec<u8>],
+        chat: crate::Where,
+    ) -> std::io::Result<()> {
+        mesh_identity::write_atomically(&self.path(hash, "blob"), &chunks.concat())?;
+        self.write_kept(hash, false, chat)
+    }
+
+    pub fn has(&self, hash: &[u8; 32]) -> bool {
+        self.path(hash, "blob").exists()
+    }
+
+    /// Sealed chunk `index` of a kept file.
+    pub fn chunk(&self, hash: &[u8; 32], index: u64) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::{Read, Seek};
+        let mut file = match std::fs::File::open(self.path(hash, "blob")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let start = index.saturating_mul(SEALED_CHUNK);
+        if start >= file.metadata()?.len() {
+            return Ok(None);
+        }
+        file.seek(std::io::SeekFrom::Start(start))?;
+        let mut chunk = Vec::with_capacity(SEALED_CHUNK as usize);
+        file.take(SEALED_CHUNK).read_to_end(&mut chunk)?;
+        Ok(Some(chunk))
+    }
+
+    /// Which chats hold a kept file, and whether it's ours.
+    pub fn kept(&self, hash: &[u8; 32]) -> std::io::Result<Option<Kept>> {
+        let bytes = match std::fs::read(self.path(hash, "kept")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        match bytes.split_first() {
+            Some((&META_FORMAT, rest)) => postcard::from_bytes(rest)
+                .map(Some)
+                .map_err(|_| std::io::Error::other("a kept file's note is damaged")),
+            _ => Err(std::io::Error::other(
+                "a kept file's note is from a newer Mesh or damaged",
+            )),
+        }
+    }
+
+    /// Marks a kept file as just opened, so it's dropped last of its kind.
+    pub fn opened(&self, hash: &[u8; 32]) -> std::io::Result<()> {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(self.path(hash, "blob"))?;
+        file.set_modified(std::time::SystemTime::now())
+    }
+
+    /// Drops a kept file (its message was deleted, D3).
+    pub fn remove(&self, hash: &[u8; 32]) -> std::io::Result<()> {
+        for ext in ["blob", "kept"] {
+            match std::fs::remove_file(self.path(hash, ext)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops kept files, oldest-opened first and ours last, until they take
+    /// at most `cap` bytes together.
+    pub fn evict(&self, cap: u64) -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut kept = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(hex) = name.to_str().and_then(|n| n.strip_suffix(".blob")) else {
+                continue;
+            };
+            let Some(hash) = parse_hash(hex) else {
+                continue;
+            };
+            let meta = entry.metadata()?;
+            let ours = self.kept(&hash)?.is_some_and(|k| k.ours);
+            kept.push((ours, meta.modified()?, meta.len(), hash));
+        }
+        let mut total: u64 = kept.iter().map(|k| k.2).sum();
+        kept.sort_by_key(|k| (k.0, k.1));
+        for (_, _, len, hash) in kept {
+            if total <= cap {
+                break;
+            }
+            self.remove(&hash)?;
+            total -= len;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +459,79 @@ mod tests {
             "the wrong key"
         );
         assert_eq!(Sealer::new(MAX_FILE + 1).err(), Some(BlobError::TooBig));
+    }
+
+    fn blobs(name: &str) -> (Blobs, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mesh-blobs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Blobs::new(&dir), dir)
+    }
+
+    const CHAT: crate::Where = crate::Where::Direct([7; 32]);
+
+    #[test]
+    fn a_sent_file_is_kept_and_served_by_chunk() {
+        let (b, dir) = blobs("sent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = file(2 * CHUNK + 5);
+        let source = dir.join("photo.jpg");
+        std::fs::write(&source, &plain).unwrap();
+        let (key, hash, size) = b.add_file(&source, CHAT).unwrap();
+        assert!(b.has(&hash) && size == plain.len() as u64);
+        let mut opener = Opener::new(key, hash, size).unwrap();
+        let mut back = Vec::new();
+        for i in 0..chunks(size) {
+            back.extend(opener.chunk(&b.chunk(&hash, i).unwrap().unwrap()).unwrap());
+        }
+        opener.finish().unwrap();
+        assert_eq!(back, plain);
+        assert_eq!(b.chunk(&hash, chunks(size)).unwrap(), None, "past the end");
+        assert_eq!(
+            b.kept(&hash).unwrap(),
+            Some(Kept {
+                ours: true,
+                chats: vec![CHAT]
+            })
+        );
+        // Nothing of the plain file is kept.
+        let raw = std::fs::read(b.path(&hash, "blob")).unwrap();
+        assert!(!raw.windows(32).any(|w| plain.windows(32).next() == Some(w)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fetched_file_is_kept_and_a_delete_drops_it() {
+        let (b, dir) = blobs("fetched");
+        let plain = file(CHUNK + 1);
+        let (_, hash, sealed) = seal(&plain);
+        b.add_fetched(&hash, &sealed, CHAT).unwrap();
+        assert_eq!(b.chunk(&hash, 1).unwrap(), Some(sealed[1].clone()));
+        assert!(!b.kept(&hash).unwrap().unwrap().ours);
+        b.remove(&hash).unwrap();
+        assert!(!b.has(&hash) && b.kept(&hash).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Past the cap, the oldest-opened go first, and files we sent last.
+    #[test]
+    fn eviction_keeps_ours_and_the_recently_opened() {
+        let (b, dir) = blobs("evict");
+        let mut hashes = Vec::new();
+        for i in 0..3u8 {
+            let (_, hash, sealed) = seal(&vec![i; 1000]);
+            b.add_fetched(&hash, &sealed, CHAT).unwrap();
+            hashes.push(hash);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("mine");
+        std::fs::write(&source, vec![9; 1000]).unwrap();
+        let (_, mine, _) = b.add_file(&source, CHAT).unwrap();
+        b.opened(&hashes[0]).unwrap();
+        // Room for two: the oldest-opened of the others go, ours stays.
+        b.evict(2 * 1016).unwrap();
+        assert!(b.has(&mine) && b.has(&hashes[0]));
+        assert!(!b.has(&hashes[1]) && !b.has(&hashes[2]));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

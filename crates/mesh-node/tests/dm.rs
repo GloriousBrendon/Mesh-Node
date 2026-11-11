@@ -314,3 +314,76 @@ fn a_group_of_three() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// A file goes by chunks from a device in the chat that has it (D12): the
+/// message carries its key, hash, size, name and type; the reader fetches
+/// it when asked. With nobody connected who has it, it's unavailable.
+#[test]
+fn a_file_goes_by_chunks() {
+    let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("file-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob");
+    all_friends(&mut [(&mut alice, &id_a), (&mut bob, &id_b)]);
+
+    let plain: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let source = dirs[1].join("trail.pdf");
+    std::fs::write(&source, &plain).unwrap();
+    let sent = ask(
+        &mut alice,
+        "dmSendFile",
+        &[&id_b, source.to_str().unwrap()],
+        "meshDmMessages",
+    );
+    let file = &sent["events"][0]["attachments"][0];
+    assert_eq!(
+        (
+            file["name"].as_str(),
+            file["mime"].as_str(),
+            file["size"].as_u64()
+        ),
+        (Some("trail.pdf"), Some("application/pdf"), Some(300_000))
+    );
+    let event = sent["events"][0]["id"].as_str().unwrap().to_owned();
+
+    let told = until(&mut bob, "meshDmNotify", |_| true);
+    assert_eq!(told["text"], "trail.pdf");
+    let got = ask(&mut bob, "dmFetch", &[&id_a, &event, "0"], "meshDmFile");
+    let path = got["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), plain, "the same bytes");
+
+    // A second file, then Alice goes: nobody connected has it.
+    let other = dirs[1].join("notes.txt");
+    std::fs::write(&other, b"only on alice").unwrap();
+    // Pages also come by themselves ("sent" changing): wait for this one.
+    alice.send("dmSendFile", &[&id_b, other.to_str().unwrap()]);
+    let has_notes = |m: &Value| {
+        let events = m["events"].as_array().unwrap();
+        events
+            .iter()
+            .any(|e| e["attachments"][0]["name"] == "notes.txt")
+    };
+    let sent = until(&mut alice, "meshDmMessages", has_notes);
+    let events = sent["events"].as_array().unwrap();
+    let second = events
+        .iter()
+        .find(|e| e["attachments"][0]["name"] == "notes.txt")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "notes.txt");
+    let stderr = alice.quit();
+    let err = ask(&mut bob, "dmFetch", &[&id_a, &second, "0"], "meshError");
+    assert_eq!(err["kind"], "unavailable", "{err}");
+
+    let stderr = stderr + &bob.quit();
+    assert!(!stderr.contains("trail.pdf") && !stderr.contains("notes.txt"));
+    seed.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

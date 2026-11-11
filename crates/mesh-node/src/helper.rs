@@ -52,6 +52,8 @@ use zeroize::Zeroize;
 
 #[path = "dm.rs"]
 mod dm;
+#[path = "files.rs"]
+mod files;
 #[path = "link.rs"]
 mod link;
 #[path = "social.rs"]
@@ -358,6 +360,11 @@ enum Back {
     DmAnswered(Box<Answered>),
     /// A typing signal: whose, which device, the frame (D10).
     Typing(Box<(MeshId, [u8; 32], Vec<u8>)>),
+    /// Someone asks for a kept file's chunks: whose, the file's hash, and
+    /// where to say whether they may (D12).
+    BlobAsk(Box<(MeshId, [u8; 32], tokio::sync::oneshot::Sender<bool>)>),
+    /// A file came, or didn't: where it's wanted for (D12).
+    Fetched(Box<files::Fetched>),
     /// A device didn't take these envelopes: they wait for it.
     Unsent(Box<([u8; 32], Vec<Vec<u8>>)>),
     /// A contact answered through this address.
@@ -893,6 +900,12 @@ impl Helper {
                 let (id, from, frames, reply) = *got;
                 return self.envelopes(id, from, frames, reply);
             }
+            Back::BlobAsk(got) => {
+                let (id, hash, answer) = *got;
+                let _ = answer.send(self.may_fetch(&id, &hash));
+                return;
+            }
+            Back::Fetched(got) => return self.fetched(*got),
             Back::Typing(got) => {
                 let (id, device, frame) = *got;
                 return self.typing_heard(id, device, frame);
@@ -1451,6 +1464,7 @@ impl Helper {
                 PRESENCE.to_owned(),
                 e2ee::SERVICE.to_owned(),
                 dm::TYPING.to_owned(),
+                files::BLOB.to_owned(),
             ],
             ..Config::default()
         };
@@ -1475,7 +1489,9 @@ impl Helper {
                 ));
                 let peers = tokio::spawn(watch_peers(node.clone(), self.back.clone()));
                 let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
-                let streams = tokio::spawn(serve_streams(node.clone(), own, self.back.clone()));
+                let blobs = self.blobs_dir();
+                let streams =
+                    tokio::spawn(serve_streams(node.clone(), own, blobs, self.back.clone()));
                 self.net = Some(Net {
                     node,
                     anon: Arc::new(anon),
@@ -1771,8 +1787,11 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 async fn serve_streams(
     node: Arc<Node>,
     own: MeshId,
+    blobs: PathBuf,
     back: tokio::sync::mpsc::UnboundedSender<Back>,
 ) {
+    // `blob` streams open per device (files::MAX_BLOB_STREAMS).
+    let blob_streams = Arc::new(std::sync::Mutex::new(HashMap::new()));
     while let Some(mut stream) = node.next_stream().await {
         let back = back.clone();
         if stream.service == PRESENCE && stream.peer.id != own {
@@ -1796,6 +1815,11 @@ async fn serve_streams(
                     }
                 }
             });
+            continue;
+        }
+        if stream.service == files::BLOB {
+            let (dir, open) = (blobs.clone(), blob_streams.clone());
+            tokio::spawn(files::serve_blob(stream, dir, back, open));
             continue;
         }
         if stream.service == dm::TYPING {

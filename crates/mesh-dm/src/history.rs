@@ -141,6 +141,7 @@ pub struct Shown {
     pub text: String,
     pub edited: bool,
     pub reply_to: Option<EventId>,
+    pub attachments: Vec<crate::event::Attachment>,
     /// Each emoji and who reacted with it.
     pub reactions: Vec<(String, Vec<Person>)>,
     /// Arrived at or below the read marker: unread (D2).
@@ -905,6 +906,23 @@ impl History {
         Ok(self.chat(at, now)?.group(id))
     }
 
+    /// A stored event, read back from its segment; `None` if it isn't here
+    /// or was wiped.
+    pub fn event(&mut self, id: &EventId) -> Result<Option<Event>, HistoryError> {
+        let Some((chat, segment, position)) = self.log.number_of(id).and_then(|n| self.place(n))
+        else {
+            return Ok(None);
+        };
+        let records = match self.chats.get_mut(&chat) {
+            Some(open) => open.files.read(segment)?,
+            None => self.store.open(&chat)?.read(segment)?,
+        };
+        let Some(record) = records.get(position as usize) else {
+            return Ok(None);
+        };
+        Ok(decode(record)?.map(|(_, _, event)| event))
+    }
+
     /// Who wrote a stored event, from its log entry: no chat is loaded.
     pub fn author_of(&self, id: &EventId) -> Option<Person> {
         Some(self.log.get(self.log.number_of(id)?)?.author)
@@ -954,6 +972,7 @@ impl History {
                         text: m.text.to_owned(),
                         edited: m.edited,
                         reply_to: m.reply_to,
+                        attachments: m.attachments.to_vec(),
                         reactions: (m.reactions.iter())
                             .map(|(e, who)| (e.to_string(), who.clone()))
                             .collect(),
@@ -2003,6 +2022,19 @@ mod tests {
         let taken = d.history.receive(&group, b.me, vec![forged], NOW).unwrap();
         assert_eq!(taken, [Taken::Refused(Refusal::BadSignature)]);
         assert!(d.version(&group).unwrap().members.contains(&d.me.person));
+    }
+
+    /// One stored event read back by its ID, with no chat loaded.
+    #[test]
+    fn an_event_is_read_back_by_id() {
+        let root = dir("event-back");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let said = h.send(&CHAT, text("find me"), NOW).unwrap();
+        drop(h);
+        let mut again = History::open(&root, &KEY, ME).unwrap();
+        assert_eq!(again.event(&said.id).unwrap(), Some(said));
+        assert_eq!(again.event(&[9; 16]).unwrap(), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// An event's author comes from the log, with no chat loaded.

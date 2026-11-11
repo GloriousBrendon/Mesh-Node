@@ -41,7 +41,7 @@ pub(super) fn direct_chat(peer: &MeshId) -> Where {
 }
 
 /// A chat as Mesh-Voice names it: a friend's ID, or a group's 32 hex.
-fn chat_text(at: &Where) -> String {
+pub(super) fn chat_text(at: &Where) -> String {
     match at {
         Where::Direct(p) => MeshId::from_bytes(p)
             .map(|p| p.to_string())
@@ -151,7 +151,7 @@ impl Helper {
 
     /// The people a chat's events go to, besides our own devices: the
     /// friend of a 1:1, the members of a group's version we hold.
-    fn dm_recipients(&self, at: &Where) -> Vec<MeshId> {
+    pub(super) fn dm_recipients(&self, at: &Where) -> Vec<MeshId> {
         let me = self.store.as_ref().map(Keystore::id);
         let people = match at {
             Where::Direct(p) => vec![*p],
@@ -273,18 +273,25 @@ impl Helper {
             }
         }
         for (at, frames, events) in runs {
-            let Some(history) = &mut self.dm else {
+            if self.dm.is_none() {
                 for i in frames {
                     answers[i] = FAILED;
                 }
                 continue;
-            };
+            }
+            // A file's message shows by its name when it has no text.
             let texts: Vec<Option<String>> = (events.iter())
                 .map(|e| match &e.body {
+                    Body::Text {
+                        text, attachments, ..
+                    } if text.is_empty() => attachments.first().map(|a| a.name.clone()),
                     Body::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .collect();
+            // A delete drops the files it takes with it (D13).
+            let dropped = self.files_of_deleted(&events);
+            let history = self.dm.as_mut().expect("checked above");
             match history.receive(&at, from, events, unix_now() * 1000) {
                 Ok(taken) => {
                     // Not known as a member yet: the sender keeps it (D7).
@@ -304,6 +311,11 @@ impl Helper {
                         .filter(|(t, _)| **t == Taken::Shown)
                         .filter_map(|(_, text)| text)
                         .collect();
+                    for (hash, t) in dropped.iter().zip(&taken) {
+                        if let (Some(hash), Taken::Shown) = (hash, t) {
+                            self.drop_file(hash);
+                        }
+                    }
                     self.dm_changed(&at, id, new);
                 }
                 Err(e) => {
@@ -318,7 +330,7 @@ impl Helper {
 
     /// A chat named by Mesh-Voice: a friend's ID (they must be a friend), or
     /// a group's hex ID (it must be listed).
-    fn dm_chat(&mut self, text: &str) -> Result<Where, Fail> {
+    pub(super) fn dm_chat(&mut self, text: &str) -> Result<Where, Fail> {
         if let Some(id) = e2ee::parse_conversation(text) {
             let at = Where::Group(id);
             let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
@@ -360,12 +372,23 @@ impl Helper {
                     })
                     .collect();
                 let sent = m.author == me && history.is_sent(&m.id);
+                let attachments: Vec<Value> = (m.attachments.iter())
+                    .map(|a| {
+                        json!({
+                            "name": a.name,
+                            "mime": a.mime,
+                            "size": a.size,
+                            "preview": a.preview.as_ref().map(|p| e2ee::hex(p)),
+                        })
+                    })
+                    .collect();
                 json!({
                     "id": e2ee::hex(&m.id),
                     "from": person_text(&m.author),
                     "text": m.text,
                     "edited": m.edited,
                     "replyTo": m.reply_to.map(|r| e2ee::hex(&r)),
+                    "attachments": attachments,
                     "reactions": reactions,
                     "late": m.late,
                     "time": m.time,
@@ -470,7 +493,7 @@ impl Helper {
     }
 
     /// Stores and sends one of our events, then answers with the chat's page.
-    fn dm_send_body(&mut self, at: &Where, body: Body) -> Result<(), Fail> {
+    pub(super) fn dm_send_body(&mut self, at: &Where, body: Body) -> Result<(), Fail> {
         self.dm_store_and_send(at, body)?;
         self.emit_page(at, None)
     }
@@ -563,8 +586,22 @@ impl Helper {
             "dmDelete" => {
                 let everyone = arg(1)? == "true";
                 let (at, target) = self.dm_event(arg(0)?, everyone)?;
-                self.dm_send_body(&at, Body::Delete { target, everyone })
+                let body = Body::Delete { target, everyone };
+                let dropped = self.files_of_deleted(std::slice::from_ref(&Event {
+                    version: mesh_dm::event::VERSION,
+                    id: [0; 16],
+                    time: 0,
+                    seq: 0,
+                    n: 0,
+                    body: body.clone(),
+                }));
+                self.dm_send_body(&at, body)?;
+                for hash in dropped.into_iter().flatten() {
+                    self.drop_file(&hash);
+                }
+                Ok(())
             }
+            "dmSendFile" | "dmFetch" => self.files_command(func, args),
             "dmReact" => {
                 let (at, target) = self.dm_event(arg(0)?, false)?;
                 let body = Body::React {
