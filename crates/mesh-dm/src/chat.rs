@@ -447,10 +447,10 @@ impl Chat {
             .collect()
     }
 
-    /// A group chat's members and name; `None` for a 1:1 chat, or before
-    /// the creation has arrived.
-    pub fn group(&self) -> Option<Version> {
-        self.group.version()
+    /// Group `id`'s members and name; `None` for a 1:1 chat, or before its
+    /// creation has arrived.
+    pub fn group(&self, id: &[u8; 16]) -> Option<Version> {
+        self.group.version(id)
     }
 
     /// Puts back an event read from disk. No checks: it passed them when it
@@ -902,12 +902,14 @@ mod tests {
     fn group_changes_in_the_chat() {
         use crate::event::{Change, GroupChange};
         let mut chat = Chat::new(ME);
-        assert_eq!(chat.group(), None);
+        let id = crate::group_id(&ALICE.person, &[3; 16]);
+        assert_eq!(chat.group(&id), None);
         let create = Body::Group(GroupChange {
             after: None,
             change: Change::Create {
                 name: "hike".into(),
                 members: vec![ME, BOB.person],
+                nonce: [3; 16],
             },
         });
         let rename = Body::Group(GroupChange {
@@ -917,7 +919,7 @@ mod tests {
         // The rename comes first and waits for the creation.
         chat.take(BOB, body(2, 20, rename), NOW);
         chat.take(ALICE, body(1, 10, create), NOW);
-        let group = chat.group().unwrap();
+        let group = chat.group(&id).unwrap();
         assert_eq!(
             (group.creator, group.name.as_str(), group.members.len()),
             (ALICE.person, "trip", 3)

@@ -33,6 +33,14 @@ impl Where {
     }
 }
 
+/// A group DM's ID: a hash of its creator and the random value its
+/// creation carries (dm D7, e2ee D10), so nobody else can make a creation
+/// that counts for it.
+pub fn group_id(creator: &Person, nonce: &[u8; 16]) -> [u8; 16] {
+    let key = blake3::derive_key("mesh/v1/dm-group", &[&creator[..], nonce].concat());
+    key[..16].try_into().expect("16 bytes")
+}
+
 /// A person: their Mesh ID's 32 bytes.
 pub type Person = [u8; 32];
 /// One of a person's devices: its device key's 32 bytes.

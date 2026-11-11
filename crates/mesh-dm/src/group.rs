@@ -8,9 +8,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::Person;
 use crate::chat::Position;
 use crate::event::{Change, EventId, GroupChange, MAX_MEMBERS};
+use crate::{Person, group_id};
 
 /// Who's in the group and what it's called.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -18,6 +18,8 @@ pub struct Version {
     pub creator: Person,
     pub members: BTreeSet<Person>,
     pub name: String,
+    /// The newest change on the winning line: what a new one follows.
+    pub head: EventId,
 }
 
 struct Node {
@@ -43,20 +45,37 @@ impl Group {
         });
     }
 
-    /// The group as its winning line of changes leaves it; `None` before
-    /// its creation has arrived.
-    pub fn version(&self) -> Option<Version> {
-        // Two creations under one ID: the first in the chat's order.
-        let (root, node) = (self.changes.iter())
-            .filter(|(_, n)| n.after.is_none() && matches!(n.change, Change::Create { .. }))
-            .min_by_key(|(_, n)| n.at)?;
-        let Change::Create { name, members } = &node.change else {
+    /// Every change held, to save with the chat (they're few): ID, sender,
+    /// the change, and where it sits.
+    pub fn changes(&self) -> Vec<(EventId, Person, GroupChange, Position)> {
+        let changes = self.changes.iter().map(|(id, n)| {
+            let change = GroupChange {
+                after: n.after,
+                change: n.change.clone(),
+            };
+            (*id, n.by, change, n.at)
+        });
+        changes.collect()
+    }
+
+    /// The group `id` as its winning line of changes leaves it; `None`
+    /// before its creation has arrived. A creation counts only if its
+    /// sender and nonce hash to `id`: nobody else can replace the creator.
+    pub fn version(&self, id: &[u8; 16]) -> Option<Version> {
+        let creates = self.changes.iter().filter(|(_, n)| {
+            n.after.is_none()
+                && matches!(&n.change, Change::Create { nonce, .. } if group_id(&n.by, nonce) == *id)
+        });
+        // The creator's two creations under one ID: the first in the chat's order.
+        let (root, node) = creates.min_by_key(|(_, n)| n.at)?;
+        let Change::Create { name, members, .. } = &node.change else {
             unreachable!("filtered above")
         };
         let mut start = Version {
             creator: node.by,
             members: BTreeSet::from([node.by]),
             name: name.clone(),
+            head: *root,
         };
         start.members.extend(members.iter().take(MAX_MEMBERS - 1));
         let mut children: HashMap<EventId, Vec<EventId>> = HashMap::new();
@@ -107,7 +126,9 @@ impl Group {
         while let Some(next) = best[&at].0 {
             at = next;
         }
-        versions.remove(&at)
+        let mut version = versions.remove(&at)?;
+        version.head = at;
+        Some(version)
     }
 }
 
@@ -156,7 +177,14 @@ mod tests {
             };
             g.add([id; 16], by, change, (seq, [id; 16]));
         }
-        g.version()
+        g.version(&id())
+    }
+
+    const NONCE: [u8; 16] = [7; 16];
+
+    /// The test group's ID: C made it.
+    fn id() -> [u8; 16] {
+        group_id(&C, &NONCE)
     }
 
     fn create() -> Step {
@@ -168,6 +196,7 @@ mod tests {
             Change::Create {
                 name: "hike".into(),
                 members,
+                nonce: NONCE,
             },
             1,
         )
@@ -277,6 +306,50 @@ mod tests {
             (6, B, Some(1), Change::Rename("six".into()), 3),
         ]);
         assert_eq!(v.name, "six");
+    }
+
+    /// A member with a new device sends a second creation that sorts
+    /// first (a lower seq, which is the sender's choice). The creator stays.
+    #[test]
+    fn a_second_creation_cant_replace_the_creator() {
+        let takeover = Change::Create {
+            name: "mine".into(),
+            members: vec![B],
+            nonce: NONCE,
+        };
+        let v = group(&[create(), (0, A, None, takeover, 0)]).unwrap();
+        assert_eq!((v.creator, v.name.as_str()), (C, "hike"));
+        // Even with a nonce that would make A the creator of some other group.
+        let theirs = Change::Create {
+            name: "mine".into(),
+            members: vec![B],
+            nonce: [9; 16],
+        };
+        let takeover = (0, A, None, theirs, 0);
+        let v = group(&[create(), takeover]).unwrap();
+        assert_eq!((v.creator, v.name.as_str()), (C, "hike"));
+    }
+
+    /// The head is the newest change on the winning line: what the next
+    /// change names as `after`. And the changes can be saved and loaded.
+    #[test]
+    fn the_head_and_saving_the_changes() {
+        let steps = [create(), (2, A, Some(1), Change::Rename("x".into()), 2)];
+        assert_eq!(group(&steps).unwrap().head, [2; 16]);
+        assert_eq!(group(&steps[..1]).unwrap().head, [1; 16]);
+        let mut g = Group::default();
+        for (i, by, after, change, seq) in steps.iter().cloned() {
+            let change = GroupChange {
+                after: after.map(|a| [a; 16]),
+                change,
+            };
+            g.add([i; 16], by, change, (seq, [i; 16]));
+        }
+        let mut back = Group::default();
+        for (id, by, change, at) in g.changes() {
+            back.add(id, by, change, at);
+        }
+        assert_eq!(back.version(&id()), g.version(&id()));
     }
 
     #[test]

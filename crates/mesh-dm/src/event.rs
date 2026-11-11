@@ -90,7 +90,12 @@ pub struct GroupChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
-    Create { name: String, members: Vec<Person> },
+    /// `nonce` with the creator's ID hashes to the group's ID (`group_id`).
+    Create {
+        name: String,
+        members: Vec<Person>,
+        nonce: [u8; 16],
+    },
     Add(Person),
     Remove(Person),
     Leave,
@@ -183,7 +188,7 @@ impl Event {
                 }
             }
             Body::Group(GroupChange { change, .. }) => match change {
-                Change::Create { name, members } => {
+                Change::Create { name, members, .. } => {
                     long(name, MAX_GROUP_NAME, "group name")?;
                     if members.len() > MAX_MEMBERS {
                         return Err(EventError::TooMany("members"));
@@ -252,6 +257,7 @@ mod tests {
                 change: Change::Create {
                     name: "hike".into(),
                     members: vec![[4; 32], [5; 32]],
+                    nonce: [6; 16],
                 },
             }),
             Body::Group(GroupChange {
@@ -302,6 +308,7 @@ mod tests {
             change: Change::Create {
                 name: "all".into(),
                 members: vec![[1; 32]; MAX_MEMBERS + 1],
+                nonce: [0; 16],
             },
         }));
         assert_eq!(crowd.to_bytes(), Err(EventError::TooMany("members")));
