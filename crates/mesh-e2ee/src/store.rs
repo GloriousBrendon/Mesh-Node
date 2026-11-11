@@ -223,7 +223,7 @@ mod tests {
     fn a_batch_for_one_device() {
         let (mut alice, mut bob) = (Stored::new(), Stored::new());
         friends(&mut alice, &mut bob);
-        let (bob_id, device) = (bob.id(), bob.who.device.public());
+        let (bob_id, device) = (bob.id(), bob.who.device.public().to_bytes());
         let bodies: Vec<Vec<u8>> = (0..3).map(|i| vec![i; 10]).collect();
         alice.e2ee.saves = 0;
         let sealed = alice
@@ -235,7 +235,7 @@ mod tests {
             let mut got = bob.e2ee.decrypt(envelope, NOW).unwrap();
             assert_eq!(&got.opened.pop().unwrap().body, body);
         }
-        let stranger = Stored::new().who.device.public();
+        let stranger = Stored::new().who.device.public().to_bytes();
         let none = alice
             .e2ee
             .encrypt_device_batch(&bob_id, &stranger, Kind::Message, &bodies);

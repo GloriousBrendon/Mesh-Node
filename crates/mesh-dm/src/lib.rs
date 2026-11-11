@@ -12,6 +12,12 @@ pub mod history;
 pub mod store;
 pub mod sync;
 
+/// Where a 1:1 chat with `peer` (their ID's bytes) is kept on our devices.
+pub fn direct_chat(peer: &Person) -> store::Conversation {
+    let key = blake3::derive_key("mesh/v1/dm-chat", peer);
+    key[..16].try_into().expect("16 bytes")
+}
+
 /// A person: their Mesh ID's 32 bytes.
 pub type Person = [u8; 32];
 /// One of a person's devices: its device key's 32 bytes.

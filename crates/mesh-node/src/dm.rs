@@ -1,0 +1,353 @@
+//! The helper's side of `dm` delivery (SPEC-dm D5; PLAN-dm Task 9). Events
+//! wait in the sealed history, not as envelopes. When a friend's device is
+//! connected, or a fresh session arrives from it, the helper reads what that
+//! device hasn't acknowledged, encrypts it for that device alone and sends
+//! it on the `e2ee` service with the "answer" flag. The reader opens and
+//! stores the events, then answers each frame `ok` or `failed`; the
+//! counters move past what's `ok`. A child of `helper`, so it works on the
+//! same `Helper`. 1:1 chats only for now: groups and own-device sync come
+//! with Tasks 10 and 11.
+
+use super::*;
+use mesh_dm::Sender as DmSender;
+use mesh_dm::chat::Taken;
+use mesh_dm::event::Event;
+use mesh_dm::history::History;
+use mesh_dm::store::Conversation as Chat;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+/// The frame flag asking the reader to answer each frame once it's stored.
+pub(super) const ANSWER: u8 = 2;
+/// The answer for a frame that was opened and stored, or refused for good.
+const OK: u8 = 0;
+/// The answer for a frame that couldn't be opened or stored: send it again.
+const FAILED: u8 = 1;
+/// Where a 1:1 chat with `peer` is kept on our devices.
+pub(super) fn direct_chat(peer: &MeshId) -> Chat {
+    mesh_dm::direct_chat(&peer.to_bytes())
+}
+
+/// Writes the frames, finishes, and reads the reader's answers: one byte
+/// per frame, `true` for `ok`. `None` if it didn't answer in time.
+pub(super) async fn exchange(
+    mut send: impl AsyncWrite + Unpin,
+    mut recv: impl AsyncRead + Unpin,
+    frames: &[Vec<u8>],
+) -> Option<Vec<bool>> {
+    let sent = async {
+        for frame in frames {
+            mesh_transport::frame::write_frame(&mut send, frame)
+                .await
+                .ok()?;
+        }
+        send.shutdown().await.ok()?;
+        mesh_transport::frame::read_frame(&mut recv).await.ok()?
+    };
+    let answers = tokio::time::timeout(e2ee::SEND_TIMEOUT, sent)
+        .await
+        .ok()??;
+    (answers.len() == frames.len()).then(|| answers.iter().map(|&a| a == OK).collect())
+}
+
+/// The reader's side: one frame of answers, then the end of the stream.
+pub(super) async fn answer(mut send: impl AsyncWrite + Unpin, answers: &[u8]) {
+    let _ = mesh_transport::frame::write_frame(&mut send, answers).await;
+    let _ = send.shutdown().await;
+}
+
+impl Helper {
+    /// Opens this device's history, as networking starts.
+    pub(super) fn open_dm(&mut self) {
+        let Some(store) = &self.store else { return };
+        let data = self.path.parent().unwrap_or(Path::new("."));
+        let me = DmSender {
+            person: store.id().to_bytes(),
+            device: store.device_key().public().to_bytes(),
+        };
+        self.dm = History::open(&data.join("dm"), store.data_key(), me)
+            .inspect_err(|e| eprintln!("mesh-node: the chat history didn't open: {e}"))
+            .ok();
+    }
+
+    /// Sends each of `id`'s connected devices what it hasn't acknowledged.
+    pub(super) fn dm_deliver(&mut self, id: &MeshId) {
+        let Some(net) = &self.net else { return };
+        for addr in net.node.connected(id) {
+            self.dm_deliver_to(id, addr);
+        }
+    }
+
+    /// One device's next batch, if none is in flight to it.
+    fn dm_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
+        let device = *addr.device.as_bytes();
+        let (Some(history), Some(e2ee), Some(net)) = (&mut self.dm, &mut self.e2ee, &self.net)
+        else {
+            return;
+        };
+        if self.dm_flight.contains(&device) {
+            return;
+        }
+        history.add_device(device, id.to_bytes());
+        let shares = |chat: &Chat, person: &[u8; 32]| {
+            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p))
+        };
+        let mut out = match history.outgoing(&device, shares, unix_now() * 1000) {
+            Ok(out) => out,
+            Err(e) => return eprintln!("mesh-node: couldn't read the chat history: {e}"),
+        };
+        out.truncate(e2ee::MAX_FRAMES);
+        if out.is_empty() {
+            return;
+        }
+        let bodies: Vec<Vec<u8>> = out.iter().filter_map(|t| t.event.to_bytes().ok()).collect();
+        if bodies.len() != out.len() {
+            return eprintln!("mesh-node: a stored message didn't encode");
+        }
+        let sealed = e2ee.encrypt_device_batch(id, &device, NoteKind::Message, &bodies);
+        let envelopes = match sealed {
+            Ok(envelopes) => envelopes,
+            Err(e) => return eprintln!("mesh-node: couldn't encrypt for a device: {e}"),
+        };
+        let numbers: Vec<u64> = out.iter().map(|t| t.number).collect();
+        self.dm_flight.insert(device);
+        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        tokio::spawn(async move {
+            let frames: Vec<Vec<u8>> = envelopes
+                .iter()
+                .map(|e| [&[ANSWER][..], e].concat())
+                .collect();
+            let answers = match node.open(&addr, e2ee::SERVICE).await {
+                Ok((_, send, recv)) => exchange(send, recv, &frames).await,
+                Err(_) => None,
+            };
+            let _ = back.send(Back::DmAnswered(Box::new((id, addr, numbers, answers))));
+        });
+    }
+
+    /// A device answered a batch (or didn't): move its counter, and send
+    /// the next batch if it took this one.
+    pub(super) fn dm_answered(
+        &mut self,
+        id: MeshId,
+        addr: MeshAddr,
+        numbers: Vec<u64>,
+        answers: Option<Vec<bool>>,
+    ) {
+        let device = *addr.device.as_bytes();
+        self.dm_flight.remove(&device);
+        let Some(history) = &mut self.dm else { return };
+        let Some(answers) = answers else { return };
+        let shares = |chat: &Chat, person: &[u8; 32]| {
+            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p))
+        };
+        for (number, ok) in numbers.iter().zip(&answers) {
+            history.acked(&device, *number, *ok, shares);
+        }
+        if let Err(e) = history.save_counters() {
+            eprintln!("mesh-node: couldn't save the delivery counters: {e}");
+        }
+        if answers.iter().all(|ok| *ok) {
+            self.dm_deliver_to(&id, addr);
+        }
+    }
+
+    /// Takes in the dm events of one stream from `id`'s device: stores them
+    /// with one sync per chat, and gives each frame's answer.
+    pub(super) fn dm_take(
+        &mut self,
+        id: &MeshId,
+        device: &[u8; 32],
+        events: Vec<(usize, Event)>,
+        answers: &mut [u8],
+    ) {
+        let Some(history) = &mut self.dm else {
+            for (i, _) in events {
+                answers[i] = FAILED;
+            }
+            return;
+        };
+        let from = DmSender {
+            person: id.to_bytes(),
+            device: *device,
+        };
+        let chat = direct_chat(id);
+        let (frames, events): (Vec<usize>, Vec<Event>) = events.into_iter().unzip();
+        match history.receive(&chat, from, events, unix_now() * 1000) {
+            Ok(taken) => {
+                let refused = taken
+                    .iter()
+                    .filter(|t| matches!(t, Taken::Refused(_)))
+                    .count();
+                if refused > 0 {
+                    eprintln!("mesh-node: {refused} chat events refused");
+                }
+            }
+            Err(e) => {
+                eprintln!("mesh-node: couldn't store chat events: {e}");
+                for i in frames {
+                    answers[i] = FAILED;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_dm::event::{Body, VERSION};
+
+    /// The ack logic over a stream: answers line up with frames, a short or
+    /// missing answer is no answer.
+    #[tokio::test]
+    async fn frames_and_answers() {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (recv, send) = tokio::io::split(ours);
+        let frames = vec![vec![ANSWER, 1], vec![ANSWER, 2], vec![ANSWER, 3]];
+        let reader = async move {
+            let (mut r, w) = tokio::io::split(theirs);
+            let got = e2ee::read(&mut r).await;
+            assert_eq!(got.len(), 3);
+            assert!(got.iter().all(|(flags, _)| flags & ANSWER != 0));
+            answer(w, &[OK, FAILED, OK]).await;
+        };
+        let (answers, ()) = tokio::join!(exchange(send, recv, &frames), reader);
+        assert_eq!(answers, Some(vec![true, false, true]));
+
+        // Two answers for three frames: not trusted.
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (recv, send) = tokio::io::split(ours);
+        let reader = async move {
+            let (mut r, w) = tokio::io::split(theirs);
+            e2ee::read(&mut r).await;
+            answer(w, &[OK, OK]).await;
+        };
+        let (answers, ()) = tokio::join!(exchange(send, recv, &frames), reader);
+        assert_eq!(answers, None);
+    }
+
+    #[test]
+    fn each_peer_has_its_own_chat() {
+        let (a, b) = (
+            RootKey::generate().unwrap().id(),
+            RootKey::generate().unwrap().id(),
+        );
+        assert_ne!(direct_chat(&a), direct_chat(&b));
+        assert_eq!(direct_chat(&a), direct_chat(&a));
+    }
+
+    /// PLAN-dm Task 9b, criterion 4: one device takes in 10,000 events from
+    /// another, on disk, through e2ee, the frames and the acks. The network
+    /// itself isn't in it: 10,000 small frames are about 3 MB.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "a measurement: cargo test --release -p mesh-node intake -- --ignored --nocapture"]
+    async fn intake_of_ten_thousand_events() {
+        use mesh_e2ee::E2ee;
+        use mesh_identity::{DeviceCert, DeviceKey, DeviceList};
+        const EVENTS: usize = 10_000;
+        const KEY: [u8; 32] = [5; 32];
+        let now = unix_now();
+        let person = |name: &str| {
+            let root = RootKey::generate().unwrap();
+            let device = DeviceKey::generate().unwrap();
+            let cert = DeviceCert::issue(&root, &device.public(), name, now).unwrap();
+            let devices = DeviceList::first(&root, cert).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("mesh-intake-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let e2ee = E2ee::open(&dir, &KEY, &root, &device, &devices, now).unwrap();
+            let me = DmSender {
+                person: root.id().to_bytes(),
+                device: device.public().to_bytes(),
+            };
+            let history = History::open(&dir.join("dm"), &KEY, me).unwrap();
+            (root, device, devices, e2ee, history, dir)
+        };
+        let (a_root, a_device, a_devices, mut a_e2ee, mut a_history, a_dir) = person("alice");
+        let (b_root, b_device, b_devices, mut b_e2ee, mut b_history, b_dir) = person("bob");
+        let (alice, bob) = (a_root.id(), b_root.id());
+        let field = b_e2ee.record_field(&alice, now).unwrap();
+        a_e2ee
+            .learn(&bob, &b_devices, &b_device.public(), &field)
+            .unwrap();
+        let field = a_e2ee.record_field(&bob, now).unwrap();
+        b_e2ee
+            .learn(&alice, &a_devices, &a_device.public(), &field)
+            .unwrap();
+
+        let chat = direct_chat(&bob);
+        let ms = now * 1000;
+        let text = |i: usize| Body::Text {
+            text: format!("message {i}: about the length of a short chat line"),
+            reply_to: None,
+            attachments: vec![],
+        };
+        let started = std::time::Instant::now();
+        for i in 0..EVENTS {
+            a_history.send(&chat, text(i), ms).unwrap();
+        }
+        let stored = started.elapsed();
+
+        let device = b_device.public().to_bytes();
+        a_history.add_device(device, bob.to_bytes());
+        let shares =
+            |c: &Chat, p: &[u8; 32]| MeshId::from_bytes(p).is_ok_and(|p| *c == direct_chat(&p));
+        let started = std::time::Instant::now();
+        let mut intake = std::time::Duration::ZERO;
+        let mut taken = 0;
+        loop {
+            let mut out = a_history.outgoing(&device, shares, ms).unwrap();
+            out.truncate(e2ee::MAX_FRAMES);
+            if out.is_empty() {
+                break;
+            }
+            let bodies: Vec<Vec<u8>> = out.iter().map(|t| t.event.to_bytes().unwrap()).collect();
+            let sealed = a_e2ee
+                .encrypt_device_batch(&bob, &device, NoteKind::Message, &bodies)
+                .unwrap();
+            let frames: Vec<Vec<u8>> = sealed.iter().map(|e| [&[ANSWER][..], e].concat()).collect();
+            let (ours, theirs) = tokio::io::duplex(1 << 20);
+            let (recv, send) = tokio::io::split(ours);
+            let reader = async {
+                let (mut r, w) = tokio::io::split(theirs);
+                let got = e2ee::read(&mut r).await;
+                let begun = std::time::Instant::now();
+                let envelopes: Vec<Vec<u8>> = got.into_iter().map(|(_, e)| e).collect();
+                let opened = b_e2ee.decrypt_batch(&envelopes, now).unwrap();
+                let events: Vec<Event> = opened
+                    .into_iter()
+                    .map(|r| Event::from_bytes(&r.unwrap().opened[0].body).unwrap())
+                    .collect();
+                let from = DmSender {
+                    person: alice.to_bytes(),
+                    device: a_device.public().to_bytes(),
+                };
+                let kept = b_history
+                    .receive(&direct_chat(&alice), from, events, ms)
+                    .unwrap();
+                taken += kept.iter().filter(|t| **t == Taken::Shown).count();
+                intake += begun.elapsed();
+                answer(w, &vec![OK; envelopes.len()]).await;
+            };
+            let (answers, ()) = tokio::join!(exchange(send, recv, &frames), reader);
+            for (t, ok) in out.iter().zip(answers.unwrap()) {
+                a_history.acked(&device, t.number, ok, shares);
+            }
+            a_history.save_counters().unwrap();
+        }
+        let total = started.elapsed();
+        assert_eq!(taken, EVENTS);
+        println!(
+            "intake of {EVENTS} events: {:.2} s in all (sender's reads, encryption, frames, acks), \
+             {:.2} s of it the reader opening and storing; storing them on the sender took {:.2} s",
+            total.as_secs_f64(),
+            intake.as_secs_f64(),
+            stored.as_secs_f64()
+        );
+        assert!(total.as_secs() < 30, "criterion 4: under 30 s");
+        let _ = (VERSION, a_dir.clone(), b_dir.clone());
+        for dir in [a_dir, b_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}

@@ -50,6 +50,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
+#[path = "dm.rs"]
+mod dm;
 #[path = "link.rs"]
 mod link;
 #[path = "social.rs"]
@@ -284,6 +286,10 @@ struct Helper {
     /// Envelopes for devices we couldn't reach, until they connect. In memory
     /// only: locking drops them (`mailbox` keeps them later).
     waiting: HashMap<[u8; 32], Vec<Vec<u8>>>,
+    /// This device's chat history, while unlocked (SPEC-dm).
+    dm: Option<mesh_dm::history::History>,
+    /// Devices a batch of chat events is on its way to.
+    dm_flight: HashSet<[u8; 32]>,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -307,6 +313,18 @@ struct Net {
     presenting: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
 }
 
+/// Envelopes another device sent: who, which device, each frame, and where
+/// to send each frame's answer if it asked (dm).
+type Incoming = (
+    MeshId,
+    MeshAddr,
+    e2ee::Frames,
+    Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+);
+/// Chat events sent to a device: whose, which device, their numbers, and
+/// each one's answer (`None`: no answer came).
+type Answered = (MeshId, MeshAddr, Vec<u64>, Option<Vec<bool>>);
+
 /// What a background request found out.
 enum Back {
     /// Each code, and the best answer any seed gave (`None`: none answered).
@@ -323,8 +341,11 @@ enum Back {
     Republish,
     /// Contacts' records, for their e2ee keys.
     Records(Vec<(MeshId, Vec<AddrRecord>)>),
-    /// Envelopes another device sent us: who, which device, each frame.
-    Envelopes(Box<(MeshId, MeshAddr, e2ee::Frames)>),
+    /// Envelopes another device sent us: who, which device, each frame, and
+    /// where to send the answers if it asked for them (dm).
+    Envelopes(Box<Incoming>),
+    /// A device answered a batch of chat events, or didn't (`None`).
+    DmAnswered(Box<Answered>),
     /// A device didn't take these envelopes: they wait for it.
     Unsent(Box<([u8; 32], Vec<Vec<u8>>)>),
     /// A contact answered through this address.
@@ -375,6 +396,8 @@ impl Helper {
             unopened: Vec::new(),
             link: None,
             link_session: 0,
+            dm: None,
+            dm_flight: HashSet::new(),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -844,7 +867,7 @@ impl Helper {
                 let unopened = std::mem::take(&mut self.unopened);
                 for (id, from, frame) in unopened {
                     if learned.contains(&id) {
-                        self.envelopes(id, from, vec![frame]);
+                        self.envelopes(id, from, vec![frame], None);
                     } else {
                         self.unopened.push((id, from, frame));
                     }
@@ -852,8 +875,12 @@ impl Helper {
                 return;
             }
             Back::Envelopes(got) => {
-                let (id, from, frames) = *got;
-                return self.envelopes(id, from, frames);
+                let (id, from, frames, reply) = *got;
+                return self.envelopes(id, from, frames, reply);
+            }
+            Back::DmAnswered(got) => {
+                let (id, addr, numbers, answers) = *got;
+                return self.dm_answered(id, addr, numbers, answers);
             }
             Back::Unsent(unsent) => {
                 let (device, envelopes) = *unsent;
@@ -900,6 +927,7 @@ impl Helper {
                 self.present_to(&id);
                 self.keys_for(&id);
                 self.send_waiting(&id);
+                self.dm_deliver(&id);
                 if promoted {
                     return self.changed(None);
                 }
@@ -916,6 +944,7 @@ impl Helper {
                     self.changed(None);
                 }
                 self.keys_for(&id);
+                self.dm_deliver(&id);
                 return self.present_to(&id);
             }
             Back::Synced(synced) => {
@@ -1073,26 +1102,53 @@ impl Helper {
     /// Envelopes a device sent over a live connection: open each, check it
     /// came from that device (the connection says who it is), and send back
     /// what opening asks for (key shares, key requests).
-    fn envelopes(&mut self, id: MeshId, from: MeshAddr, frames: e2ee::Frames) {
+    fn envelopes(
+        &mut self,
+        id: MeshId,
+        from: MeshAddr,
+        frames: e2ee::Frames,
+        reply: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    ) {
         let device = *from.device.as_bytes();
         // A relay we read in a record beats a bare connection address.
         self.devices_at.entry(device).or_insert((id, from.clone()));
+        // Each frame's answer, if the sender asked (dm): ok unless it fails.
+        let mut answers = vec![0u8; frames.len()];
         let Some(e2ee) = self.e2ee.as_mut() else {
+            if let Some(reply) = reply {
+                let _ = reply.send(vec![1; answers.len()]);
+            }
             return;
         };
         let mut replies = Vec::new();
         let mut notes = Vec::new();
-        let mut unknown = false;
-        for (flags, envelope) in frames {
-            match e2ee.decrypt(&envelope, unix_now()) {
+        let mut events = Vec::new();
+        let (mut unknown, mut fresh) = (false, false);
+        let envelopes: Vec<Vec<u8>> = frames.iter().map(|(_, e)| e.clone()).collect();
+        // One save for the whole stream (PLAN-dm Task 8).
+        let opened = match e2ee.decrypt_batch(&envelopes, unix_now()) {
+            Ok(opened) => opened,
+            Err(e) => {
+                eprintln!("mesh-node: couldn't save e2ee state: {e}");
+                if let Some(reply) = reply {
+                    let _ = reply.send(vec![1; answers.len()]);
+                }
+                return;
+            }
+        };
+        for (i, ((flags, envelope), result)) in frames.into_iter().zip(opened).enumerate() {
+            match result {
                 Err(E2eeError::UnknownSender) => {
                     // ponytail: kept in memory, 256 at most; `mailbox` keeps mail for real.
                     if self.unopened.len() < 256 {
                         self.unopened.push((id, from.clone(), (flags, envelope)));
                     }
                     unknown = true;
+                    answers[i] = 1;
                 }
                 Ok(got) => {
+                    // Opened, but nothing in it: a fresh session (e2ee D4).
+                    fresh |= got.opened.is_empty() && got.replies.is_empty();
                     for opened in got.opened {
                         // On a live connection the sender is the device at
                         // the other end; nobody passes envelopes on yet.
@@ -1102,12 +1158,33 @@ impl Helper {
                             );
                             continue;
                         }
+                        if opened.kind == NoteKind::Message {
+                            // A bad event is dropped and counted (dm D14), and answered ok.
+                            match mesh_dm::event::Event::from_bytes(&opened.body) {
+                                Ok(event) => events.push((i, event)),
+                                Err(_) => eprintln!("mesh-node: a chat event didn't read"),
+                            }
+                            continue;
+                        }
                         notes.push((opened, flags & e2ee::WAITED != 0));
                     }
                     replies.extend(got.replies);
                 }
-                Err(e) => eprintln!("mesh-node: couldn't open an envelope: {e}"),
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't open an envelope: {e}");
+                    answers[i] = 1;
+                }
             }
+        }
+        if !events.is_empty() {
+            self.dm_take(&id, &device, events, &mut answers);
+        }
+        if let Some(reply) = reply {
+            let _ = reply.send(answers);
+        }
+        if fresh {
+            // What they haven't acknowledged goes again on the new session.
+            self.dm_deliver(&id);
         }
         if unknown {
             self.fetch_keys(Some(&id));
@@ -1301,6 +1378,7 @@ impl Helper {
         self.e2ee = opened
             .inspect_err(|e| eprintln!("mesh-node: end-to-end encryption didn't start: {e}"))
             .ok();
+        self.open_dm();
         let Some(store) = &self.store else { return };
         let this = store.device_key().public();
         let Some(cert) = store
@@ -1386,6 +1464,8 @@ impl Helper {
             emit_net(None, false, false);
         }
         self.e2ee = None;
+        self.dm = None;
+        self.dm_flight.clear();
         self.devices_at.clear();
         self.waiting.clear();
         self.unopened.clear();
@@ -1681,8 +1761,19 @@ async fn serve_streams(
                     direct: Vec::new(),
                 };
                 let frames = e2ee::read(&mut stream.recv).await;
-                if !frames.is_empty() {
-                    let _ = back.send(Back::Envelopes(Box::new((stream.peer.id, from, frames))));
+                if frames.is_empty() {
+                    return;
+                }
+                let id = stream.peer.id;
+                // Chat events want each frame answered once it's stored.
+                if !frames.iter().any(|(flags, _)| flags & dm::ANSWER != 0) {
+                    let _ = back.send(Back::Envelopes(Box::new((id, from, frames, None))));
+                    return;
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = back.send(Back::Envelopes(Box::new((id, from, frames, Some(tx)))));
+                if let Ok(Ok(answers)) = tokio::time::timeout(e2ee::SEND_TIMEOUT, rx).await {
+                    dm::answer(stream.send, &answers).await;
                 }
             });
             continue;

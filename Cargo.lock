@@ -2470,6 +2470,7 @@ name = "mesh-node"
 version = "0.1.0"
 dependencies = [
  "iroh-relay",
+ "mesh-dm",
  "mesh-e2ee",
  "mesh-identity",
  "mesh-transport",

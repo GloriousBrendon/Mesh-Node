@@ -591,7 +591,7 @@ impl E2ee {
     pub fn encrypt_device_batch(
         &mut self,
         peer: &MeshId,
-        device: &VerifyingKey,
+        device: &[u8; 32],
         kind: Kind,
         bodies: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, E2eeError> {
@@ -608,7 +608,7 @@ impl E2ee {
             .unwrap_or_default();
         let (curve, _) = theirs
             .into_iter()
-            .find(|(_, key)| key == device)
+            .find(|(_, key)| key.as_bytes() == device)
             .ok_or(E2eeError::NoKeys)?;
         let mut out = Vec::with_capacity(bodies.len());
         for body in bodies {

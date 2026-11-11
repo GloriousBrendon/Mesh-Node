@@ -58,7 +58,7 @@ pub const MAX_FRAMES: usize = 256;
 /// Envelopes kept for one device that isn't connected.
 pub const MAX_WAITING: usize = 256;
 /// How long a device has to take what we send it.
-const SEND_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Each contact's records on the seeds, for their e2ee fields.
 // ponytail: one seed stream per contact; batch them when contact lists grow.
