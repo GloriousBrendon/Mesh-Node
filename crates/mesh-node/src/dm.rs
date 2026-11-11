@@ -378,6 +378,7 @@ impl Helper {
                             "name": a.name,
                             "mime": a.mime,
                             "size": a.size,
+                            // ponytail: hex doubles a 16 KB preview; base64 if pages grow heavy.
                             "preview": a.preview.as_ref().map(|p| e2ee::hex(p)),
                         })
                     })

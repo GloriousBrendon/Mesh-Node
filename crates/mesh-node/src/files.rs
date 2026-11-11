@@ -256,6 +256,7 @@ impl Helper {
                 let (node, back) = (net.node.clone(), self.back.clone());
                 tokio::spawn(async move {
                     let mut got = None;
+                    // ponytail: one device after another, one chunk at a time; ask several at once if big files feel slow.
                     for addr in addrs {
                         got = fetch_from(&node, &addr, &file).await;
                         if got.is_some() {
