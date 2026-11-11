@@ -59,6 +59,7 @@ impl Group {
             let change = GroupChange {
                 after: n.after,
                 change: n.change.clone(),
+                signed: None,
             };
             (*id, n.by, change, n.at)
         });
@@ -191,6 +192,7 @@ mod tests {
             let change = GroupChange {
                 after: after.map(|a| [a; 16]),
                 change,
+                signed: None,
             };
             g.add([id; 16], by, change, (seq, [id; 16]));
         }
@@ -359,6 +361,7 @@ mod tests {
             let change = GroupChange {
                 after: after.map(|a| [a; 16]),
                 change,
+                signed: None,
             };
             g.add([i; 16], by, change, (seq, [i; 16]));
         }

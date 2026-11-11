@@ -67,6 +67,12 @@ impl RootKey {
         self.0.sign(&signed_bytes(domain, body))
     }
 
+    /// `sign`, as the signature's 64 bytes, for crates that don't name the
+    /// signature type.
+    pub fn sign_bytes(&self, domain: &str, body: &[u8]) -> [u8; 64] {
+        self.sign(domain, body).to_bytes()
+    }
+
     /// X25519 between this root key and `their` ID (routing's pair secret).
     /// `None` for a weak key, whose result would be predictable.
     pub(crate) fn diffie_hellman(&self, their: &MeshId) -> Option<Zeroizing<[u8; 32]>> {
@@ -177,6 +183,15 @@ impl MeshId {
 
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
+    }
+
+    /// Whether `signature` (64 bytes) is this ID's root key signing `body`
+    /// under `domain` (`RootKey::sign_bytes`).
+    pub fn verify_bytes(&self, domain: &str, body: &[u8], signature: &[u8]) -> bool {
+        let Ok(bytes) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        self.verify(domain, body, &Signature::from_bytes(&bytes))
     }
 
     /// Whether `signature` is this ID's root key signing `body` under `domain`.

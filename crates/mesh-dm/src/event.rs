@@ -86,6 +86,63 @@ pub struct GroupChange {
     /// `None` only for the creation.
     pub after: Option<EventId>,
     pub change: Change,
+    /// Its author's signature, so any member can pass it on (D7). A change
+    /// from the wire without one is refused.
+    pub signed: Option<Signed>,
+}
+
+/// Who made a group change, signed with their ID key over the group, the
+/// event's ID, `seq` and `n`, their device, and the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signed {
+    pub author: Person,
+    pub device: crate::Device,
+    /// 64 bytes (a Vec: serde has no arrays past 32).
+    pub signature: Vec<u8>,
+}
+
+/// The domain group-change signatures are made under.
+pub const GROUP_SIGNATURE: &str = "mesh/v1/dm-group-change";
+
+/// The bytes an author signs for group change `event` in group `group`.
+pub fn group_signed_bytes(
+    group: &[u8; 16],
+    event: &Event,
+    author: &Person,
+    device: &crate::Device,
+) -> Option<Vec<u8>> {
+    let Body::Group(change) = &event.body else {
+        return None;
+    };
+    let fields = (
+        group,
+        &event.id,
+        event.seq,
+        event.n,
+        author,
+        device,
+        &change.after,
+        &change.change,
+    );
+    Some(postcard::to_stdvec(&fields).expect("to memory"))
+}
+
+/// Who wrote group change `event` in `group`, if its signature checks out.
+pub fn group_author(group: &[u8; 16], event: &Event) -> Option<crate::Sender> {
+    let Body::Group(GroupChange {
+        signed: Some(signed),
+        ..
+    }) = &event.body
+    else {
+        return None;
+    };
+    let id = mesh_identity::MeshId::from_bytes(&signed.author).ok()?;
+    let bytes = group_signed_bytes(group, event, &signed.author, &signed.device)?;
+    id.verify_bytes(GROUP_SIGNATURE, &bytes, &signed.signature)
+        .then_some(crate::Sender {
+            person: signed.author,
+            device: signed.device,
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,10 +316,12 @@ mod tests {
                     members: vec![[4; 32], [5; 32]],
                     nonce: [6; 16],
                 },
+                signed: None,
             }),
             Body::Group(GroupChange {
                 after: Some(target),
                 change: Change::Remove([5; 32]),
+                signed: None,
             }),
         ];
         for body in bodies {
@@ -310,6 +369,7 @@ mod tests {
                 members: vec![[1; 32]; MAX_MEMBERS + 1],
                 nonce: [0; 16],
             },
+            signed: None,
         }));
         assert_eq!(crowd.to_bytes(), Err(EventError::TooMany("members")));
         let emoji = event(Body::React {

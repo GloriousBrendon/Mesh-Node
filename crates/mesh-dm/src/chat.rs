@@ -68,6 +68,8 @@ pub enum Refusal {
     /// From someone who isn't in this chat: a 1:1 chat takes events only
     /// from that person and our own devices.
     NotInChat,
+    /// A group change whose author's signature doesn't check out (D7).
+    BadSignature,
 }
 
 struct Held {
@@ -941,10 +943,12 @@ mod tests {
                 members: vec![ME, BOB.person],
                 nonce: [3; 16],
             },
+            signed: None,
         });
         let rename = Body::Group(GroupChange {
             after: Some([1; 16]),
             change: Change::Rename("trip".into()),
+            signed: None,
         });
         // The rename comes first and waits for the creation.
         chat.take(BOB, body(2, 20, rename), NOW);

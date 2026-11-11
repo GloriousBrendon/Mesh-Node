@@ -62,8 +62,14 @@ struct ChatIndex {
 /// Events from one sender that may wait for a group's creation (D7).
 pub const MAX_BEFORE_CREATION: usize = 100;
 
+/// Signs group changes with this person's ID key (`RootKey::sign_bytes`
+/// under `GROUP_SIGNATURE`): History holds no keys itself.
+pub type Signer = Box<dyn Fn(&[u8]) -> [u8; 64] + Send>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
+    #[error("group changes can't be signed here")]
+    NoSigner,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -98,6 +104,7 @@ pub struct History {
     before_creation: HashMap<(Conversation, Person), usize>,
     counters: Counters,
     chats: HashMap<Conversation, Open>,
+    signer: Option<Signer>,
 }
 
 /// A message as a page shows it (dmOpen).
@@ -249,6 +256,7 @@ impl History {
             audience: HashMap::new(),
             before_creation: HashMap::new(),
             counters: Counters::new(me.person),
+            signer: None,
             chats: HashMap::new(),
             log_files: store.open_log()?,
             store,
@@ -460,6 +468,11 @@ impl History {
     }
 
     /// Makes, stores and returns this device's next event in `chat`.
+    /// How group changes are signed (D7).
+    pub fn set_signer(&mut self, signer: Signer) {
+        self.signer = Some(signer);
+    }
+
     pub fn send(&mut self, at: &Where, body: Body, now: u64) -> Result<Event, HistoryError> {
         let chat = &at.key();
         self.load(chat, now)?;
@@ -476,6 +489,20 @@ impl History {
             n: open.chat.next_n(&device),
             body,
         };
+        let mut event = event;
+        if let (Where::Group(group), Body::Group(_)) = (at, &event.body) {
+            let signer = self.signer.as_ref().ok_or(HistoryError::NoSigner)?;
+            let bytes = crate::event::group_signed_bytes(group, &event, &self.me.person, &device)
+                .expect("a group change");
+            let signature = signer(&bytes).to_vec();
+            if let Body::Group(change) = &mut event.body {
+                change.signed = Some(crate::event::Signed {
+                    author: self.me.person,
+                    device,
+                    signature,
+                });
+            }
+        }
         event.to_bytes()?;
         self.receive(at, self.me, vec![event.clone()], now)?;
         Ok(event)
@@ -527,8 +554,25 @@ impl History {
                 taken.push(Taken::Duplicate);
                 continue;
             }
+            // A group change counts as its signed author's, whoever passed it
+            // on (D7); one that isn't signed by its author is refused, and a
+            // 1:1 chat has no changes.
+            let author = match (group, &event.body) {
+                (Some(id), Body::Group(_)) => match crate::event::group_author(&id, &event) {
+                    Some(author) => author,
+                    None => {
+                        taken.push(Taken::Refused(Refusal::BadSignature));
+                        continue;
+                    }
+                },
+                (None, Body::Group(_)) => {
+                    taken.push(Taken::Refused(Refusal::NotInChat));
+                    continue;
+                }
+                _ => from,
+            };
             if let Some(id) = group
-                && let Some(refused) = self.group_refuses(chat, &id, &from, &event)
+                && let Some(refused) = self.group_refuses(chat, &id, &author, &event)
             {
                 taken.push(Taken::Refused(refused));
                 continue;
@@ -543,9 +587,11 @@ impl History {
                 self.load_segment(chat, segment, now)?;
             }
             let open = self.chats.get_mut(chat).expect("loaded");
-            let t = open.chat.take_received(from, event.clone(), now, received);
+            let t = open
+                .chat
+                .take_received(author, event.clone(), now, received);
             if matches!(t, Taken::Shown | Taken::Waiting) {
-                kept.push((received, event));
+                kept.push((received, author, event));
             }
             taken.push(t);
         }
@@ -555,7 +601,7 @@ impl History {
                 at: *at,
             }])?;
         }
-        self.store_kept(chat, from, via, kept)?;
+        self.store_kept(chat, via, kept)?;
         if let Some(id) = group {
             let open = self.chats.get_mut(chat).expect("loaded");
             match open.chat.group(&id) {
@@ -598,6 +644,7 @@ impl History {
         if let Body::Group(GroupChange {
             after: None,
             change: Change::Create { nonce, .. },
+            ..
         }) = &event.body
         {
             return (crate::group_id(&from.person, nonce) != *id).then_some(Refusal::NotInChat);
@@ -624,9 +671,8 @@ impl History {
     fn store_kept(
         &mut self,
         chat: &Conversation,
-        from: Sender,
         via: Device,
-        kept: Vec<(u64, Event)>,
+        kept: Vec<(u64, Sender, Event)>,
     ) -> Result<(), HistoryError> {
         if kept.is_empty() {
             return Ok(());
@@ -634,14 +680,14 @@ impl History {
         let open = self.chats.get_mut(chat).expect("loaded");
         let places = open.files.next_places(kept.len());
         let mut records = Vec::with_capacity(kept.len());
-        for (received, event) in &kept {
-            records.push(encode(*received, from, event)?);
+        for (received, from, event) in &kept {
+            records.push(encode(*received, *from, event)?);
         }
         open.files.append(&records)?;
         let newest = open.files.segments() - 1;
         open.loaded.insert(newest);
         let mut records = Vec::with_capacity(kept.len());
-        for ((received, event), (segment, position)) in kept.iter().zip(places) {
+        for ((received, from, event), (segment, position)) in kept.iter().zip(places) {
             let entry = Entry {
                 id: event.id,
                 chat: *chat,
@@ -1366,40 +1412,67 @@ mod tests {
         assert_eq!(unforward(b"junk").err(), Some(Unread::Garbage));
     }
 
-    const NONCE: [u8; 16] = [8; 16];
-
-    fn create(members: Vec<Person>) -> Body {
-        Body::Group(crate::event::GroupChange {
-            after: None,
-            change: crate::event::Change::Create {
-                name: "hike".into(),
-                members,
-                nonce: NONCE,
-            },
-        })
-    }
-
     /// Group DMs go over 1:1 sessions, so dm checks membership: an event
     /// counts only if its sender is a member of the current version (D7).
     #[test]
     fn group_events_count_only_from_members() {
-        let root = dir("group-members");
-        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
-        let mut h = History::open(&root, &KEY, ME).unwrap();
-        h.send(&group, create(vec![BOB.person]), NOW).unwrap();
-        let from_bob = h
-            .receive(&group, BOB, vec![bobs(1, NOW + 1, 1, text("in"))], NOW)
+        let (mut me, mut bob, carol) = (
+            Member::new("gm-me"),
+            Member::new("gm-bob"),
+            Member::new("gm-carol"),
+        );
+        let group = make_group(&mut me, &[&bob]);
+        me.pass_to(&mut bob);
+        bob.history.send(&group, text("in"), NOW).unwrap();
+        assert_eq!(bob.pass_to(&mut me), [Taken::Shown]);
+        // Carol isn't in it.
+        let out = bobs(2, NOW + 2, 1, text("out"));
+        let taken = me
+            .history
+            .receive(&group, carol.me, vec![out], NOW)
             .unwrap();
-        assert_eq!(from_bob, [Taken::Shown]);
-        let from_carol = bobs(2, NOW + 2, 1, text("out"));
-        let taken = h.receive(&group, CAROL, vec![from_carol], NOW).unwrap();
         assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
-        // A creation that doesn't hash to the group's ID is refused.
-        let fake = bobs(3, NOW + 3, 2, create(vec![CAROL.person]));
-        let taken = h.receive(&group, BOB, vec![fake], NOW).unwrap();
+        // A creation, properly signed by Carol, that doesn't hash to the
+        // group's ID from her: she can't make herself its creator.
+        let Where::Group(id) = group else {
+            unreachable!()
+        };
+        let mut fake = Event {
+            version: VERSION,
+            id: [55; 16],
+            time: NOW,
+            seq: NOW + 3,
+            n: 1,
+            body: Body::Group(crate::event::GroupChange {
+                after: None,
+                change: crate::event::Change::Create {
+                    name: "mine".into(),
+                    members: vec![],
+                    nonce: [1; 16],
+                },
+                signed: None,
+            }),
+        };
+        let bytes =
+            crate::event::group_signed_bytes(&id, &fake, &carol.me.person, &carol.me.device)
+                .unwrap();
+        let signature = carol
+            .root
+            .sign_bytes(crate::event::GROUP_SIGNATURE, &bytes)
+            .to_vec();
+        if let Body::Group(change) = &mut fake.body {
+            change.signed = Some(crate::event::Signed {
+                author: carol.me.person,
+                device: carol.me.device,
+                signature,
+            });
+        }
+        let taken = me
+            .history
+            .receive(&group, carol.me, vec![fake], NOW)
+            .unwrap();
         assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
-        assert_eq!(h.chats(), [group]);
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(me.history.chats(), [group]);
     }
 
     /// Before its creation arrives a group's events wait: not shown, no chat
@@ -1407,13 +1480,21 @@ mod tests {
     /// members' events show and anyone else's are wiped.
     #[test]
     fn before_its_creation_a_group_waits() {
-        let root = dir("group-waits");
-        let group = Where::Group(crate::group_id(&CAROL.person, &NONCE));
-        let mut h = History::open(&root, &KEY, ME).unwrap();
-        let early = h
-            .receive(&group, BOB, vec![bobs(1, NOW + 1, 1, text("early"))], NOW)
-            .unwrap();
-        assert_eq!(early, [Taken::Shown]);
+        let (mut me, mut bob, mut carol) = (
+            Member::new("w-me"),
+            Member::new("w-bob"),
+            Member::new("w-carol"),
+        );
+        let group = make_group(&mut carol, &[&me, &bob]);
+        carol.pass_to(&mut bob);
+        let early = bob.history.send(&group, text("early"), NOW).unwrap();
+        // Bob's message reaches me before the creation does.
+        assert_eq!(
+            me.history
+                .receive(&group, bob.me, vec![early], NOW)
+                .unwrap(),
+            [Taken::Shown]
+        );
         let stranger = Sender {
             person: [9; 32],
             device: [90; 32],
@@ -1422,127 +1503,282 @@ mod tests {
             let mut e = bobs(0, NOW + 10 + i, i + 1, text("spam"));
             e.id[..8].copy_from_slice(&i.to_be_bytes());
             e.id[8] = 0xEE;
-            h.receive(&group, stranger, vec![e], NOW).unwrap();
+            me.history.receive(&group, stranger, vec![e], NOW).unwrap();
         }
         let over = bobs(250, NOW + 5000, 5000, text("one more"));
-        let taken = h.receive(&group, stranger, vec![over], NOW).unwrap();
+        let taken = me
+            .history
+            .receive(&group, stranger, vec![over], NOW)
+            .unwrap();
         assert_eq!(taken, [Taken::Refused(Refusal::TooManyWaiting)]);
-        assert!(h.chats().is_empty(), "not listed before its creation");
         assert!(
-            h.page(&group, None, 50, NOW).unwrap().0.is_empty(),
-            "nothing shown"
+            me.history.chats().is_empty(),
+            "not listed before its creation"
         );
-        let creation = Event {
-            body: create(vec![ME.person, BOB.person]),
-            ..bobs(2, NOW, 1, text(""))
-        };
-        h.receive(&group, CAROL, vec![creation], NOW).unwrap();
-        let (page, _) = h.page(&group, None, 50, NOW).unwrap();
+        assert!(me.history.page(&group, None, 50, NOW).unwrap().0.is_empty());
+        carol.pass_to(&mut me);
+        let (page, _) = me.history.page(&group, None, 50, NOW).unwrap();
         let texts: Vec<&str> = page.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["early"], "Bob's waited; the stranger's are gone");
-        assert_eq!(h.chats(), [group]);
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(me.history.chats(), [group]);
     }
 
     /// Someone added to a group gets its messages from their add on, not the
     /// ones before; its changes they get all of, to know who's in it.
     #[test]
     fn a_new_member_gets_events_from_their_add() {
-        let root = dir("group-join");
-        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
-        let mut h = History::open(&root, &KEY, ME).unwrap();
-        let made = h.send(&group, create(vec![BOB.person]), NOW).unwrap();
-        h.send(&group, text("before Carol"), NOW).unwrap();
-        let add = Body::Group(crate::event::GroupChange {
-            after: Some(made.id),
-            change: crate::event::Change::Add(CAROL.person),
-        });
-        h.send(&group, add, NOW).unwrap();
-        h.send(&group, text("with Carol"), NOW).unwrap();
-        h.add_device(CAROL.device, CAROL.person);
-        h.add_device(BOB.device, BOB.person);
-        let carol: Vec<Body> = h
-            .outgoing(&CAROL.device, NOW)
-            .unwrap()
-            .into_iter()
-            .map(|t| t.event.body)
-            .collect();
-        // The group's changes (to know who's in it), then from her add on.
-        assert_eq!(carol.len(), 3, "{carol:?}");
-        assert!(!carol.contains(&text("before Carol")));
-        assert_eq!(carol[2], text("with Carol"));
-        assert_eq!(h.outgoing(&BOB.device, NOW).unwrap().len(), 4);
-        let _ = std::fs::remove_dir_all(root);
+        let (mut me, mut bob, mut carol) = (
+            Member::new("j-me"),
+            Member::new("j-bob"),
+            Member::new("j-carol"),
+        );
+        let group = make_group(&mut me, &[&bob]);
+        me.history.send(&group, text("before Carol"), NOW).unwrap();
+        me.change(&group, crate::event::Change::Add(carol.me.person));
+        me.history.send(&group, text("with Carol"), NOW).unwrap();
+        me.history.add_device(carol.me.device, carol.me.person);
+        me.history.add_device(bob.me.device, bob.me.person);
+        let to_carol = me.history.outgoing(&carol.me.device, NOW).unwrap();
+        let carol_got: Vec<Body> = to_carol.into_iter().map(|t| t.event.body).collect();
+        assert_eq!(
+            carol_got.len(),
+            3,
+            "the creation, her add, then the message"
+        );
+        assert!(!carol_got.contains(&text("before Carol")));
+        assert_eq!(carol_got[2], text("with Carol"));
+        assert_eq!(me.history.outgoing(&bob.me.device, NOW).unwrap().len(), 4);
+        let _ = (&mut bob, &mut carol);
     }
 
     /// The removal reaches the person removed, though they're no longer a
     /// member; later messages don't.
     #[test]
     fn a_removal_reaches_the_removed() {
-        let root = dir("group-remove");
-        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
-        let mut h = History::open(&root, &KEY, ME).unwrap();
-        let made = h
-            .send(&group, create(vec![BOB.person, CAROL.person]), NOW)
-            .unwrap();
-        let remove = Body::Group(crate::event::GroupChange {
-            after: Some(made.id),
-            change: crate::event::Change::Remove(CAROL.person),
-        });
-        h.send(&group, remove.clone(), NOW).unwrap();
-        h.send(&group, text("just us"), NOW).unwrap();
-        h.add_device(CAROL.device, CAROL.person);
-        let carol: Vec<Body> = h
-            .outgoing(&CAROL.device, NOW)
-            .unwrap()
-            .into_iter()
-            .map(|t| t.event.body)
-            .collect();
-        assert!(carol.contains(&remove), "{carol:?}");
-        assert!(!carol.contains(&text("just us")));
-        let _ = std::fs::remove_dir_all(root);
+        let (mut me, bob, mut carol) = (
+            Member::new("r-me"),
+            Member::new("r-bob"),
+            Member::new("r-carol"),
+        );
+        let group = make_group(&mut me, &[&bob, &carol]);
+        me.pass_to(&mut carol);
+        me.change(&group, crate::event::Change::Remove(carol.me.person));
+        me.history.send(&group, text("just us"), NOW).unwrap();
+        me.pass_to(&mut carol);
+        let seen = carol.version(&group).unwrap();
+        assert!(!seen.members.contains(&carol.me.person), "she learned");
+        let (page, _) = carol.history.page(&group, None, 50, NOW).unwrap();
+        assert!(page.iter().all(|m| m.text != "just us"));
     }
 
     /// The group's state comes back with the chat, though its creation is
     /// in a segment the reopened chat doesn't read.
     #[test]
     fn a_group_survives_a_reopen() {
-        let root = dir("group-reopen");
-        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
-        let mut h = History::open(&root, &KEY, ME).unwrap();
-        h.send(&group, create(vec![BOB.person]), NOW).unwrap();
+        let (mut me, bob) = (Member::new("s-me"), Member::new("s-bob"));
+        let group = make_group(&mut me, &[&bob]);
         for i in 0..SEGMENT_EVENTS {
-            h.send(&group, text(&format!("m{i}")), NOW).unwrap();
+            me.history
+                .send(&group, text(&format!("m{i}")), NOW)
+                .unwrap();
         }
-        drop(h);
-        let mut again = History::open(&root, &KEY, ME).unwrap();
-        assert_eq!(again.chats(), [group], "listed before any chat is opened");
-        let from_bob = bobs(1, NOW + 999, 1, text("still in"));
+        me.history = History::open(&me.dir, &KEY, me.me).unwrap();
         assert_eq!(
-            again.receive(&group, BOB, vec![from_bob], NOW).unwrap(),
+            me.history.chats(),
+            [group],
+            "listed before any chat is opened"
+        );
+        let from_bob = Event {
+            version: VERSION,
+            id: [1; 16],
+            time: NOW,
+            seq: NOW + 999,
+            n: 1,
+            body: text("still in"),
+        };
+        assert_eq!(
+            me.history
+                .receive(&group, bob.me, vec![from_bob], NOW)
+                .unwrap(),
             [Taken::Shown]
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
-    /// What a friend's device gets: the event, and the group it's in if
-    /// any (group DMs go over the 1:1 sessions, e2ee D6).
+    /// A person with an ID key and one device, and their history.
+    struct Member {
+        root: mesh_identity::RootKey,
+        me: Sender,
+        history: History,
+        dir: PathBuf,
+    }
+
+    impl Member {
+        fn new(name: &str) -> Self {
+            let root = mesh_identity::RootKey::generate().unwrap();
+            let me = Sender {
+                person: root.id().to_bytes(),
+                device: mesh_identity::DeviceKey::generate()
+                    .unwrap()
+                    .public()
+                    .to_bytes(),
+            };
+            let dir = dir(&format!("relay-{name}"));
+            let mut history = History::open(&dir, &KEY, me).unwrap();
+            let signer = mesh_identity::RootKey::from_secret_bytes(*root.secret_bytes());
+            history.set_signer(Box::new(move |bytes| {
+                signer.sign_bytes(crate::event::GROUP_SIGNATURE, bytes)
+            }));
+            Self {
+                root,
+                me,
+                history,
+                dir,
+            }
+        }
+
+        fn head(&mut self, group: &Where) -> EventId {
+            self.history.group(group, NOW).unwrap().unwrap().head
+        }
+
+        fn change(&mut self, group: &Where, change: crate::event::Change) {
+            let after = Some(self.head(group));
+            let body = Body::Group(crate::event::GroupChange {
+                after,
+                change,
+                signed: None,
+            });
+            self.history.send(group, body, NOW).unwrap();
+        }
+
+        /// Everything of ours that's meant for `to`, passed to them.
+        fn pass_to(&mut self, to: &mut Member) -> Vec<Taken> {
+            self.history.add_device(to.me.device, to.me.person);
+            let out = self.history.outgoing(&to.me.device, NOW).unwrap();
+            let mut taken = Vec::new();
+            for t in out {
+                let got = to
+                    .history
+                    .receive(&t.at, self.me, vec![t.event], NOW)
+                    .unwrap();
+                self.history.acked(&to.me.device, t.number, true);
+                taken.extend(got);
+            }
+            taken
+        }
+
+        fn version(&mut self, group: &Where) -> Option<crate::group::Version> {
+            self.history.group(group, NOW).unwrap()
+        }
+    }
+
+    impl Drop for Member {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn make_group(creator: &mut Member, members: &[&Member]) -> Where {
+        let ids: Vec<Person> = members.iter().map(|m| m.me.person).collect();
+        let (nonce, id) = crate::new_group(&creator.me.person).unwrap();
+        let change = crate::event::Change::Create {
+            name: "hike".into(),
+            members: ids,
+            nonce,
+        };
+        let body = Body::Group(crate::event::GroupChange {
+            after: None,
+            change,
+            signed: None,
+        });
+        let group = Where::Group(id);
+        creator.history.send(&group, body, NOW).unwrap();
+        group
+    }
+
+    /// The creator makes a group with A and B and goes away for good; B
+    /// adds D. D, hearing only from A and B, sees the group with the right
+    /// members, and can chat (D7, changes passed on by members).
     #[test]
-    fn a_friend_body_names_its_group() {
-        let event = bobs(1, NOW, 1, text("hi"));
-        let group = Where::Group([5; 16]);
-        assert_eq!(
-            from_friend(&to_friend(&group, &event)),
-            Ok((Some([5; 16]), event.clone()))
+    fn a_new_member_joins_while_the_creator_is_away() {
+        let (mut c, mut a, mut b, mut d) = (
+            Member::new("c"),
+            Member::new("a"),
+            Member::new("b"),
+            Member::new("d"),
         );
-        assert_eq!(
-            from_friend(&to_friend(&CHAT, &event)),
-            Ok((None, event.clone()))
+        let group = make_group(&mut c, &[&a, &b]);
+        c.pass_to(&mut a);
+        c.pass_to(&mut b);
+        drop(c);
+        b.change(&group, crate::event::Change::Add(d.me.person));
+        b.pass_to(&mut d);
+        b.pass_to(&mut a);
+        let seen = d.version(&group).expect("D sees the group");
+        assert_eq!(seen, a.version(&group).unwrap());
+        assert!(seen.members.contains(&d.me.person) && seen.members.len() == 4);
+        d.history.send(&group, text("hi, I'm new"), NOW).unwrap();
+        // D passes on the group's changes too; A has them already.
+        let taken = d.pass_to(&mut a);
+        assert_eq!(taken.last(), Some(&Taken::Shown), "{taken:?}");
+        let (page, _) = a.history.page(&group, None, 50, NOW).unwrap();
+        assert_eq!(page.last().unwrap().text, "hi, I'm new");
+    }
+
+    /// A member renames the group, leaves and never comes back; someone who
+    /// missed both still ends with the same group as everyone else.
+    #[test]
+    fn a_departed_members_changes_still_reach_everyone() {
+        let (mut c, mut a, mut m, mut n) = (
+            Member::new("c2"),
+            Member::new("a2"),
+            Member::new("m2"),
+            Member::new("n2"),
         );
-        let mut newer = to_friend(&CHAT, &event);
-        newer[0] = FRIEND_VERSION + 1;
-        assert_eq!(from_friend(&newer).err(), Some(Unread::Newer));
-        assert_eq!(from_friend(b"junk").err(), Some(Unread::Garbage));
+        let group = make_group(&mut c, &[&a, &m, &n]);
+        for to in [&mut a, &mut m, &mut n] {
+            c.pass_to(to);
+        }
+        m.change(&group, crate::event::Change::Rename("trip".into()));
+        m.change(&group, crate::event::Change::Leave);
+        m.pass_to(&mut a);
+        drop(m);
+        a.pass_to(&mut n);
+        let (theirs, ours) = (n.version(&group).unwrap(), a.version(&group).unwrap());
+        assert_eq!(theirs, ours);
+        assert_eq!((theirs.name.as_str(), theirs.members.len()), ("trip", 3));
+    }
+
+    /// A member passes on a change claiming the creator made it: refused.
+    #[test]
+    fn a_change_passed_on_in_someone_elses_name_is_refused() {
+        let (mut c, mut b, mut d) = (Member::new("c3"), Member::new("b3"), Member::new("d3"));
+        let group = make_group(&mut c, &[&b, &d]);
+        c.pass_to(&mut b);
+        c.pass_to(&mut d);
+        let head = b.head(&group);
+        let forged = Event {
+            version: VERSION,
+            id: [77; 16],
+            time: NOW,
+            seq: NOW,
+            n: 1,
+            body: Body::Group(crate::event::GroupChange {
+                after: Some(head),
+                change: crate::event::Change::Remove(d.me.person),
+                // Claims the creator, signed by B.
+                signed: Some(crate::event::Signed {
+                    author: c.me.person,
+                    device: c.me.device,
+                    signature: b
+                        .root
+                        .sign_bytes(crate::event::GROUP_SIGNATURE, b"anything")
+                        .to_vec(),
+                }),
+            }),
+        };
+        let taken = d.history.receive(&group, b.me, vec![forged], NOW).unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::BadSignature)]);
+        assert!(d.version(&group).unwrap().members.contains(&d.me.person));
     }
 
     /// An event's author comes from the log, with no chat loaded.

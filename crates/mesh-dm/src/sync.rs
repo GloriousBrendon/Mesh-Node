@@ -248,7 +248,9 @@ fn meant_for(
     if person == me {
         e.from != *device
     } else {
-        e.author == me && !e.private && shares(e, n, &person)
+        // Our own events; and a group's changes, whoever made them, so a
+        // member can pass them on to one who lacks them (D7).
+        (e.author == me || e.change) && e.author != person && !e.private && shares(e, n, &person)
     }
 }
 

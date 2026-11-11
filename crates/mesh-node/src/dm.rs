@@ -125,6 +125,14 @@ impl Helper {
         self.dm = History::open(&data.join("dm"), store.data_key(), me)
             .inspect_err(|e| eprintln!("mesh-node: the chat history didn't open: {e}"))
             .ok();
+        // Group changes are signed with our ID key, so any member can pass
+        // them on (D7).
+        let root = mesh_identity::RootKey::from_secret_bytes(*store.root_key().secret_bytes());
+        if let Some(history) = &mut self.dm {
+            history.set_signer(Box::new(move |bytes| {
+                root.sign_bytes(mesh_dm::event::GROUP_SIGNATURE, bytes)
+            }));
+        }
     }
 
     /// Sends each of `id`'s connected devices what it hasn't acknowledged.
@@ -495,6 +503,7 @@ impl Helper {
         let body = Body::Group(GroupChange {
             after: Some(version.head),
             change,
+            signed: None,
         });
         self.dm_store_and_send(&at, body)?;
         if let Some(removed) = removed {
@@ -590,6 +599,7 @@ impl Helper {
                 let body = Body::Group(GroupChange {
                     after: None,
                     change,
+                    signed: None,
                 });
                 self.dm_store_and_send(&at, body)?;
                 self.emit_chats()
