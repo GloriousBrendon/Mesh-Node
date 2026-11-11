@@ -137,6 +137,15 @@ impl Counters {
         self.devices.insert(device, counter);
     }
 
+    /// Whether a device of someone other than us has acknowledged event
+    /// `number`: what "sent" means (D5).
+    pub fn taken_by_others(&self, number: u64) -> bool {
+        let others = self.devices.values().filter(|c| c.person != self.me);
+        others
+            .into_iter()
+            .any(|c| c.upto >= number || c.above.contains(&number))
+    }
+
     pub fn counter(&self, device: &Device) -> Option<u64> {
         self.devices.get(device).map(|c| c.upto)
     }

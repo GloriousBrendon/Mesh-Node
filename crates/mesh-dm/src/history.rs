@@ -86,6 +86,22 @@ pub struct History {
     chats: HashMap<Conversation, Open>,
 }
 
+/// A message as a page shows it (dmOpen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    pub id: EventId,
+    pub author: Person,
+    pub text: String,
+    pub edited: bool,
+    pub reply_to: Option<EventId>,
+    /// Each emoji and who reacted with it.
+    pub reactions: Vec<(String, Vec<Person>)>,
+    /// Arrived at or below the read marker: unread (D2).
+    pub late: bool,
+    /// The time to show, in milliseconds (D2's clamp).
+    pub time: u64,
+}
+
 /// An event to send a device, with its number for the ack.
 pub struct ToSend {
     pub number: u64,
@@ -545,6 +561,67 @@ impl History {
     pub fn counter(&self, device: &Device) -> Option<u64> {
         self.counters.counter(device)
     }
+
+    /// Every chat with events.
+    pub fn chats(&self) -> Vec<Where> {
+        self.known.values().copied().collect()
+    }
+
+    /// The chat an event is in.
+    pub fn where_of(&self, id: &EventId) -> Option<Where> {
+        let chat = self.log.get(self.log.number_of(id)?)?.chat;
+        self.known.get(&chat).copied()
+    }
+
+    /// Whether one of the other person's devices has taken our event (D5).
+    pub fn is_sent(&self, id: &EventId) -> bool {
+        self.log
+            .number_of(id)
+            .is_some_and(|n| self.counters.taken_by_others(n))
+    }
+
+    /// Up to `count` messages before `before` (or the newest), oldest first,
+    /// reading older segments as needed; and whether there are older ones.
+    pub fn page(
+        &mut self,
+        at: &Where,
+        before: Option<EventId>,
+        count: usize,
+        now: u64,
+    ) -> Result<(Vec<Shown>, bool), HistoryError> {
+        let chat = at.key();
+        self.load(&chat, now)?;
+        loop {
+            let open = &self.chats[&chat];
+            let messages = open.chat.messages();
+            let end = match before {
+                Some(id) => messages.iter().position(|m| m.id == id).unwrap_or(0),
+                None => messages.len(),
+            };
+            let oldest_loaded = open.loaded.iter().min().copied();
+            let older = oldest_loaded.and_then(|n| n.checked_sub(1));
+            if end >= count || older.is_none() {
+                let start = end.saturating_sub(count);
+                let page = messages[start..end]
+                    .iter()
+                    .map(|m| Shown {
+                        id: m.id,
+                        author: m.author,
+                        text: m.text.to_owned(),
+                        edited: m.edited,
+                        reply_to: m.reply_to,
+                        reactions: (m.reactions.iter())
+                            .map(|(e, who)| (e.to_string(), who.clone()))
+                            .collect(),
+                        late: m.late,
+                        time: open.chat.display_time(&m.id).unwrap_or(0),
+                    })
+                    .collect();
+                return Ok((page, start > 0 || older.is_some()));
+            }
+            self.load_segment(&chat, older.expect("checked"), now)?;
+        }
+    }
 }
 
 /// For our own devices only: "read up to here" and "delete for me" (D3, D9).
@@ -881,6 +958,58 @@ mod tests {
             "the message only"
         );
         assert_eq!(h.outgoing(&[11; 32], shares, NOW).unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Pages of a long chat (dmOpen): the newest first, older ones read
+    /// from disk as they're asked for.
+    #[test]
+    fn pages_go_back_through_the_segments() {
+        let root = dir("pages");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        for i in 0..SEGMENT_EVENTS + 10 {
+            h.send(&CHAT, text(&format!("m{i}")), NOW).unwrap();
+        }
+        drop(h);
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let (page, more) = h.page(&CHAT, None, 50, NOW).unwrap();
+        let last = format!("m{}", SEGMENT_EVENTS + 9);
+        assert_eq!(
+            (page.len(), page.last().unwrap().text.as_str(), more),
+            (50, last.as_str(), true)
+        );
+        // Before the newest segment's first: read from the one before it.
+        let mut before = page[0].id;
+        let mut seen = 50;
+        loop {
+            let (older, more) = h.page(&CHAT, Some(before), 50, NOW).unwrap();
+            seen += older.len();
+            if !more {
+                assert_eq!(older[0].text, "m0");
+                break;
+            }
+            before = older[0].id;
+        }
+        assert_eq!(seen, SEGMENT_EVENTS + 10);
+        assert_eq!(h.chats(), [CHAT]);
+        assert_eq!(h.where_of(&page[0].id), Some(CHAT));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// "Sent" once one of the other person's devices took it (D5).
+    #[test]
+    fn sent_once_their_device_took_it() {
+        let root = dir("sent");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let said = h.send(&CHAT, text("hi"), NOW).unwrap();
+        h.add_device(BOB.device, BOB.person);
+        h.add_device([11; 32], ME.person);
+        assert!(!h.is_sent(&said.id));
+        let number = h.outgoing(&[11; 32], shares, NOW).unwrap()[0].number;
+        h.acked(&[11; 32], number, true, shares);
+        assert!(!h.is_sent(&said.id), "our own laptop doesn't count");
+        h.acked(&BOB.device, number, true, shares);
+        assert!(h.is_sent(&said.id));
         let _ = std::fs::remove_dir_all(root);
     }
 

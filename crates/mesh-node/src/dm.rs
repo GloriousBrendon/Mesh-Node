@@ -13,7 +13,7 @@ use super::*;
 use mesh_dm::Sender as DmSender;
 use mesh_dm::Where;
 use mesh_dm::chat::Taken;
-use mesh_dm::event::Event;
+use mesh_dm::event::{Body, Event, EventId};
 use mesh_dm::history::History;
 use mesh_dm::store::Conversation as Chat;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -154,6 +154,10 @@ impl Helper {
         if let Err(e) = history.save_counters() {
             eprintln!("mesh-node: couldn't save the delivery counters: {e}");
         }
+        // "Sent" may have changed on the open chat.
+        if self.dm_open == Some(id) && answers.iter().any(|ok| *ok) {
+            let _ = self.emit_page(&id, None);
+        }
         if answers.iter().all(|ok| *ok) {
             self.dm_deliver_to(&id, addr);
         }
@@ -180,6 +184,12 @@ impl Helper {
         };
         let chat = direct_chat(id);
         let (frames, events): (Vec<usize>, Vec<Event>) = events.into_iter().unzip();
+        let texts: Vec<Option<String>> = (events.iter())
+            .map(|e| match &e.body {
+                Body::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         match history.receive(&chat, from, events, unix_now() * 1000) {
             Ok(taken) => {
                 let refused = taken
@@ -189,6 +199,11 @@ impl Helper {
                 if refused > 0 {
                     eprintln!("mesh-node: {refused} chat events refused");
                 }
+                let new = (taken.iter().zip(texts))
+                    .filter(|(t, _)| **t == Taken::Shown)
+                    .filter_map(|(_, text)| text)
+                    .collect();
+                self.dm_changed(id, new);
             }
             Err(e) => {
                 eprintln!("mesh-node: couldn't store chat events: {e}");
@@ -197,6 +212,283 @@ impl Helper {
                 }
             }
         }
+    }
+}
+
+/// Shown text in a notification, at most (as WhatsApp's).
+const NOTIFY_CHARS: usize = 100;
+/// Messages in one page of `dmOpen`.
+const PAGE: usize = 50;
+
+fn dm_fail(e: impl std::fmt::Display) -> Fail {
+    Fail(
+        "unavailable",
+        format!("the chat history isn't working: {e}"),
+    )
+}
+
+fn parse_event_id(text: &str) -> Result<EventId, Fail> {
+    e2ee::parse_conversation(text)
+        .ok_or_else(|| Fail("bad-args", "that isn't a message ID".to_owned()))
+}
+
+impl Helper {
+    /// The 1:1 chat named by a friend's ID; refused unless they're a friend
+    /// (D6 for groups, and Q1).
+    fn dm_chat_with(&mut self, id: &str) -> Result<(MeshId, Where), Fail> {
+        let peer = parse_id(id)?;
+        let store = self.unlocked()?;
+        if store.account().kind(&peer) != Some(Kind::Friend) {
+            return Err(Fail(
+                "not-a-friend",
+                "you can only message friends".to_owned(),
+            ));
+        }
+        Ok((peer, direct_chat(&peer)))
+    }
+
+    /// `meshDmMessages` for one chat: its newest page, or the page before
+    /// `before`.
+    fn emit_page(&mut self, peer: &MeshId, before: Option<EventId>) -> Result<(), Fail> {
+        let me = self.unlocked()?.id().to_bytes();
+        let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
+        let (page, more) = history
+            .page(&direct_chat(peer), before, PAGE, unix_now() * 1000)
+            .map_err(dm_fail)?;
+        let events: Vec<Value> = page
+            .iter()
+            .map(|m| {
+                let from = MeshId::from_bytes(&m.author)
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                let reactions: Vec<Value> = (m.reactions.iter())
+                    .map(|(emoji, who)| {
+                        let who: Vec<String> = (who.iter())
+                            .filter_map(|p| MeshId::from_bytes(p).ok())
+                            .map(|p| p.to_string())
+                            .collect();
+                        json!({ "emoji": emoji, "who": who })
+                    })
+                    .collect();
+                let sent = m.author == me && history.is_sent(&m.id);
+                json!({
+                    "id": e2ee::hex(&m.id),
+                    "from": from,
+                    "text": m.text,
+                    "edited": m.edited,
+                    "replyTo": m.reply_to.map(|r| e2ee::hex(&r)),
+                    "reactions": reactions,
+                    "late": m.late,
+                    "time": m.time,
+                    "sent": sent,
+                })
+            })
+            .collect();
+        emit(
+            "meshDmMessages",
+            json!({ "id": peer.to_string(), "events": events, "more": more }),
+        );
+        Ok(())
+    }
+
+    /// `meshDmChats`: every chat, newest activity first.
+    pub(super) fn emit_chats(&mut self) -> Result<(), Fail> {
+        let now = unix_now() * 1000;
+        let names: HashMap<[u8; 32], String> = {
+            let store = self.unlocked()?;
+            (store.account().entries().iter())
+                .map(|e| {
+                    let name = if e.nick.is_empty() {
+                        e.name.clone()
+                    } else {
+                        e.nick.clone()
+                    };
+                    (e.id().to_bytes(), name)
+                })
+                .collect()
+        };
+        let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
+        let mut chats = Vec::new();
+        // ponytail: loads every chat's newest segment for the list; keep last activity and unread in each index if lists grow long.
+        for at in history.chats() {
+            let Where::Direct(person) = at else { continue };
+            let Ok(peer) = MeshId::from_bytes(&person) else {
+                continue;
+            };
+            let chat = history.chat(&at, now).map_err(dm_fail)?;
+            let last = chat
+                .messages()
+                .last()
+                .and_then(|m| chat.display_time(&m.id))
+                .unwrap_or(0);
+            chats.push(json!({
+                "id": peer.to_string(),
+                "kind": "direct",
+                "name": names.get(&person).cloned().unwrap_or_default(),
+                "members": [peer.to_string()],
+                "last": last,
+                "unread": chat.unread(),
+                "mentions": 0,
+            }));
+        }
+        chats.sort_by_key(|c| std::cmp::Reverse(c["last"].as_u64()));
+        emit("meshDmChats", json!({ "chats": chats }));
+        Ok(())
+    }
+
+    /// Stores and sends one of our events in a 1:1 chat, then answers with
+    /// the chat's page.
+    fn dm_send_body(&mut self, peer: MeshId, body: Body) -> Result<(), Fail> {
+        let at = direct_chat(&peer);
+        let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
+        match history.send(&at, body, unix_now() * 1000) {
+            Ok(_) => {}
+            Err(mesh_dm::history::HistoryError::Event(e)) => {
+                let kind = match e {
+                    mesh_dm::event::EventError::TooLong(_) => "too-long",
+                    mesh_dm::event::EventError::TooMany(_) => "too-many",
+                    _ => "bad-args",
+                };
+                return Err(Fail(kind, e.to_string()));
+            }
+            Err(e) => return Err(dm_fail(e)),
+        }
+        self.dm_deliver(&peer);
+        if let Some(me) = self.store.as_ref().map(Keystore::id) {
+            self.dm_deliver(&me);
+        }
+        self.emit_page(&peer, None)
+    }
+
+    /// The chat an event of ours is in, and that it's ours to change.
+    fn dm_own_event(&mut self, id: &str) -> Result<(MeshId, EventId), Fail> {
+        let event = parse_event_id(id)?;
+        let me = self.unlocked()?.id().to_bytes();
+        let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
+        let Some(Where::Direct(person)) = history.where_of(&event) else {
+            return Err(Fail("not-found", "no such message".to_owned()));
+        };
+        let peer = MeshId::from_bytes(&person)
+            .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
+        let page = history
+            .page(&direct_chat(&peer), None, usize::MAX, unix_now() * 1000)
+            .map_err(dm_fail)?
+            .0;
+        let author = page.iter().find(|m| m.id == event).map(|m| m.author);
+        if author != Some(me) {
+            return Err(Fail(
+                "not-author",
+                "only the author can change a message".to_owned(),
+            ));
+        }
+        Ok((peer, event))
+    }
+
+    /// The dm commands (SPEC-dm *Client side*).
+    pub(super) fn dm_command(&mut self, func: &str, args: &[String]) -> Result<(), Fail> {
+        let arg = |i: usize| {
+            args.get(i)
+                .map(String::as_str)
+                .ok_or_else(|| Fail("bad-args", format!("{func} is missing argument {}", i + 1)))
+        };
+        match func {
+            "dmList" => self.emit_chats(),
+            "dmOpen" => {
+                let (peer, _) = self.dm_chat_with(arg(0)?)?;
+                let before = args
+                    .get(1)
+                    .filter(|b| !b.is_empty())
+                    .map(|b| parse_event_id(b))
+                    .transpose()?;
+                self.dm_open = Some(peer);
+                self.emit_page(&peer, before)
+            }
+            "dmSend" => {
+                let (peer, _) = self.dm_chat_with(arg(0)?)?;
+                // Sending in a chat means it's open on screen.
+                self.dm_open = Some(peer);
+                let reply_to = args
+                    .get(2)
+                    .filter(|r| !r.is_empty())
+                    .map(|r| parse_event_id(r))
+                    .transpose()?;
+                let body = Body::Text {
+                    text: arg(1)?.to_owned(),
+                    reply_to,
+                    attachments: Vec::new(),
+                };
+                self.dm_send_body(peer, body)
+            }
+            "dmEdit" => {
+                let (peer, target) = self.dm_own_event(arg(0)?)?;
+                let body = Body::Edit {
+                    target,
+                    text: arg(1)?.to_owned(),
+                };
+                self.dm_send_body(peer, body)
+            }
+            "dmDelete" => {
+                let everyone = arg(1)? == "true";
+                let (peer, target) = if everyone {
+                    self.dm_own_event(arg(0)?)?
+                } else {
+                    let target = parse_event_id(arg(0)?)?;
+                    let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
+                    let Some(Where::Direct(p)) = history.where_of(&target) else {
+                        return Err(Fail("not-found", "no such message".to_owned()));
+                    };
+                    let peer = MeshId::from_bytes(&p)
+                        .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
+                    (peer, target)
+                };
+                self.dm_send_body(peer, Body::Delete { target, everyone })
+            }
+            "dmReact" => {
+                let target = parse_event_id(arg(0)?)?;
+                let history = self.dm.as_ref().ok_or_else(|| dm_fail("not open"))?;
+                let Some(Where::Direct(p)) = history.where_of(&target) else {
+                    return Err(Fail("not-found", "no such message".to_owned()));
+                };
+                let peer = MeshId::from_bytes(&p)
+                    .map_err(|_| Fail("not-found", "no such message".to_owned()))?;
+                let body = Body::React {
+                    target,
+                    emoji: arg(1)?.to_owned(),
+                    on: arg(2)? == "true",
+                };
+                self.dm_send_body(peer, body)
+            }
+            "dmRead" => {
+                let (_, at) = self.dm_chat_with(arg(0)?)?;
+                let up_to = parse_event_id(arg(1)?)?;
+                let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
+                history
+                    .send(&at, Body::Read { up_to }, unix_now() * 1000)
+                    .map_err(dm_fail)?;
+                if let Some(me) = self.store.as_ref().map(Keystore::id) {
+                    self.dm_deliver(&me);
+                }
+                self.emit_chats()
+            }
+            _ => Err(Fail("unknown-fn", format!("unknown command {func}"))),
+        }
+    }
+
+    /// After events came in: the open chat's page again, or a note for each
+    /// new message from someone else, and the list.
+    pub(super) fn dm_changed(&mut self, peer: &MeshId, new: Vec<String>) {
+        if self.dm_open == Some(*peer) {
+            let _ = self.emit_page(peer, None);
+        } else {
+            for text in new {
+                let text: String = text.chars().take(NOTIFY_CHARS).collect();
+                emit(
+                    "meshDmNotify",
+                    json!({ "id": peer.to_string(), "from": peer.to_string(), "text": text }),
+                );
+            }
+        }
+        let _ = self.emit_chats();
     }
 }
 
@@ -230,12 +522,25 @@ impl Helper {
                 _ => runs.push((at, author, vec![i], vec![(received, event)])),
             }
         }
+        let mut chats = Vec::new();
         for (at, author, frames, events) in runs {
             if let Err(e) = history.receive_synced(&at, author, *via, events, now) {
                 eprintln!("mesh-node: couldn't store synced history: {e}");
                 for i in frames {
                     answers[i] = FAILED;
                 }
+            }
+            if let Where::Direct(p) = at
+                && let Ok(peer) = MeshId::from_bytes(&p)
+                && !chats.contains(&peer)
+            {
+                chats.push(peer);
+            }
+        }
+        // Our own devices' history isn't news: no notes, just what's open.
+        for peer in chats {
+            if self.dm_open == Some(peer) {
+                let _ = self.emit_page(&peer, None);
             }
         }
     }

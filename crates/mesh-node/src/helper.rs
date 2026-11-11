@@ -290,6 +290,9 @@ struct Helper {
     dm: Option<mesh_dm::history::History>,
     /// Devices a batch of chat events is on its way to.
     dm_flight: HashSet<[u8; 32]>,
+    /// The chat open on screen (`dmOpen`), which gets its page again when
+    /// it changes; others get a note.
+    dm_open: Option<MeshId>,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -398,6 +401,7 @@ impl Helper {
             link_session: 0,
             dm: None,
             dm_flight: HashSet::new(),
+            dm_open: None,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -684,6 +688,7 @@ impl Helper {
             "e2eeNote" => self.note(arg(0)?, arg(1)?, args.get(2).map(String::as_str))?,
             "deviceRemove" => self.remove_device(arg(0)?)?,
             "linkStart" => self.link_start()?,
+            f if f.starts_with("dm") => self.dm_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
             "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
             "linkCancel" => self.link_cancel()?,
@@ -1483,6 +1488,7 @@ impl Helper {
         self.e2ee = None;
         self.dm = None;
         self.dm_flight.clear();
+        self.dm_open = None;
         self.devices_at.clear();
         self.waiting.clear();
         self.unopened.clear();
