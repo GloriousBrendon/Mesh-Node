@@ -10,7 +10,7 @@
 use super::*;
 use mesh_dm::Where;
 use mesh_dm::blob::{Blobs, MAX_KEPT, Opener, chunks};
-use mesh_dm::event::{Attachment, Body, MAX_PREVIEW};
+use mesh_dm::event::{Attachment, Body, EventId, MAX_PREVIEW};
 
 /// The transport service files move on.
 pub(super) const BLOB: &str = "blob";
@@ -151,7 +151,7 @@ impl Helper {
     pub(super) fn files_of_deleted(
         &mut self,
         events: &[mesh_dm::event::Event],
-    ) -> Vec<Option<[u8; 32]>> {
+    ) -> Vec<Option<(EventId, [u8; 32])>> {
         let Some(history) = &mut self.dm else {
             return vec![None; events.len()];
         };
@@ -161,7 +161,7 @@ impl Helper {
                     Ok(Some(mesh_dm::event::Event {
                         body: Body::Text { attachments, .. },
                         ..
-                    })) => attachments.first().map(|a| a.hash),
+                    })) => attachments.first().map(|a| (*target, a.hash)),
                     _ => None,
                 },
                 _ => None,
@@ -169,9 +169,29 @@ impl Helper {
             .collect()
     }
 
-    pub(super) fn drop_file(&self, hash: &[u8; 32]) {
+    /// Drops a deleted message's kept file and any copy opened from it.
+    pub(super) fn drop_file(&self, (message, hash): &(EventId, [u8; 32])) {
         if let Err(e) = Blobs::new(&self.blobs_dir()).remove(hash) {
             eprintln!("mesh-node: couldn't drop a kept file: {e}");
+        }
+        let prefix = format!("{}-", e2ee::hex(message));
+        self.clear_opened(|name| name.starts_with(&prefix));
+    }
+
+    fn opened_dir(&self) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).join("files")
+    }
+
+    /// Removes the opened copies `which` names (by folder), the only
+    /// plaintext outside the sealed store; all of them at unlock and lock.
+    pub(super) fn clear_opened(&self, which: impl Fn(&str) -> bool) {
+        let entries = std::fs::read_dir(self.opened_dir()).into_iter().flatten();
+        let failed = (entries.flatten())
+            .filter(|e| which(&e.file_name().to_string_lossy()))
+            .filter(|e| std::fs::remove_dir_all(e.path()).is_err())
+            .count();
+        if failed > 0 {
+            eprintln!("mesh-node: couldn't remove {failed} opened files");
         }
     }
 
@@ -332,12 +352,7 @@ impl Helper {
                 }
             })
             .collect();
-        let dir = self
-            .path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("files")
-            .join(format!("{message}-{index}"));
+        let dir = self.opened_dir().join(format!("{message}-{index}"));
         std::fs::create_dir_all(&dir).map_err(io)?;
         let path = dir.join(if safe.is_empty() {
             "file".to_owned()

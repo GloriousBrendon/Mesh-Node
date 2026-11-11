@@ -122,6 +122,8 @@ fn parse_event_id(text: &str) -> Result<EventId, Fail> {
 impl Helper {
     /// Opens this device's history, as networking starts.
     pub(super) fn open_dm(&mut self) {
+        // Opened copies from the last run go (dm *Never*).
+        self.clear_opened(|_| true);
         let Some(store) = &self.store else { return };
         let data = self.path.parent().unwrap_or(Path::new("."));
         let me = DmSender {
@@ -312,8 +314,8 @@ impl Helper {
                         .filter_map(|(_, text)| text)
                         .collect();
                     for (hash, t) in dropped.iter().zip(&taken) {
-                        if let (Some(hash), Taken::Shown) = (hash, t) {
-                            self.drop_file(hash);
+                        if let (Some(file), Taken::Shown) = (hash, t) {
+                            self.drop_file(file);
                         }
                     }
                     self.dm_changed(&at, id, new);
@@ -597,8 +599,8 @@ impl Helper {
                     body: body.clone(),
                 }));
                 self.dm_send_body(&at, body)?;
-                for hash in dropped.into_iter().flatten() {
-                    self.drop_file(&hash);
+                for file in dropped.into_iter().flatten() {
+                    self.drop_file(&file);
                 }
                 Ok(())
             }

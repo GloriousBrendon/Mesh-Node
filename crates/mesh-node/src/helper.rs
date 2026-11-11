@@ -1524,7 +1524,9 @@ impl Helper {
             emit_net(None, false, false);
         }
         self.e2ee = None;
-        self.dm = None;
+        if self.dm.take().is_some() {
+            self.clear_opened(|_| true);
+        }
         self.dm_flight.clear();
         self.dm_open = None;
         self.devices_at.clear();

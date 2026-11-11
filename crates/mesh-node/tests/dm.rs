@@ -5,6 +5,8 @@
 //! once the other device took it. No text reaches any log.
 
 use serde_json::Value;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 mod common;
 use common::{Helper, Relay, Seed, temp_dir};
@@ -353,6 +355,37 @@ fn a_file_goes_by_chunks() {
     let got = ask(&mut bob, "dmFetch", &[&id_a, &event, "0"], "meshDmFile");
     let path = got["path"].as_str().unwrap();
     assert_eq!(std::fs::read(path).unwrap(), plain, "the same bytes");
+
+    // Delete for everyone: no copy is left on disk, opened or sealed, but
+    // Alice's own source.
+    ask(&mut alice, "dmDelete", &[&event, "true"], "meshDmMessages");
+    let copies = || {
+        let mut found = Vec::new();
+        let mut walk = vec![dirs[1].clone(), dirs[2].clone()];
+        while let Some(dir) = walk.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk.push(path);
+                } else if path != source
+                    && (path.file_name() == Some("trail.pdf".as_ref())
+                        || path.extension() == Some("blob".as_ref()))
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !copies().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        copies(),
+        Vec::<PathBuf>::new(),
+        "copies left after the delete"
+    );
 
     // A second file, then Alice goes: nobody connected has it.
     let other = dirs[1].join("notes.txt");
