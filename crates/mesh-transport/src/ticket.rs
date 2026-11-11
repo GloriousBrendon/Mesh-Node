@@ -6,6 +6,9 @@
 use crate::MeshAddr;
 
 const PREFIX: &str = "mesh://node/";
+/// Direct addresses a ticket may carry: a seed's fixed IPv4 and IPv6, and
+/// room to spare.
+pub const MAX_DIRECT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TicketError {
@@ -13,37 +16,59 @@ pub enum TicketError {
     WrongScheme,
     #[error("the ticket's device key is damaged")]
     BadKey,
-    #[error("the ticket has no relay")]
+    #[error("the ticket has no relay or address")]
     NoRelay,
+    #[error("the ticket's address is damaged")]
+    BadAddr,
     #[error("the ticket's relay address is damaged")]
     BadRelay,
 }
 
+/// `mesh://node/<key>?relay=<url>&addr=<ip:port>…`: the relay, any direct
+/// addresses (a seed's fixed one, SPEC-seed D8c), or both. Tickets with only
+/// a relay read as they always have.
 impl MeshAddr {
-    /// This address as a ticket to paste: the key and relay only, never the
-    /// direct addresses. Needs a relay (`NoRelay` until the node has one).
     pub fn ticket(&self) -> Result<String, TicketError> {
-        let relay = self.relay.as_ref().ok_or(TicketError::NoRelay)?;
-        Ok(format!("{PREFIX}{}?relay={relay}", self.device))
+        if self.relay.is_none() && self.direct.is_empty() {
+            return Err(TicketError::NoRelay);
+        }
+        if self.direct.len() > MAX_DIRECT {
+            return Err(TicketError::BadAddr);
+        }
+        let mut params: Vec<String> = self.relay.iter().map(|r| format!("relay={r}")).collect();
+        params.extend(self.direct.iter().map(|a| format!("addr={a}")));
+        Ok(format!("{PREFIX}{}?{}", self.device, params.join("&")))
     }
 
-    /// Reads a pasted ticket; each failure says what's wrong with it.
     pub fn from_ticket(text: &str) -> Result<Self, TicketError> {
         let rest = text
             .trim()
             .strip_prefix(PREFIX)
             .ok_or(TicketError::WrongScheme)?;
-        let (key, relay) = rest.split_once("?relay=").ok_or(TicketError::NoRelay)?;
+        let (key, query) = rest.split_once('?').ok_or(TicketError::NoRelay)?;
         let device = key.parse().map_err(|_| TicketError::BadKey)?;
-        let relay: iroh::RelayUrl = relay.parse().map_err(|_| TicketError::BadRelay)?;
-        // Relays are reached over HTTP(S) only.
-        if !matches!(relay.scheme(), "https" | "http") {
-            return Err(TicketError::BadRelay);
+        let (mut relay, mut direct) = (None, Vec::new());
+        for param in query.split('&') {
+            if let Some(url) = param.strip_prefix("relay=") {
+                let url: iroh::RelayUrl = url.parse().map_err(|_| TicketError::BadRelay)?;
+                if !matches!(url.scheme(), "https" | "http") {
+                    return Err(TicketError::BadRelay);
+                }
+                relay = Some(url);
+            } else if let Some(addr) = param.strip_prefix("addr=") {
+                direct.push(addr.parse().map_err(|_| TicketError::BadAddr)?);
+                if direct.len() > MAX_DIRECT {
+                    return Err(TicketError::BadAddr);
+                }
+            }
+        }
+        if relay.is_none() && direct.is_empty() {
+            return Err(TicketError::NoRelay);
         }
         Ok(Self {
             device,
-            relay: Some(relay),
-            direct: Vec::new(),
+            relay,
+            direct,
         })
     }
 }
@@ -64,12 +89,33 @@ mod tests {
     fn round_trips() {
         let ticket = addr().ticket().unwrap();
         assert!(ticket.starts_with(PREFIX));
-        // Direct addresses never go into a ticket.
+        assert!(
+            !ticket.contains("addr="),
+            "no direct address, none in the ticket"
+        );
+        // A seed's fixed address goes in, and comes back out.
         let with_ip = MeshAddr {
-            direct: vec!["192.168.1.2:4000".parse().unwrap()],
+            direct: vec![
+                "203.0.113.5:7400".parse().unwrap(),
+                "[2001:db8::5]:7400".parse().unwrap(),
+            ],
             ..addr()
         };
-        assert_eq!(with_ip.ticket(), Ok(ticket.clone()));
+        let fixed = with_ip.ticket().unwrap();
+        assert!(
+            fixed.contains("&addr=203.0.113.5:7400&addr=[2001:db8::5]:7400"),
+            "{fixed}"
+        );
+        assert_eq!(MeshAddr::from_ticket(&fixed), Ok(with_ip.clone()));
+        // An address alone is enough; so is a relay alone, as tickets were.
+        let direct_only = MeshAddr {
+            relay: None,
+            ..with_ip
+        };
+        assert_eq!(
+            MeshAddr::from_ticket(&direct_only.ticket().unwrap()),
+            Ok(direct_only)
+        );
         assert_eq!(
             MeshAddr {
                 relay: None,
@@ -103,6 +149,12 @@ mod tests {
                 TicketError::BadRelay,
             ),
             (ticket.replace("https://", "file://"), TicketError::BadRelay),
+            (format!("{ticket}&addr=203.0.113.5"), TicketError::BadAddr),
+            (format!("{ticket}&addr=nowhere:7400"), TicketError::BadAddr),
+            (
+                format!("{ticket}{}", "&addr=203.0.113.5:1".repeat(MAX_DIRECT + 1)),
+                TicketError::BadAddr,
+            ),
         ];
         for (text, error) in cases {
             assert_eq!(MeshAddr::from_ticket(&text), Err(error), "{text}");

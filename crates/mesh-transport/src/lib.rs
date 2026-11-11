@@ -96,6 +96,10 @@ pub struct Config {
     pub services: Vec<String>,
     /// Whose devices may connect to this node; everyone by default.
     pub allow: Allow,
+    /// A fixed UDP port for direct connections, on every IPv4 and IPv6
+    /// address (a seed with a public address, SPEC-seed D8c). `None` lets
+    /// iroh pick one, as devices do.
+    pub port: Option<u16>,
     #[cfg(feature = "test-utils")]
     pub test: TestOptions,
 }

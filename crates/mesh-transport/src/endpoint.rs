@@ -85,6 +85,21 @@ impl Node {
             .relay_mode(relay_mode)
             .transport_config(quic)
             .alpns(vec![ALPN.to_vec()]);
+        let builder = match config.port {
+            // iroh starts with its own IPv4 and IPv6 sockets on any port;
+            // these replace them. IPv6 may be missing on the machine.
+            Some(port) => builder
+                .clear_ip_transports()
+                .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+                .and_then(|b| {
+                    b.bind_addr_with_opts(
+                        std::net::SocketAddr::from(([0u16; 8], port)),
+                        iroh::endpoint::BindOpts::default().set_is_required(false),
+                    )
+                })
+                .map_err(|e| TransportError::Bind(e.to_string()))?,
+            None => builder,
+        };
         #[cfg(feature = "test-utils")]
         let builder = config.test.apply(builder);
         let endpoint = builder
@@ -211,6 +226,29 @@ impl Node {
             }
             opened => opened.map(|(send, recv)| (peer, send, recv)),
         }
+    }
+
+    /// As `open`, but tries `addr`'s direct addresses alone for `wait` first,
+    /// and adds its relay only if that fails. With both from the start, iroh
+    /// keeps whichever path answers first, often the relay; a seed with a
+    /// fixed address wants callers direct from their first request
+    /// (SPEC-seed D8c). An address with no direct part just uses `open`.
+    pub async fn open_direct_first(
+        &self,
+        addr: &MeshAddr,
+        service: &str,
+        wait: Duration,
+    ) -> Result<(Peer, SendStream, RecvStream), TransportError> {
+        if !addr.direct.is_empty() && addr.relay.is_some() {
+            let direct = MeshAddr {
+                relay: None,
+                ..addr.clone()
+            };
+            if let Ok(Ok(opened)) = tokio::time::timeout(wait, self.open(&direct, service)).await {
+                return Ok(opened);
+            }
+        }
+        self.open(addr, service).await
     }
 
     /// The next stream another device opened for one of `Config::services`.

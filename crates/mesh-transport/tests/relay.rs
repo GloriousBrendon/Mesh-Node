@@ -69,3 +69,72 @@ async fn real_relays() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
+/// A seed on a fixed port with its relay (SPEC-seed D8c), and the service a
+/// client opens on it.
+async fn fixed_seed(url: &iroh::RelayUrl) -> (Node, MeshAddr) {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (root, key) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
+    let cert = DeviceCert::issue(&root, &key.public(), "seed", 1).unwrap();
+    let config = Config {
+        relays: Relays::Custom(vec![url.clone()]),
+        services: vec!["ask".into()],
+        port: Some(port),
+        test: TestOptions {
+            trust_any_relay: true,
+            relay_only: false,
+        },
+        ..Config::default()
+    };
+    let seed = Node::start(&key, &cert, config).await.unwrap();
+    assert!(seed.online(Duration::from_secs(10)).await);
+    let addr = MeshAddr {
+        direct: vec![([127, 0, 0, 1], port).into()],
+        ..via_relay(&seed)
+    };
+    (seed, addr)
+}
+
+const WAIT: Duration = Duration::from_secs(2);
+
+#[tokio::test]
+async fn direct_first_arrives_direct_on_the_first_stream() {
+    let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
+    let (seed, addr) = fixed_seed(&url).await;
+    let test = TestOptions {
+        trust_any_relay: true,
+        relay_only: false,
+    };
+    let (client, _) = node(Relays::Custom(vec![url]), test).await;
+    client
+        .open_direct_first(&addr, "ask", WAIT)
+        .await
+        .expect("opens");
+    let stream = seed.next_stream().await.unwrap();
+    assert!(stream.direct_ip.is_some(), "the first stream came by relay");
+}
+
+#[tokio::test]
+async fn direct_first_falls_back_to_the_relay() {
+    let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
+    let (seed, addr) = fixed_seed(&url).await;
+    // A network that blocks UDP: the client can use the relay only.
+    let test = TestOptions {
+        trust_any_relay: true,
+        relay_only: true,
+    };
+    let (client, _) = node(Relays::Custom(vec![url]), test).await;
+    assert!(client.online(Duration::from_secs(10)).await);
+    let started = std::time::Instant::now();
+    client
+        .open_direct_first(&addr, "ask", WAIT)
+        .await
+        .expect("gets through");
+    assert!(started.elapsed() >= WAIT, "it tried direct first");
+    let stream = seed.next_stream().await.unwrap();
+    assert!(stream.direct_ip.is_none());
+}

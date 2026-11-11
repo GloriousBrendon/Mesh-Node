@@ -38,7 +38,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a changed store is written out.
 const SAVE_EVERY: Duration = Duration::from_secs(5);
 /// How often expired records go, and the counts are logged.
-const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// How often the stores are swept and the counts logged.
+pub const REPORT_EVERY: Duration = Duration::from_secs(3600);
+/// How long a client tries a seed's direct address alone before it adds the
+/// relay (D8c): enough for a handshake on a slow line (two round trips of
+/// about 700 ms on satellite), short enough that a network that blocks UDP
+/// costs only this once.
+const DIRECT_FIRST: Duration = Duration::from_secs(2);
+
+/// How a seed is run (`mesh-node seed` flags).
+pub struct Options {
+    /// A fixed UDP port (D8c).
+    pub port: Option<u16>,
+    /// The address callers reach that port at, for the ticket.
+    pub public: Option<std::net::SocketAddr>,
+    pub report: Duration,
+}
 
 /// What the hourly log line reports.
 #[derive(Default)]
@@ -127,7 +142,7 @@ const CONNECTIONS: usize = 2048;
 /// Handshakes under way at once.
 const HANDSHAKES: usize = 128;
 
-pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
+pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), String> {
     let (root, device) = key(&dir.join(KEY_FILE))?;
     let cert = DeviceCert::issue(&root, &device.public(), "seed", unix_now())
         .map_err(|e| format!("can't make the seed's certificate: {e}"))?;
@@ -156,6 +171,7 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
             idle: Some(IDLE),
             ..Limits::default()
         },
+        port: options.port,
         ..Config::default()
     };
     let node = Arc::new(
@@ -165,12 +181,12 @@ pub async fn run(dir: &Path, relays: Relays) -> Result<(), String> {
     );
     let counts = Arc::new(Counts::default());
 
-    tokio::spawn(announce(node.clone()));
+    tokio::spawn(announce(node.clone(), options.public));
     tokio::spawn(serve(node.clone(), stores.clone(), counts.clone()));
     tokio::spawn(save_often(stores.codes.clone(), SAVE_EVERY));
     tokio::spawn(save_often(stores.addrs.clone(), SAVE_ADDRS_EVERY));
     tokio::spawn(save_often(stores.knocks.clone(), SAVE_ADDRS_EVERY));
-    tokio::spawn(sweep_hourly(stores.clone(), counts));
+    tokio::spawn(sweep_hourly(stores.clone(), counts, options.report));
 
     shutdown().await;
     eprintln!("mesh-node seed: stopping");
@@ -228,12 +244,17 @@ fn key(path: &Path) -> Result<(RootKey, DeviceKey), String> {
 }
 
 /// Logs the seed's ticket once it has a home relay: it goes in the clients'
-/// built-in list. It names the seed's key and relay, nobody else's.
-async fn announce(node: Arc<Node>) {
+/// built-in list. It names the seed's key, relay and `--public` address,
+/// nothing else: never the machine's own LAN addresses.
+async fn announce(node: Arc<Node>, public: Option<std::net::SocketAddr>) {
     while !node.online(Duration::from_secs(30)).await {
         eprintln!("mesh-node seed: no relay reachable yet");
     }
-    match node.addr().ticket() {
+    let addr = MeshAddr {
+        direct: public.into_iter().collect(),
+        ..node.addr()
+    };
+    match addr.ticket() {
         Ok(ticket) => eprintln!("mesh-node seed: ticket {ticket}"),
         Err(e) => eprintln!("mesh-node seed: no ticket: {e}"),
     }
@@ -420,9 +441,9 @@ fn save<S: Saved>(store: &Mutex<S>) {
     }
 }
 
-async fn sweep_hourly(stores: Stores, counts: Arc<Counts>) {
+async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
     loop {
-        tokio::time::sleep(SWEEP_EVERY).await;
+        tokio::time::sleep(every).await;
         let now = unix_now();
         let held = {
             let mut store = lock(&stores.codes);
@@ -472,7 +493,10 @@ pub async fn ask(
     request: &[u8],
 ) -> Result<Vec<u8>, ()> {
     let exchange = async {
-        let (_, mut send, mut recv) = node.open(seed, service).await.map_err(drop)?;
+        let (_, mut send, mut recv) = node
+            .open_direct_first(seed, service, DIRECT_FIRST)
+            .await
+            .map_err(drop)?;
         frame::write_frame(&mut send, request).await.map_err(drop)?;
         send.finish().map_err(drop)?;
         frame::read_frame(&mut recv).await.ok().flatten().ok_or(())
@@ -492,7 +516,10 @@ pub async fn ask_many(
     requests: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, ()> {
     let exchange = async {
-        let (_, mut send, mut recv) = node.open(seed, service).await.map_err(drop)?;
+        let (_, mut send, mut recv) = node
+            .open_direct_first(seed, service, DIRECT_FIRST)
+            .await
+            .map_err(drop)?;
         let sending = async {
             for request in requests {
                 frame::write_frame(&mut send, request).await.map_err(drop)?;

@@ -400,7 +400,11 @@ async fn existing_session(
         if !node.online(ONLINE_WAIT).await {
             return Err(OFFLINE);
         }
-        let ticket = node.addr().ticket().map_err(|_| OFFLINE)?;
+        let relayed = MeshAddr {
+            direct: Vec::new(),
+            ..node.addr()
+        };
+        let ticket = relayed.ticket().map_err(|_| OFFLINE)?;
         let record = rendezvous
             .seal(ticket.as_bytes(), now)
             .map_err(|_| NO_RANDOM)?;

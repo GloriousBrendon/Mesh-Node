@@ -452,3 +452,36 @@ async fn idle_connections_close_and_the_next_request_redials() {
     frame::write_frame(&mut send, b"again").await.unwrap();
     assert!(b.next_stream().await.is_some());
 }
+
+/// A seed's fixed port (SPEC-seed D8c): the node listens there, and a dialler
+/// that knows only that address reaches it.
+#[tokio::test]
+async fn a_fixed_port_is_the_one_bound() {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (seed, client) = (Device::new(), Device::new());
+    let config = Config {
+        relays: Relays::Disabled,
+        port: Some(port),
+        ..Config::default()
+    };
+    let s = Node::start(&seed.key, &seed.cert("seed"), config)
+        .await
+        .unwrap();
+    assert!(
+        s.bound_sockets().iter().all(|a| a.port() == port),
+        "{:?}",
+        s.bound_sockets()
+    );
+    let c = client.node("laptop").await;
+    let fixed = MeshAddr {
+        device: s.addr().device,
+        relay: None,
+        direct: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))],
+    };
+    let peer = c.dial(&fixed).await.expect("dial the fixed port");
+    assert_eq!(peer.id, seed.id());
+}

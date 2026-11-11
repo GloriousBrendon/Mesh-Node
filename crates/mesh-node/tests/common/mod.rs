@@ -223,11 +223,16 @@ pub struct Seed {
 
 impl Seed {
     pub fn start(dir: &Path, relay: &Relay) -> Self {
+        Self::start_with(dir, relay, &[])
+    }
+
+    pub fn start_with(dir: &Path, relay: &Relay, args: &[&str]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mesh-node"));
         command
             .args(["seed", "--data"])
             .arg(dir)
             .args(["--relay", &relay.url])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -260,6 +265,20 @@ impl Seed {
             self.log.push(line.clone());
             if let Some(ticket) = line.strip_prefix("mesh-node seed: ticket ") {
                 return ticket.to_owned();
+            }
+        }
+    }
+
+    /// Waits for a log line that `done` accepts.
+    pub fn line_with(&mut self, done: impl Fn(&str) -> bool) -> String {
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the seed went quiet");
+            self.log.push(line.clone());
+            if done(&line) {
+                return line;
             }
         }
     }

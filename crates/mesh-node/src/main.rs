@@ -8,7 +8,11 @@
 //! `MESH_SEEDS` environment variable (space-separated tickets) is used; set
 //! but empty, there are no seeds.
 //!
-//! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed).
+//! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed). On a
+//! machine with a public address, `--port <udp>` fixes its port and
+//! `--public <ip:port>` puts that address in its ticket, so callers reach it
+//! direct (D8c). `--report-every <secs>` shortens the hourly counts, for
+//! tests.
 
 mod addrs;
 mod codes;
@@ -110,13 +114,49 @@ fn main() {
         }
     };
     if seed {
-        if let Err(e) = runtime.block_on(seed::run(&dir, relays)) {
+        let options = match seed_options(&args) {
+            Ok(options) => options,
+            Err(e) => {
+                eprintln!("mesh-node seed: {e}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(e) = runtime.block_on(seed::run(&dir, relays, options)) {
             eprintln!("mesh-node seed: {e}");
             std::process::exit(1);
         }
     } else {
         runtime.block_on(helper::run(&dir, relays, seeds, record_ttl));
     }
+}
+
+/// The seed's `--port`, `--public` and `--report-every`.
+fn seed_options(args: &[String]) -> Result<seed::Options, String> {
+    let value = |flag: &str| {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    };
+    let port = value("--port")
+        .map(|p| p.parse::<u16>().map_err(|_| "--port takes a UDP port"))
+        .transpose()?;
+    let public = value("--public")
+        .map(|a| a.parse().map_err(|_| "--public takes an ip:port"))
+        .transpose()?;
+    let report = match value("--report-every") {
+        None => seed::REPORT_EVERY,
+        Some(s) => std::time::Duration::from_secs(
+            s.parse::<u64>()
+                .ok()
+                .filter(|&s| s > 0)
+                .ok_or("--report-every takes seconds")?,
+        ),
+    };
+    Ok(seed::Options {
+        port,
+        public,
+        report,
+    })
 }
 
 /// Our relay (on the homelab, SPEC-seed D5), then n0's. iroh makes whichever

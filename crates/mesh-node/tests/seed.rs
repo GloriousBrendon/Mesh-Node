@@ -305,3 +305,86 @@ fn a_damaged_address_file_starts_empty() {
     drop(relay.runtime);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn free_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A seed on a fixed port, its address in its ticket (SPEC-seed D8c).
+fn fixed_seed(dir: &std::path::Path, relay: &Relay) -> (Seed, String, u16) {
+    let port = free_port();
+    let (port_arg, public) = (port.to_string(), format!("127.0.0.1:{port}"));
+    let args = [
+        "--port",
+        &port_arg,
+        "--public",
+        &public,
+        "--report-every",
+        "2",
+    ];
+    let mut seed = Seed::start_with(dir, relay, &args);
+    let ticket = seed.ticket();
+    assert!(ticket.contains(&format!("addr={public}")), "{ticket}");
+    (seed, ticket, port)
+}
+
+/// The first report that saw any caller.
+fn callers(seed: &mut Seed) -> String {
+    seed.line_with(|l| l.contains("callers") && !l.contains("callers 0 direct, 0 relayed, 0 both"))
+}
+
+/// Dialled direct first, a caller arrives direct from its first request, so
+/// it's never counted in the relayed bucket.
+#[test]
+fn a_fixed_port_seed_counts_its_first_caller_as_direct() {
+    let (dir_s, dir_a) = (temp_dir("fixed-seed"), temp_dir("fixed-a"));
+    let relay = Relay::start();
+    let (mut seed, ticket, _) = fixed_seed(&dir_s, &relay);
+    let mut a = Helper::start_with(&dir_a, &relay, &["--seed", &ticket]);
+    assert_eq!(a.event().0, "meshIdentity");
+    a.expect("idCreate", &["alice", PASSWORD], "meshIdentity");
+    assert_eq!(a.event().0, "meshCodes");
+    a.held_code("1");
+    let line = callers(&mut seed);
+    assert!(
+        line.contains("callers 1 direct, 0 relayed, 0 both ways"),
+        "{line}"
+    );
+    a.quit();
+    seed.stop();
+    for dir in [dir_s, dir_a] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A caller that can't reach the fixed address in the ticket still gets
+/// through, by the relay, after the short direct-first wait.
+#[test]
+fn a_caller_that_cant_reach_the_fixed_address_goes_by_relay() {
+    let (dir_s, dir_a) = (temp_dir("blocked-seed"), temp_dir("blocked-a"));
+    let relay = Relay::start();
+    let (mut seed, ticket, port) = fixed_seed(&dir_s, &relay);
+    let blocked = ticket.replace(
+        &format!("127.0.0.1:{port}"),
+        &format!("127.0.0.1:{}", free_port()),
+    );
+    let mut a = Helper::start_with(&dir_a, &relay, &["--seed", &blocked]);
+    assert_eq!(a.event().0, "meshIdentity");
+    a.expect("idCreate", &["alice", PASSWORD], "meshIdentity");
+    assert_eq!(a.event().0, "meshCodes");
+    // Got through: the code is held. On one machine iroh then finds the
+    // seed's loopback address through the relay and goes direct, so the
+    // path itself is checked in mesh-transport's relay test, with a client
+    // that can only use the relay.
+    a.held_code("1");
+    callers(&mut seed);
+    a.quit();
+    seed.stop();
+    for dir in [dir_s, dir_a] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
