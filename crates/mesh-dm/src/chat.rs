@@ -93,6 +93,8 @@ pub struct Chat {
     pending: HashMap<EventId, Vec<EventId>>,
     /// Deleted messages: a late copy, edit or reaction can't bring them back.
     deleted: HashSet<EventId>,
+    /// Deleted since `take_deleted` last asked, for the log.
+    newly_deleted: Vec<EventId>,
     /// Stored events to wipe (`take_scrub`).
     scrub: Vec<EventId>,
     /// A group's changes (D7).
@@ -123,6 +125,7 @@ impl Chat {
             folded: HashMap::new(),
             pending: HashMap::new(),
             deleted: HashSet::new(),
+            newly_deleted: Vec::new(),
             scrub: Vec::new(),
             group: Group::default(),
         }
@@ -218,6 +221,7 @@ impl Chat {
                     }
                 }
                 self.deleted.insert(event.id);
+                self.newly_deleted.push(event.id);
                 true
             }
             _ => false,
@@ -338,6 +342,7 @@ impl Chat {
                 }
                 self.wipe(target);
                 self.deleted.insert(target);
+                self.newly_deleted.push(target);
             }
             _ => self.wipe(id),
         }
@@ -437,6 +442,70 @@ impl Chat {
     /// the creation has arrived.
     pub fn group(&self) -> Option<Version> {
         self.group.version()
+    }
+
+    /// Puts back an event read from disk. No checks: it passed them when it
+    /// came. Shown, or waiting if it's still ahead of the clock.
+    pub fn restore(&mut self, from: Sender, event: Event, received: u64, now: u64) {
+        if self.held.contains_key(&event.id) || self.deleted.contains(&event.id) {
+            return;
+        }
+        let waiting = event.seq > now.saturating_add(AHEAD_SHOWN);
+        if waiting {
+            *self.waiting.entry(from.device).or_default() += 1;
+        }
+        let steps = self.steps.entry(from.device).or_default();
+        steps.insert(event.n, event.seq);
+        let id = event.id;
+        let held = Held {
+            sender: from,
+            event,
+            received,
+            waiting,
+        };
+        self.held.insert(id, held);
+        if !waiting {
+            self.show(id);
+        }
+    }
+
+    /// A message deleted before this chat was loaded: late copies, edits
+    /// and reactions of it stay refused.
+    pub fn was_deleted(&mut self, id: EventId) {
+        self.deleted.insert(id);
+    }
+
+    /// Messages deleted since this was last asked, for the log.
+    pub fn take_deleted(&mut self) -> Vec<EventId> {
+        std::mem::take(&mut self.newly_deleted)
+    }
+
+    pub fn read_marker(&self) -> Option<Position> {
+        self.read
+    }
+
+    /// The read marker as the index saved it.
+    pub fn set_read_marker(&mut self, at: Position) {
+        self.read = Some(self.read.map_or(at, |read| read.max(at)));
+    }
+
+    /// Each sending device's highest `n` and its `seq`, for the index.
+    pub fn highs(&self) -> Vec<(Device, u64, u64)> {
+        let highs = self.steps.iter();
+        let highs = highs.filter_map(|(d, s)| s.last_key_value().map(|(n, seq)| (*d, *n, *seq)));
+        highs.collect()
+    }
+
+    /// A device's highest `n` and `seq` from history not loaded: "out of
+    /// step" and `next_seq` check against it too.
+    pub fn know_high(&mut self, device: Device, n: u64, seq: u64) {
+        self.steps.entry(device).or_default().insert(n, seq);
+    }
+
+    /// The next `n` for `device`.
+    pub fn next_n(&self, device: &Device) -> u64 {
+        let last = self.steps.get(device).and_then(|s| s.last_key_value());
+        last.map_or(0, |(n, _)| *n) + 1
     }
 
     /// Events whose stored copies must now be wiped: a deleted message, its

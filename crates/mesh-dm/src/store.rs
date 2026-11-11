@@ -209,6 +209,24 @@ impl ChatFiles {
         Ok((events, at as u64))
     }
 
+    /// Where the next `count` appended events will be kept: segment and
+    /// position.
+    pub fn next_places(&self, count: usize) -> Vec<(u32, u32)> {
+        let (mut segment, mut used) = match self.segments.checked_sub(1) {
+            Some(newest) if self.last.0 < SEGMENT_EVENTS => (newest, self.last.0),
+            _ => (self.segments, 0),
+        };
+        (0..count)
+            .map(|_| {
+                if used == SEGMENT_EVENTS {
+                    (segment, used) = (segment + 1, 0);
+                }
+                used += 1;
+                (segment, used as u32 - 1)
+            })
+            .collect()
+    }
+
     /// Adds events, starting new segments as they fill, and syncs them to
     /// disk before returning.
     pub fn append(&mut self, events: &[Vec<u8>]) -> Result<(), StoreError> {

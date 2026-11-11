@@ -8,6 +8,7 @@ pub mod blob;
 pub mod chat;
 pub mod event;
 pub mod group;
+pub mod history;
 pub mod store;
 pub mod sync;
 
