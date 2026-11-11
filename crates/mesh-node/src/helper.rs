@@ -210,6 +210,11 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
                 continue;
             }
             _ = refresh.tick() => {
+                if let Some(history) = &mut helper.dm
+                    && let Err(e) = history.sweep_waiting(unix_now() * 1000)
+                {
+                    eprintln!("mesh-node: couldn't sweep the chat history: {e}");
+                }
                 helper.publish();
                 helper.dial_contacts();
                 helper.sync_own();
