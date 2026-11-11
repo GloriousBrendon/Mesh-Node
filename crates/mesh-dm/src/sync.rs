@@ -90,6 +90,10 @@ struct Counter {
     upto: u64,
     /// Acknowledged past `upto`.
     above: BTreeSet<u64>,
+    /// Given up for this device (past the friend limits): never "sent".
+    // ponytail: kept for good; only a friend's device away 30 days or 2,000 events behind adds to it.
+    #[serde(default)]
+    given_up: BTreeSet<u64>,
 }
 
 /// What to send a device now, and what's given up for it.
@@ -133,17 +137,31 @@ impl Counters {
             person,
             upto,
             above: BTreeSet::new(),
+            given_up: BTreeSet::new(),
         };
         self.devices.insert(device, counter);
     }
 
-    /// Whether a device of someone other than us has acknowledged event
-    /// `number`: what "sent" means (D5).
-    pub fn taken_by_others(&self, number: u64) -> bool {
-        let others = self.devices.values().filter(|c| c.person != self.me);
-        others
-            .into_iter()
-            .any(|c| c.upto >= number || c.above.contains(&number))
+    /// Whether a device of someone in that event's chat, other than us, has
+    /// acknowledged it: what "sent" means (D5). A counter also moves past
+    /// events that weren't for it, and past ones given up for it; neither
+    /// counts.
+    pub fn taken_by_others(
+        &self,
+        number: u64,
+        log: &Log,
+        shares: impl Fn(&Conversation, &Person) -> bool,
+    ) -> bool {
+        let Some(e) = log.get(number) else {
+            return false;
+        };
+        let theirs = self.devices.values().filter(|c| {
+            c.person != self.me && e.author == self.me && !e.private && shares(&e.chat, &c.person)
+        });
+        let mut theirs = theirs;
+        theirs.any(|c| {
+            !c.given_up.contains(&number) && (c.upto >= number || c.above.contains(&number))
+        })
     }
 
     pub fn counter(&self, device: &Device) -> Option<u64> {
@@ -180,6 +198,7 @@ impl Counters {
             waiting = kept[over..].to_vec();
         }
         counter.above.extend(&given_up);
+        counter.given_up.extend(&given_up);
         let person = counter.person;
         advance(counter, log, |n| {
             meant_for(log, n, device, person, me, &shares)

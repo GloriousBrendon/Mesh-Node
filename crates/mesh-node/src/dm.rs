@@ -15,7 +15,6 @@ use mesh_dm::Where;
 use mesh_dm::chat::Taken;
 use mesh_dm::event::{Body, Event, EventId};
 use mesh_dm::history::History;
-use mesh_dm::store::Conversation as Chat;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// The frame flag asking the reader to answer each frame once it's stored.
@@ -91,10 +90,7 @@ impl Helper {
             return;
         }
         history.add_device(device, id.to_bytes());
-        let shares = |chat: &Chat, person: &[u8; 32]| {
-            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p).key())
-        };
-        let mut out = match history.outgoing(&device, shares, unix_now() * 1000) {
+        let mut out = match history.outgoing(&device, unix_now() * 1000) {
             Ok(out) => out,
             Err(e) => return eprintln!("mesh-node: couldn't read the chat history: {e}"),
         };
@@ -145,11 +141,8 @@ impl Helper {
         self.dm_flight.remove(&device);
         let Some(history) = &mut self.dm else { return };
         let Some(answers) = answers else { return };
-        let shares = |chat: &Chat, person: &[u8; 32]| {
-            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p).key())
-        };
         for (number, ok) in numbers.iter().zip(&answers) {
-            history.acked(&device, *number, *ok, shares);
+            history.acked(&device, *number, *ok);
         }
         if let Err(e) = history.save_counters() {
             eprintln!("mesh-node: couldn't save the delivery counters: {e}");
@@ -651,14 +644,11 @@ mod tests {
         // device as ours while the envelopes use the pair's session: the
         // same opening and storing, event for event.
         a_history.add_device(device, alice.to_bytes());
-        let shares = |c: &Chat, p: &[u8; 32]| {
-            MeshId::from_bytes(p).is_ok_and(|p| *c == direct_chat(&p).key())
-        };
         let started = std::time::Instant::now();
         let mut intake = std::time::Duration::ZERO;
         let mut taken = 0;
         loop {
-            let mut out = a_history.outgoing(&device, shares, ms).unwrap();
+            let mut out = a_history.outgoing(&device, ms).unwrap();
             out.truncate(e2ee::MAX_FRAMES);
             if out.is_empty() {
                 break;
@@ -693,7 +683,7 @@ mod tests {
             };
             let (answers, ()) = tokio::join!(exchange(send, recv, &frames), reader);
             for (t, ok) in out.iter().zip(answers.unwrap()) {
-                a_history.acked(&device, t.number, ok, shares);
+                a_history.acked(&device, t.number, ok);
             }
             a_history.save_counters().unwrap();
         }

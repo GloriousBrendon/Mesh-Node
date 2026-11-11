@@ -18,7 +18,7 @@
 //!   `n` and `seq`, so a chat opened from its newest segment alone still
 //!   checks "late and low" and "out of step" (D2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,8 @@ pub struct History {
     deleted: HashMap<Conversation, HashSet<EventId>>,
     /// Every chat with events, and which chat each storage key is.
     known: HashMap<Conversation, Where>,
+    /// Each group chat's members in its current version.
+    members: HashMap<Conversation, BTreeSet<Person>>,
     counters: Counters,
     chats: HashMap<Conversation, Open>,
 }
@@ -157,6 +159,7 @@ impl History {
             places: Vec::new(),
             deleted: HashMap::new(),
             known: HashMap::new(),
+            members: HashMap::new(),
             counters: Counters::new(me.person),
             chats: HashMap::new(),
             log_files: store.open_log()?,
@@ -497,13 +500,10 @@ impl History {
     }
 
     /// What `device` gets next, read back from disk.
-    pub fn outgoing(
-        &mut self,
-        device: &Device,
-        shares: impl Fn(&Conversation, &Person) -> bool,
-        now: u64,
-    ) -> Result<Vec<ToSend>, HistoryError> {
-        let Outgoing { send, .. } = self.counters.to_send(device, &self.log, &shares, now);
+    pub fn outgoing(&mut self, device: &Device, now: u64) -> Result<Vec<ToSend>, HistoryError> {
+        let (known, members) = (&self.known, &self.members);
+        let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
+        let Outgoing { send, .. } = self.counters.to_send(device, &self.log, shares, now);
         let mut segments: HashMap<(Conversation, u32), Vec<Vec<u8>>> = HashMap::new();
         let mut out = Vec::with_capacity(send.len());
         for number in send {
@@ -533,22 +533,20 @@ impl History {
                     });
                 }
                 // Wiped since: there's nothing to send, so it counts as taken.
-                None => self
-                    .counters
-                    .acked(device, number, true, &self.log, &shares),
+                None => {
+                    let (known, members) = (&self.known, &self.members);
+                    let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
+                    self.counters.acked(device, number, true, &self.log, shares)
+                }
             }
         }
         Ok(out)
     }
 
     /// The device answered for event `number`.
-    pub fn acked(
-        &mut self,
-        device: &Device,
-        number: u64,
-        ok: bool,
-        shares: impl Fn(&Conversation, &Person) -> bool,
-    ) {
+    pub fn acked(&mut self, device: &Device, number: u64, ok: bool) {
+        let (known, members) = (&self.known, &self.members);
+        let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
         self.counters.acked(device, number, ok, &self.log, shares);
     }
 
@@ -575,9 +573,11 @@ impl History {
 
     /// Whether one of the other person's devices has taken our event (D5).
     pub fn is_sent(&self, id: &EventId) -> bool {
+        let (known, members) = (&self.known, &self.members);
+        let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
         self.log
             .number_of(id)
-            .is_some_and(|n| self.counters.taken_by_others(n))
+            .is_some_and(|n| self.counters.taken_by_others(n, &self.log, shares))
     }
 
     /// Up to `count` messages before `before` (or the newest), oldest first,
@@ -621,6 +621,21 @@ impl History {
             }
             self.load_segment(&chat, older.expect("checked"), now)?;
         }
+    }
+}
+
+/// Whether `person` is in chat `chat`: the person of a 1:1, a member of a
+/// group's current version.
+fn in_chat(
+    known: &HashMap<Conversation, Where>,
+    members: &HashMap<Conversation, BTreeSet<Person>>,
+    chat: &Conversation,
+    person: &Person,
+) -> bool {
+    match known.get(chat) {
+        Some(Where::Direct(p)) => p == person,
+        Some(Where::Group(_)) => members.get(chat).is_some_and(|m| m.contains(person)),
+        None => false,
     }
 }
 
@@ -712,10 +727,6 @@ mod tests {
     fn texts(h: &mut History) -> Vec<String> {
         let chat = h.chat(&CHAT, NOW).unwrap();
         chat.messages().iter().map(|m| m.text.to_owned()).collect()
-    }
-
-    fn shares(_: &Conversation, _: &Person) -> bool {
-        true
     }
 
     /// Bob's event as his device would make it.
@@ -879,13 +890,13 @@ mod tests {
         let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
         files.append(&[encode(NOW, ME, &missed).unwrap()]).unwrap();
         let mut again = History::open(&root, &KEY, ME).unwrap();
-        let out = again.outgoing(&laptop, shares, NOW).unwrap();
+        let out = again.outgoing(&laptop, NOW).unwrap();
         let sent: Vec<Body> = out.into_iter().map(|t| t.event.body).collect();
         assert_eq!(sent, [text("logged"), text("unlogged")]);
         // Numbered once: a third open finds nothing missing.
         drop(again);
         let mut third = History::open(&root, &KEY, ME).unwrap();
-        assert_eq!(third.outgoing(&laptop, shares, NOW).unwrap().len(), 2);
+        assert_eq!(third.outgoing(&laptop, NOW).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -904,9 +915,7 @@ mod tests {
         desk.receive(&CHAT, BOB, vec![bobs(1, NOW + 1, 1, text("from Bob"))], NOW)
             .unwrap();
         desk.add_device(laptop_me.device, ME.person);
-        let out = desk
-            .outgoing(&laptop_me.device, shares, NOW + 60_000)
-            .unwrap();
+        let out = desk.outgoing(&laptop_me.device, NOW + 60_000).unwrap();
         assert_eq!(out.len(), 2);
         for t in &out {
             let (at, author, received, event) = unforward(&forward(t)).unwrap();
@@ -930,7 +939,7 @@ mod tests {
         );
         // The laptop sends none of it back to the desk.
         laptop.add_device(ME.device, ME.person);
-        assert!(laptop.outgoing(&ME.device, shares, NOW).unwrap().is_empty());
+        assert!(laptop.outgoing(&ME.device, NOW).unwrap().is_empty());
         for d in [desk_dir, laptop_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
@@ -953,11 +962,11 @@ mod tests {
         h.add_device(BOB.device, BOB.person);
         h.add_device([11; 32], ME.person);
         assert_eq!(
-            h.outgoing(&BOB.device, shares, NOW).unwrap().len(),
+            h.outgoing(&BOB.device, NOW).unwrap().len(),
             1,
             "the message only"
         );
-        assert_eq!(h.outgoing(&[11; 32], shares, NOW).unwrap().len(), 3);
+        assert_eq!(h.outgoing(&[11; 32], NOW).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1005,11 +1014,43 @@ mod tests {
         h.add_device(BOB.device, BOB.person);
         h.add_device([11; 32], ME.person);
         assert!(!h.is_sent(&said.id));
-        let number = h.outgoing(&[11; 32], shares, NOW).unwrap()[0].number;
-        h.acked(&[11; 32], number, true, shares);
+        let number = h.outgoing(&[11; 32], NOW).unwrap()[0].number;
+        h.acked(&[11; 32], number, true);
         assert!(!h.is_sent(&said.id), "our own laptop doesn't count");
-        h.acked(&BOB.device, number, true, shares);
+        h.acked(&BOB.device, number, true);
         assert!(h.is_sent(&said.id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// "Sent" with two friends: Bob taking his message says nothing about
+    /// Carol's, though Bob's counter moves past it (it wasn't for him).
+    #[test]
+    fn sent_counts_only_people_in_that_chat() {
+        let root = dir("sent-two");
+        let carol_chat = Where::Direct(CAROL.person);
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let to_carol = h.send(&carol_chat, text("Carol?"), NOW).unwrap();
+        let to_bob = h.send(&CHAT, text("Bob?"), NOW).unwrap();
+        h.add_device(BOB.device, BOB.person);
+        h.add_device(CAROL.device, CAROL.person);
+        let out = h.outgoing(&BOB.device, NOW).unwrap();
+        assert_eq!(out.len(), 1, "Bob gets only his");
+        h.acked(&BOB.device, out[0].number, true);
+        assert!(h.is_sent(&to_bob.id));
+        assert!(!h.is_sent(&to_carol.id), "Carol is offline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Given up for a device after 30 days isn't "sent" either.
+    #[test]
+    fn given_up_isnt_sent() {
+        let root = dir("given-up");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let old = h.send(&CHAT, text("long ago"), NOW).unwrap();
+        h.add_device(BOB.device, BOB.person);
+        let later = NOW + crate::sync::FRIEND_WAIT + 1;
+        assert!(h.outgoing(&BOB.device, later).unwrap().is_empty());
+        assert!(!h.is_sent(&old.id));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1022,15 +1063,15 @@ mod tests {
         for i in 0..3 {
             h.send(&CHAT, text(&format!("m{i}")), NOW).unwrap();
         }
-        let out = h.outgoing(&laptop, shares, NOW).unwrap();
+        let out = h.outgoing(&laptop, NOW).unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[2].event.body, text("m2"));
-        h.acked(&laptop, out[0].number, true, shares);
+        h.acked(&laptop, out[0].number, true);
         h.save_counters().unwrap();
         drop(h);
         let mut again = History::open(&root, &KEY, ME).unwrap();
         assert_eq!(again.counter(&laptop), Some(1));
-        assert_eq!(again.outgoing(&laptop, shares, NOW).unwrap().len(), 2);
+        assert_eq!(again.outgoing(&laptop, NOW).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 }
