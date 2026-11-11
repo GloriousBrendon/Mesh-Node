@@ -24,7 +24,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{Chat, Position, Refusal, Taken};
-use crate::event::{Body, Event, EventError, EventId, VERSION};
+use crate::event::{Body, Change, Event, EventError, EventId, GroupChange, VERSION};
+use crate::group::Group;
 use crate::store::{ChatFiles, Conversation, Store, StoreError};
 use crate::sync::{Counters, Entry, Log, Outgoing};
 use crate::{Device, Person, Sender, Where};
@@ -54,7 +55,12 @@ enum LogRecord {
 struct ChatIndex {
     read: Option<Position>,
     highs: Vec<(Device, u64, u64)>,
+    /// A group's changes: its state, whichever segment holds them.
+    group: Vec<(EventId, Person, GroupChange, Position)>,
 }
+
+/// Events from one sender that may wait for a group's creation (D7).
+pub const MAX_BEFORE_CREATION: usize = 100;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
@@ -82,8 +88,12 @@ pub struct History {
     deleted: HashMap<Conversation, HashSet<EventId>>,
     /// Every chat with events, and which chat each storage key is.
     known: HashMap<Conversation, Where>,
-    /// Each group chat's members in its current version.
+    /// Each group chat's members in its current version; none before its
+    /// creation has arrived.
     members: HashMap<Conversation, BTreeSet<Person>>,
+    /// Events each sender has waiting for a group's creation.
+    // ponytail: in memory, so a restart lets a sender start over at MAX_BEFORE_CREATION.
+    before_creation: HashMap<(Conversation, Person), usize>,
     counters: Counters,
     chats: HashMap<Conversation, Open>,
 }
@@ -192,6 +202,7 @@ impl History {
             deleted: HashMap::new(),
             known: HashMap::new(),
             members: HashMap::new(),
+            before_creation: HashMap::new(),
             counters: Counters::new(me.person),
             chats: HashMap::new(),
             log_files: store.open_log()?,
@@ -208,7 +219,33 @@ impl History {
             history.counters = postcard::from_bytes(&bytes).map_err(|_| StoreError::Damaged)?;
         }
         history.number_the_missed()?;
+        history.load_members()?;
         Ok(history)
+    }
+
+    /// Each group chat's members, from its index alone, so delivery and the
+    /// list know them before any chat is opened.
+    fn load_members(&mut self) -> Result<(), HistoryError> {
+        let groups: Vec<(Conversation, [u8; 16])> = (self.known.iter())
+            .filter_map(|(key, at)| match at {
+                Where::Group(id) => Some((*key, *id)),
+                Where::Direct(_) => None,
+            })
+            .collect();
+        for (key, id) in groups {
+            let Some(bytes) = self.store.open(&key)?.index()? else {
+                continue;
+            };
+            let index: ChatIndex = postcard::from_bytes(&bytes).map_err(|_| StoreError::Damaged)?;
+            let mut group = Group::default();
+            for (event, by, change, at) in index.group {
+                group.add(event, by, change, at);
+            }
+            if let Some(version) = group.version(&id) {
+                self.members.insert(key, version.members);
+            }
+        }
+        Ok(())
     }
 
     /// Events a crash left in a chat with no number (the chat file is
@@ -326,6 +363,9 @@ impl History {
             for (device, n, seq) in index.highs {
                 chat.know_high(device, n, seq);
             }
+            for (event, by, change, at) in index.group {
+                chat.restore_group_change(event, by, change, at);
+            }
         }
         for id in self.deleted.get(conversation).into_iter().flatten() {
             chat.was_deleted(*id);
@@ -426,11 +466,24 @@ impl History {
         }
         let chat = &at.key();
         self.load(chat, now)?;
+        let group = match at {
+            Where::Group(id) => Some(*id),
+            Where::Direct(_) => None,
+        };
+        let created_before = group
+            .and_then(|id| self.chats[chat].chat.group(&id))
+            .is_some();
         let mut taken = Vec::with_capacity(events.len());
         let mut kept = Vec::new();
         for (received, event) in events {
             if self.log.number_of(&event.id).is_some() {
                 taken.push(Taken::Duplicate);
+                continue;
+            }
+            if let Some(id) = group
+                && let Some(refused) = self.group_refuses(chat, &id, &from, &event)
+            {
+                taken.push(Taken::Refused(refused));
                 continue;
             }
             // An edit, delete or reaction of an old message: read its segment
@@ -456,15 +509,67 @@ impl History {
             }])?;
         }
         self.store_kept(chat, from, via, kept)?;
+        if let Some(id) = group {
+            let open = self.chats.get_mut(chat).expect("loaded");
+            match open.chat.group(&id) {
+                Some(version) => {
+                    // Created just now: what waited is checked (D7).
+                    if !created_before {
+                        open.chat.wipe_senders_not_in(&version.members);
+                    }
+                    self.members.insert(*chat, version.members);
+                }
+                None => {
+                    self.members.remove(chat);
+                }
+            }
+        }
         self.wipe(chat)?;
         let open = &self.chats[chat];
         let index = ChatIndex {
             read: open.chat.read_marker(),
             highs: open.chat.highs(),
+            group: open.chat.group_changes(),
         };
         open.files
             .write_index(&postcard::to_stdvec(&index).expect("to memory"))?;
         Ok(taken)
+    }
+
+    /// Why a group event doesn't count (D7), if it doesn't: a creation that
+    /// doesn't hash to the group's ID from its sender; once created, a
+    /// sender who isn't a member of the current version; before, one with
+    /// too many events already waiting.
+    fn group_refuses(
+        &mut self,
+        chat: &Conversation,
+        id: &[u8; 16],
+        from: &Sender,
+        event: &Event,
+    ) -> Option<Refusal> {
+        if let Body::Group(GroupChange {
+            after: None,
+            change: Change::Create { nonce, .. },
+        }) = &event.body
+        {
+            return (crate::group_id(&from.person, nonce) != *id).then_some(Refusal::NotInChat);
+        }
+        match self.chats[chat].chat.group(id) {
+            Some(version) => {
+                (!version.members.contains(&from.person)).then_some(Refusal::NotInChat)
+            }
+            None => {
+                let count = self
+                    .before_creation
+                    .entry((*chat, from.person))
+                    .or_default();
+                if *count >= MAX_BEFORE_CREATION {
+                    return Some(Refusal::TooManyWaiting);
+                }
+                *count += 1;
+                None
+            }
+        }
     }
 
     /// Appends kept events to the chat and the log: one sync each.
@@ -610,7 +715,12 @@ impl History {
 
     /// Every chat with events.
     pub fn chats(&self) -> Vec<Where> {
-        self.known.values().copied().collect()
+        let listed = self.known.iter().filter(|(key, at)| match at {
+            Where::Direct(_) => true,
+            // A group isn't listed before its creation has arrived (D7).
+            Where::Group(_) => self.members.contains_key(*key),
+        });
+        listed.map(|(_, at)| *at).collect()
     }
 
     /// The chat an event is in.
@@ -644,6 +754,11 @@ impl History {
     ) -> Result<(Vec<Shown>, bool), HistoryError> {
         let chat = at.key();
         self.load(&chat, now)?;
+        if let Where::Group(_) = at
+            && !self.members.contains_key(&chat)
+        {
+            return Ok((Vec::new(), false));
+        }
         loop {
             let open = &self.chats[&chat];
             let messages = open.chat.messages();
@@ -1159,6 +1274,106 @@ mod tests {
         let inner = postcard::to_stdvec(&inner).unwrap();
         assert_eq!(unforward(&inner).err(), Some(Unread::Newer));
         assert_eq!(unforward(b"junk").err(), Some(Unread::Garbage));
+    }
+
+    const NONCE: [u8; 16] = [8; 16];
+
+    fn create(members: Vec<Person>) -> Body {
+        Body::Group(crate::event::GroupChange {
+            after: None,
+            change: crate::event::Change::Create {
+                name: "hike".into(),
+                members,
+                nonce: NONCE,
+            },
+        })
+    }
+
+    /// Group DMs go over 1:1 sessions, so dm checks membership: an event
+    /// counts only if its sender is a member of the current version (D7).
+    #[test]
+    fn group_events_count_only_from_members() {
+        let root = dir("group-members");
+        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.send(&group, create(vec![BOB.person]), NOW).unwrap();
+        let from_bob = h
+            .receive(&group, BOB, vec![bobs(1, NOW + 1, 1, text("in"))], NOW)
+            .unwrap();
+        assert_eq!(from_bob, [Taken::Shown]);
+        let from_carol = bobs(2, NOW + 2, 1, text("out"));
+        let taken = h.receive(&group, CAROL, vec![from_carol], NOW).unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
+        // A creation that doesn't hash to the group's ID is refused.
+        let fake = bobs(3, NOW + 3, 2, create(vec![CAROL.person]));
+        let taken = h.receive(&group, BOB, vec![fake], NOW).unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
+        assert_eq!(h.chats(), [group]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Before its creation arrives a group's events wait: not shown, no chat
+    /// listed, at most MAX_BEFORE_CREATION per sender. When it comes, the
+    /// members' events show and anyone else's are wiped.
+    #[test]
+    fn before_its_creation_a_group_waits() {
+        let root = dir("group-waits");
+        let group = Where::Group(crate::group_id(&CAROL.person, &NONCE));
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let early = h
+            .receive(&group, BOB, vec![bobs(1, NOW + 1, 1, text("early"))], NOW)
+            .unwrap();
+        assert_eq!(early, [Taken::Shown]);
+        let stranger = Sender {
+            person: [9; 32],
+            device: [90; 32],
+        };
+        for i in 0..MAX_BEFORE_CREATION as u64 {
+            let mut e = bobs(0, NOW + 10 + i, i + 1, text("spam"));
+            e.id[..8].copy_from_slice(&i.to_be_bytes());
+            e.id[8] = 0xEE;
+            h.receive(&group, stranger, vec![e], NOW).unwrap();
+        }
+        let over = bobs(250, NOW + 5000, 5000, text("one more"));
+        let taken = h.receive(&group, stranger, vec![over], NOW).unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::TooManyWaiting)]);
+        assert!(h.chats().is_empty(), "not listed before its creation");
+        assert!(
+            h.page(&group, None, 50, NOW).unwrap().0.is_empty(),
+            "nothing shown"
+        );
+        let creation = Event {
+            body: create(vec![ME.person, BOB.person]),
+            ..bobs(2, NOW, 1, text(""))
+        };
+        h.receive(&group, CAROL, vec![creation], NOW).unwrap();
+        let (page, _) = h.page(&group, None, 50, NOW).unwrap();
+        let texts: Vec<&str> = page.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["early"], "Bob's waited; the stranger's are gone");
+        assert_eq!(h.chats(), [group]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The group's state comes back with the chat, though its creation is
+    /// in a segment the reopened chat doesn't read.
+    #[test]
+    fn a_group_survives_a_reopen() {
+        let root = dir("group-reopen");
+        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.send(&group, create(vec![BOB.person]), NOW).unwrap();
+        for i in 0..SEGMENT_EVENTS {
+            h.send(&group, text(&format!("m{i}")), NOW).unwrap();
+        }
+        drop(h);
+        let mut again = History::open(&root, &KEY, ME).unwrap();
+        assert_eq!(again.chats(), [group], "listed before any chat is opened");
+        let from_bob = bobs(1, NOW + 999, 1, text("still in"));
+        assert_eq!(
+            again.receive(&group, BOB, vec![from_bob], NOW).unwrap(),
+            [Taken::Shown]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// An event's author comes from the log, with no chat loaded.

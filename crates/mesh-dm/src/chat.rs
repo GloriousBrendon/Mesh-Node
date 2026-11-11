@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::event::{Attachment, Body, Event, EventId};
+use crate::event::{Attachment, Body, Event, EventId, GroupChange};
 use crate::group::{Group, Version};
 use crate::{Device, Person, Sender};
 
@@ -515,6 +515,36 @@ impl Chat {
     pub fn next_n(&self, device: &Device) -> u64 {
         let last = self.steps.get(device).and_then(|s| s.last_key_value());
         last.map_or(0, |(n, _)| *n) + 1
+    }
+
+    /// The group's changes, to save with the chat's index.
+    pub fn group_changes(&self) -> Vec<(EventId, Person, GroupChange, Position)> {
+        self.group.changes()
+    }
+
+    /// A group change from the index: the group's state, though the segment
+    /// that holds it isn't loaded.
+    pub fn restore_group_change(
+        &mut self,
+        id: EventId,
+        by: Person,
+        change: GroupChange,
+        at: Position,
+    ) {
+        self.group.add(id, by, change, at);
+    }
+
+    /// Wipes every held event whose sender isn't one of `members`: a group's
+    /// events that waited for its creation and turn out to be from outside.
+    pub fn wipe_senders_not_in(&mut self, members: &BTreeSet<Person>) {
+        let outside: Vec<EventId> = (self.held.iter())
+            .filter(|(_, h)| !members.contains(&h.sender.person))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in outside {
+            self.folded.remove(&id);
+            self.wipe(id);
+        }
     }
 
     /// Events whose stored copies must now be wiped: a deleted message, its
