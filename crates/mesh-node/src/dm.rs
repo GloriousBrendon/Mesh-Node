@@ -208,6 +208,27 @@ impl Helper {
     }
 }
 
+/// A chat event from a friend's device, or the answer it gets if it
+/// doesn't read: `failed` for a newer version (the sender keeps it until we
+/// update), `ok` for garbage, which is dropped and counted (D14).
+pub(super) fn read_event(body: &[u8]) -> Result<Event, u8> {
+    if body
+        .first()
+        .is_some_and(|&v| mesh_dm::history::is_newer(v, mesh_dm::event::VERSION))
+    {
+        return Err(FAILED);
+    }
+    Event::from_bytes(body).map_err(|_| OK)
+}
+
+/// History from another of our devices, or the answer if it doesn't read.
+pub(super) fn read_forward(body: &[u8]) -> Result<(Where, DmSender, u64, Event), u8> {
+    mesh_dm::history::unforward(body).map_err(|e| match e {
+        mesh_dm::history::Unread::Newer => FAILED,
+        mesh_dm::history::Unread::Garbage => OK,
+    })
+}
+
 /// Shown text in a notification, at most (as WhatsApp's).
 const NOTIFY_CHARS: usize = 100;
 /// Messages in one page of `dmOpen`.
@@ -567,6 +588,25 @@ mod tests {
         };
         let (answers, ()) = tokio::join!(exchange(send, recv, &frames), reader);
         assert_eq!(answers, None);
+    }
+
+    /// A body from a newer version is answered `failed`, so the sender
+    /// keeps it until we update; garbage is answered ok and dropped.
+    #[test]
+    fn a_newer_event_waits_on_the_sender() {
+        let event = mesh_dm::event::Event {
+            version: VERSION,
+            id: [1; 16],
+            time: 1,
+            seq: 1,
+            n: 1,
+            body: Body::Read { up_to: [2; 16] },
+        };
+        assert!(read_event(&event.to_bytes().unwrap()).is_ok());
+        let mut newer = event.to_bytes().unwrap();
+        newer[0] = VERSION + 1;
+        assert_eq!(read_event(&newer).err(), Some(FAILED));
+        assert_eq!(read_event(b"junk").err(), Some(OK));
     }
 
     #[test]

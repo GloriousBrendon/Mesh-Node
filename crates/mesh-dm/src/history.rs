@@ -119,6 +119,8 @@ pub struct ToSend {
 /// it and when it first arrived, so that device stores it as it is here.
 #[derive(Serialize, Deserialize)]
 struct Forward {
+    /// First, so a newer layout is told apart from garbage.
+    version: u8,
     at: Where,
     person: Person,
     device: Device,
@@ -129,6 +131,7 @@ struct Forward {
 /// The body that carries `t` to another of our devices.
 pub fn forward(t: &ToSend) -> Vec<u8> {
     let forward = Forward {
+        version: FORWARD_VERSION,
         at: t.at,
         person: t.from.person,
         device: t.from.device,
@@ -138,15 +141,44 @@ pub fn forward(t: &ToSend) -> Vec<u8> {
     postcard::to_stdvec(&forward).expect("to memory")
 }
 
+/// The forwarded layout's version.
+pub const FORWARD_VERSION: u8 = 1;
+/// How far above ours a version byte may be and still mean "newer", not
+/// garbage. A `failed` answer keeps the sender resending, so a damaged body
+/// whose first byte is anything must not get one.
+pub const NEWER_WITHIN: u8 = 8;
+
+/// Whether a first byte reads as a newer version of `ours`.
+pub fn is_newer(byte: u8, ours: u8) -> bool {
+    byte > ours && byte <= ours.saturating_add(NEWER_WITHIN)
+}
+
+/// Why a body didn't read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// From a newer version of Mesh: the sender should keep it for us.
+    Newer,
+    /// Damaged or not ours: dropped.
+    Garbage,
+}
+
 /// A forwarded body: the chat, the author, the first arrival, the event.
-pub fn unforward(bytes: &[u8]) -> Option<(Where, Sender, u64, Event)> {
-    let f: Forward = postcard::from_bytes(bytes).ok()?;
-    let event = Event::from_bytes(&f.event).ok()?;
+pub fn unforward(bytes: &[u8]) -> Result<(Where, Sender, u64, Event), Unread> {
+    match bytes.first() {
+        Some(&v) if is_newer(v, FORWARD_VERSION) => return Err(Unread::Newer),
+        Some(&v) if v == FORWARD_VERSION => {}
+        _ => return Err(Unread::Garbage),
+    }
+    let f: Forward = postcard::from_bytes(bytes).map_err(|_| Unread::Garbage)?;
+    if f.event.first().is_some_and(|&v| is_newer(v, VERSION)) {
+        return Err(Unread::Newer);
+    }
+    let event = Event::from_bytes(&f.event).map_err(|_| Unread::Garbage)?;
     let from = Sender {
         person: f.person,
         device: f.device,
     };
-    Some((f.at, from, f.received, event))
+    Ok((f.at, from, f.received, event))
 }
 
 impl History {
@@ -1095,6 +1127,38 @@ mod tests {
         let out = again.outgoing(&laptop, NOW).unwrap();
         assert_eq!(out.len(), SEGMENT_EVENTS + 2, "all of them");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A forwarded record or event from a newer version is told apart from
+    /// garbage, so the reader can keep it waiting on the sender.
+    #[test]
+    fn newer_forwards_are_not_garbage() {
+        let event = bobs(1, NOW, 1, text("hi"));
+        let t = ToSend {
+            number: 1,
+            at: CHAT,
+            from: BOB,
+            received: NOW,
+            event: event.clone(),
+        };
+        let bytes = forward(&t);
+        assert!(matches!(unforward(&bytes), Ok((_, _, _, e)) if e == event));
+        let mut newer = bytes.clone();
+        newer[0] = FORWARD_VERSION + 1;
+        assert_eq!(unforward(&newer).err(), Some(Unread::Newer));
+        let mut newer_event = event.clone();
+        newer_event.version = VERSION + 1;
+        let inner = Forward {
+            version: FORWARD_VERSION,
+            at: CHAT,
+            person: BOB.person,
+            device: BOB.device,
+            received: NOW,
+            event: postcard::to_stdvec(&newer_event).unwrap(),
+        };
+        let inner = postcard::to_stdvec(&inner).unwrap();
+        assert_eq!(unforward(&inner).err(), Some(Unread::Newer));
+        assert_eq!(unforward(b"junk").err(), Some(Unread::Garbage));
     }
 
     /// An event's author comes from the log, with no chat loaded.

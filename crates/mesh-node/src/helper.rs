@@ -1172,16 +1172,23 @@ impl Helper {
                                 && opened.sender == id
                                 && self.store.as_ref().is_some_and(|s| s.id() == id)
                             {
-                                match mesh_dm::history::unforward(&opened.body) {
-                                    Some(forwarded) => synced.push((i, forwarded)),
-                                    None => eprintln!("mesh-node: synced history didn't read"),
+                                match dm::read_forward(&opened.body) {
+                                    Ok(forwarded) => synced.push((i, forwarded)),
+                                    Err(answer) => {
+                                        eprintln!("mesh-node: synced history didn't read");
+                                        answers[i] = answer;
+                                    }
                                 }
                                 continue;
                             }
-                            // A bad event is dropped and counted (dm D14), and answered ok.
-                            match mesh_dm::event::Event::from_bytes(&opened.body) {
+                            // A bad event is dropped and counted (dm D14);
+                            // a newer one waits on its sender.
+                            match dm::read_event(&opened.body) {
                                 Ok(event) => events.push((i, event)),
-                                Err(_) => eprintln!("mesh-node: a chat event didn't read"),
+                                Err(answer) => {
+                                    eprintln!("mesh-node: a chat event didn't read");
+                                    answers[i] = answer;
+                                }
                             }
                             continue;
                         }
