@@ -35,7 +35,8 @@ pub use knock::{
     seal_knock,
 };
 pub use link::{
-    LINK_CODE_LIFETIME, LinkError, LinkInitiator, LinkResponder, LinkedIdentity, PendingDevice,
+    LINK_CODE_LIFETIME, LinkError, LinkInitiator, LinkRendezvous, LinkResponder, LinkedIdentity,
+    PendingDevice,
 };
 pub use pair::{PairKeys, day_of};
 pub use password::{

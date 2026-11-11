@@ -42,6 +42,11 @@ const REPLY: u8 = 2;
 const DEVICE: u8 = 3;
 const IDENTITY: u8 = 4;
 const NONCE_LEN: usize = 24;
+/// The Argon2id salt for the link record's keys; friend codes use their own.
+const LINK_SALT: &[u8] = b"mesh/v1/link-code";
+/// The link record's slot: there's only ever one under its lookup ID.
+const RECORD_SLOT: [u8; 8] = [0; 8];
+const OUTER_LEN: usize = 16 + 8 + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LinkError {
@@ -331,6 +336,74 @@ impl LinkedIdentity {
     }
 }
 
+/// Where E leaves its link node's address for N (PLAN-link L1): an ordinary
+/// address record to the seed, filed under a lookup ID and sealed with a key
+/// that both come from the link code through Argon2id, as friend codes' do.
+/// A fast hash would let the seed's operator try all 2^40 codes within the
+/// code's 5 minutes. About 100 ms: make it off any async thread.
+pub struct LinkRendezvous {
+    lookup: [u8; 16],
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl LinkRendezvous {
+    pub fn new(code: &FriendCode) -> Self {
+        let (lookup, key) = code.stretch(LINK_SALT);
+        Self { lookup, key }
+    }
+
+    /// The lookup ID the record is filed and fetched under.
+    pub fn lookup(&self) -> [u8; 16] {
+        self.lookup
+    }
+
+    /// The record for `addr` (E's link node, as a ticket), lasting the code's
+    /// life from `now`.
+    pub fn seal(&self, addr: &[u8], now: u64) -> Result<Vec<u8>, LinkError> {
+        let mut outer = self.lookup.to_vec();
+        outer.extend_from_slice(&RECORD_SLOT);
+        outer.extend_from_slice(&(now + LINK_CODE_LIFETIME).to_be_bytes());
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|_| LinkError::Random)?;
+        let payload = Payload {
+            msg: addr,
+            aad: &outer,
+        };
+        let sealed = XChaCha20Poly1305::new(&Key::from(*self.key))
+            .encrypt(&XNonce::from(nonce), payload)
+            .map_err(|_| LinkError::Malformed)?;
+        let record = [&outer[..], &nonce, &sealed].concat();
+        if crate::addr::addr_outer(&record).is_none() {
+            return Err(LinkError::Malformed);
+        }
+        Ok(record)
+    }
+
+    /// The address in a record from the seed; refused if it's for another
+    /// code, damaged or expired.
+    pub fn open(&self, record: &[u8], now: u64) -> Result<Vec<u8>, LinkError> {
+        let (lookup, _, expires_at) =
+            crate::addr::addr_outer(record).ok_or(LinkError::Malformed)?;
+        if lookup != self.lookup {
+            return Err(LinkError::WrongCode);
+        }
+        if now >= expires_at {
+            return Err(LinkError::Expired);
+        }
+        let (outer, rest) = record.split_at(OUTER_LEN);
+        let (nonce, sealed) = rest
+            .split_first_chunk::<NONCE_LEN>()
+            .ok_or(LinkError::Malformed)?;
+        let payload = Payload {
+            msg: sealed,
+            aad: outer,
+        };
+        XChaCha20Poly1305::new(&Key::from(*self.key))
+            .decrypt(&XNonce::from(*nonce), payload)
+            .map_err(|_| LinkError::Malformed)
+    }
+}
+
 /// The 40 code bits are the SPAKE2 password.
 fn code_bytes(code: &FriendCode) -> &[u8] {
     code.as_bytes()
@@ -411,6 +484,47 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::keystore::KdfParams;
+
+    #[test]
+    fn the_link_record_opens_only_with_its_code() {
+        let (_, code) = LinkInitiator::new(NOW).unwrap();
+        let here = LinkRendezvous::new(&code);
+        let ticket = b"mesh://node/abc?relay=https://relay.example/";
+        let record = here.seal(ticket, NOW).unwrap();
+        // The seed reads it as any address record, within its 3 hours ahead.
+        let (lookup, _, expires_at) = crate::addr::addr_outer(&record).unwrap();
+        assert_eq!(lookup, here.lookup());
+        assert_eq!(expires_at, NOW + LINK_CODE_LIFETIME);
+        const { assert!(LINK_CODE_LIFETIME <= 3 * 3600) };
+
+        let there = LinkRendezvous::new(&FriendCode::parse(&code.to_string()).unwrap());
+        assert_eq!(there.open(&record, NOW).unwrap(), ticket);
+        let other = LinkRendezvous::new(&FriendCode::generate().unwrap());
+        assert!(other.open(&record, NOW).is_err(), "another code");
+        assert!(
+            there.open(&record, NOW + LINK_CODE_LIFETIME).is_err(),
+            "expired"
+        );
+        let mut bad = record.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(there.open(&bad, NOW).is_err(), "damaged");
+    }
+
+    /// The keys must cost what a friend code's do: Argon2id with the same
+    /// settings, under the link salt (PLAN-link L1).
+    #[test]
+    fn the_link_record_keys_are_the_slow_derivation() {
+        let code = FriendCode::generate().unwrap();
+        let params = argon2::Params::new(64 * 1024, 5, 1, Some(48)).unwrap();
+        let mut out = [0u8; 48];
+        argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(code.as_bytes(), b"mesh/v1/link-code", &mut out)
+            .unwrap();
+        let rendezvous = LinkRendezvous::new(&code);
+        assert_eq!(rendezvous.lookup(), out[..16]);
+        assert_eq!(*rendezvous.key, out[16..]);
+        assert_ne!(rendezvous.lookup(), code.lookup_id(), "not a friend code's");
+    }
 
     const NOW: u64 = 1_792_627_200;
     const PASSWORD: &str = "Tundra-Gravel-Mosaic-41";

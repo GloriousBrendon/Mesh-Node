@@ -141,14 +141,21 @@ impl FriendCode {
 
     /// The lookup ID and record key (Argon2id, fixed settings).
     fn keys(&self) -> ([u8; 16], Zeroizing<[u8; 32]>) {
+        self.stretch(KDF_SALT)
+    }
+
+    /// A lookup ID and key from the code under `salt`: Argon2id with the
+    /// fixed settings, so each guess at a 40-bit code costs about 100 ms.
+    /// Link codes use it too, with their own salt.
+    pub(crate) fn stretch(&self, salt: &[u8]) -> ([u8; 16], Zeroizing<[u8; 32]>) {
         let params = argon2::Params::new(KDF_M_KIB, KDF_T, 1, Some(48)).expect("valid settings");
         let mut out = Zeroizing::new([0u8; 48]);
         argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-            .hash_password_into(&self.0, KDF_SALT, out.as_mut())
+            .hash_password_into(&self.0, salt, out.as_mut())
             .expect("valid lengths");
         let lookup_id = out[..16].try_into().expect("16 bytes");
-        let record_key = Zeroizing::new(out[16..].try_into().expect("32 bytes"));
-        (lookup_id, record_key)
+        let key = Zeroizing::new(out[16..].try_into().expect("32 bytes"));
+        (lookup_id, key)
     }
 }
 
