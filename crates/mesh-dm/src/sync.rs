@@ -34,7 +34,6 @@ pub struct Entry {
     /// For our own devices only: "read up to here", "delete for me".
     pub private: bool,
     /// A group change: every member gets these, whenever they joined.
-    #[serde(default)]
     pub change: bool,
 }
 
@@ -106,7 +105,6 @@ struct Counter {
     above: BTreeSet<u64>,
     /// Given up for this device (past the friend limits): never "sent".
     // ponytail: kept for good; only a friend's device away 30 days or 2,000 events behind adds to it.
-    #[serde(default)]
     given_up: BTreeSet<u64>,
     /// Group changes this device took. A change can come to be meant for a
     /// device after its counter passed it (its person added to a group), so
@@ -360,6 +358,27 @@ mod tests {
                 counters.acked(&to_device, n, true, from, all);
             }
         }
+    }
+
+    /// postcard isn't self-describing: reading what an older version wrote,
+    /// a field added since can't be filled by `#[serde(default)]`. That's
+    /// why the saved formats carry a number instead (history.rs).
+    #[test]
+    fn serde_default_does_nothing_with_postcard() {
+        #[derive(Serialize)]
+        struct Old {
+            a: u8,
+        }
+        #[derive(Deserialize, Debug)]
+        struct New {
+            #[allow(dead_code)]
+            a: u8,
+            #[serde(default)]
+            #[allow(dead_code)]
+            b: u8,
+        }
+        let bytes = postcard::to_stdvec(&Old { a: 1 }).unwrap();
+        assert!(postcard::from_bytes::<New>(&bytes).is_err());
     }
 
     #[test]

@@ -70,8 +70,30 @@ const DAY_MS: u64 = 24 * 3600 * 1000;
 /// under `GROUP_SIGNATURE`): History holds no keys itself.
 pub type Signer = Box<dyn Fn(&[u8]) -> [u8; 64] + Send>;
 
+/// The number every saved format starts with: chat records, log records, a
+/// chat's index, the counters. A higher one is from a newer Mesh.
+pub const SAVED_FORMAT: u8 = 1;
+
+/// `bytes` as saved: the format number first.
+fn framed(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.insert(0, SAVED_FORMAT);
+    bytes
+}
+
+/// What's after the format number of a saved `what`; a newer format is
+/// refused as that, not as damage.
+fn unframe<'a>(what: &'static str, bytes: &'a [u8]) -> Result<&'a [u8], HistoryError> {
+    match bytes.split_first() {
+        Some((&SAVED_FORMAT, rest)) => Ok(rest),
+        Some((&v, _)) if v > SAVED_FORMAT => Err(HistoryError::Newer(what)),
+        _ => Err(StoreError::Damaged.into()),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
+    #[error("the {0} was written by a newer version of Mesh; update Mesh to read it")]
+    Newer(&'static str),
     #[error("group changes can't be signed here")]
     NoSigner,
     #[error(transparent)]
@@ -267,13 +289,14 @@ impl History {
         };
         for n in 0..history.log_files.segments() {
             for record in history.log_files.read(n)? {
-                let record =
-                    postcard::from_bytes::<LogRecord>(&record).map_err(|_| StoreError::Damaged)?;
+                let record = postcard::from_bytes::<LogRecord>(unframe("a log record", &record)?)
+                    .map_err(|_| StoreError::Damaged)?;
                 history.remember(record);
             }
         }
         if let Some(bytes) = history.log_files.index()? {
-            history.counters = postcard::from_bytes(&bytes).map_err(|_| StoreError::Damaged)?;
+            let bytes = unframe("the delivery counters", &bytes)?;
+            history.counters = postcard::from_bytes(bytes).map_err(|_| StoreError::Damaged)?;
         }
         history.number_the_missed()?;
         history.load_members()?;
@@ -314,7 +337,8 @@ impl History {
             let Some(bytes) = self.store.open(&key)?.index()? else {
                 continue;
             };
-            let index: ChatIndex = postcard::from_bytes(&bytes).map_err(|_| StoreError::Damaged)?;
+            let bytes = unframe("a chat index", &bytes)?;
+            let index: ChatIndex = postcard::from_bytes(bytes).map_err(|_| StoreError::Damaged)?;
             let mut group = Group::default();
             for (event, by, change, at) in index.group {
                 group.add(event, by, change, at);
@@ -398,7 +422,7 @@ impl History {
         }
         let bytes: Vec<Vec<u8>> = records
             .iter()
-            .map(|r| postcard::to_stdvec(r).expect("to memory"))
+            .map(|r| framed(postcard::to_stdvec(r).expect("to memory")))
             .collect();
         self.log_files.append(&bytes)?;
         for record in records {
@@ -436,7 +460,8 @@ impl History {
         let files = self.store.open(conversation)?;
         let mut chat = Chat::new(self.me.person);
         if let Some(bytes) = files.index()? {
-            let index: ChatIndex = postcard::from_bytes(&bytes).map_err(|_| StoreError::Damaged)?;
+            let bytes = unframe("a chat index", &bytes)?;
+            let index: ChatIndex = postcard::from_bytes(bytes).map_err(|_| StoreError::Damaged)?;
             if let Some(read) = index.read {
                 chat.set_read_marker(read);
             }
@@ -653,7 +678,7 @@ impl History {
             group: open.chat.group_changes(),
         };
         open.files
-            .write_index(&postcard::to_stdvec(&index).expect("to memory"))?;
+            .write_index(&framed(postcard::to_stdvec(&index).expect("to memory")))?;
         Ok(taken)
     }
 
@@ -837,7 +862,7 @@ impl History {
 
     /// Writes the counters (after a batch of acks).
     pub fn save_counters(&self) -> Result<(), HistoryError> {
-        let bytes = postcard::to_stdvec(&self.counters).expect("to memory");
+        let bytes = framed(postcard::to_stdvec(&self.counters).expect("to memory"));
         Ok(self.log_files.write_index(&bytes)?)
     }
 
@@ -1002,7 +1027,8 @@ fn target(body: &Body) -> Option<EventId> {
 
 /// A chat record: `received | sender person | sender device | event`.
 fn encode(received: u64, from: Sender, event: &Event) -> Result<Vec<u8>, HistoryError> {
-    let mut record = received.to_be_bytes().to_vec();
+    let mut record = vec![SAVED_FORMAT];
+    record.extend_from_slice(&received.to_be_bytes());
     record.extend_from_slice(&from.person);
     record.extend_from_slice(&from.device);
     record.extend(event.to_bytes()?);
@@ -1014,6 +1040,7 @@ fn decode(record: &[u8]) -> Result<Option<(u64, Sender, Event)>, HistoryError> {
     if record.is_empty() {
         return Ok(None);
     }
+    let record = unframe("a chat record", record)?;
     if record.len() < RECORD_HEAD {
         return Err(StoreError::Damaged.into());
     }
@@ -1882,6 +1909,67 @@ mod tests {
             .unwrap();
         let mut files = Store::new(&me.dir, &KEY).open(&group.key()).unwrap();
         assert!(files.read(0).unwrap()[0].is_empty(), "wiped");
+    }
+
+    /// Every saved format carries a number; one from a newer version of
+    /// Mesh is refused as that, not as damage.
+    #[test]
+    fn a_newer_saved_format_is_refused_clearly() {
+        let newer = |bytes: &mut Vec<u8>| bytes[0] = SAVED_FORMAT + 1;
+        // A chat record.
+        let root = dir("newer-record");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.send(&CHAT, text("hi"), NOW).unwrap();
+        drop(h);
+        let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
+        let mut record = files.read(0).unwrap().remove(0);
+        newer(&mut record);
+        files.rewrite(0, |_| Some(record.clone())).unwrap();
+        // Refused at unlock (the crash repair reads the newest segment) or
+        // when the chat opens: either way, as newer.
+        let err = History::open(&root, &KEY, ME)
+            .and_then(|mut h| h.chat(&CHAT, NOW).map(|_| ()))
+            .err()
+            .unwrap();
+        assert!(matches!(err, HistoryError::Newer("a chat record")), "{err}");
+        assert!(err.to_string().contains("newer version of Mesh"));
+        let _ = std::fs::remove_dir_all(&root);
+        // The chat's index.
+        let root = dir("newer-index");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.send(&CHAT, text("hi"), NOW).unwrap();
+        drop(h);
+        let files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
+        let mut index = files.index().unwrap().unwrap();
+        newer(&mut index);
+        files.write_index(&index).unwrap();
+        let err = History::open(&root, &KEY, ME)
+            .and_then(|mut h| h.chat(&CHAT, NOW).map(|_| ()))
+            .err()
+            .unwrap();
+        assert!(matches!(err, HistoryError::Newer("a chat index")), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+        // A log record, and the counters.
+        for what in ["a log record", "the delivery counters"] {
+            let root = dir("newer-log");
+            let mut h = History::open(&root, &KEY, ME).unwrap();
+            h.send(&CHAT, text("hi"), NOW).unwrap();
+            h.save_counters().unwrap();
+            drop(h);
+            let mut log = Store::new(&root, &KEY).open_log().unwrap();
+            if what == "a log record" {
+                let mut first = log.read(0).unwrap().remove(0);
+                newer(&mut first);
+                log.rewrite(0, |_| Some(first.clone())).unwrap();
+            } else {
+                let mut counters = log.index().unwrap().unwrap();
+                newer(&mut counters);
+                log.write_index(&counters).unwrap();
+            }
+            let err = History::open(&root, &KEY, ME).err().unwrap();
+            assert!(matches!(err, HistoryError::Newer(w) if w == what), "{err}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// A member passes on a change claiming the creator made it: refused.
