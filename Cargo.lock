@@ -2416,6 +2416,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-dm"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "getrandom 0.4.3",
+ "mesh-identity",
+ "postcard",
+ "serde",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "mesh-e2ee"
 version = "0.1.0"
 dependencies = [
