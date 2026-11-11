@@ -257,13 +257,14 @@ impl Store {
     /// file is an error, never silently replaced.
     pub fn load(path: &Path) -> Result<Self, StoreError> {
         let live = |held: &Vec<u8>| HeldCode::from_bytes(held).is_ok();
-        let entries = match saved::load(
+        // An upgraded file is saved as the current format soon after.
+        let (entries, upgraded) = match saved::load(
             path,
             WHAT,
             FORMAT,
             |(_, e): &([u8; 16], Entry)| !matches!(e, Entry::Live { held, .. } if !live(held)),
         ) {
-            Ok(entries) => entries.into_iter().collect(),
+            Ok(entries) => (entries.into_iter().collect(), false),
             Err(StoreError::Corrupt(..)) if saved::format(path)? == Some(1) => {
                 let old = saved::load(
                     path,
@@ -273,7 +274,7 @@ impl Store {
                 )?;
                 let now = mesh_identity::unix_now();
                 let entries = old.into_iter().map(|(k, e)| (k, e.upgrade(now)));
-                entries.collect()
+                (entries.collect(), true)
             }
             Err(e) => return Err(e),
         };
@@ -282,7 +283,7 @@ impl Store {
             entries,
             lookups: Window::default(),
             holds: Window::default(),
-            dirty: false,
+            dirty: upgraded,
         })
     }
 
@@ -892,6 +893,8 @@ mod tests {
         let mut back = Store::load(&s.path).unwrap();
         let now = mesh_identity::unix_now();
         assert_eq!(back.len(), 2);
+        // Saved soon as format 2, so a restart doesn't start the 30 days again.
+        assert!(back.dirty, "an upgraded store is saved");
         assert!(back.spend(&live.lookup_id(), now).is_some());
         assert!(back.spend(&live.lookup_id(), now).is_some());
         assert_eq!(
