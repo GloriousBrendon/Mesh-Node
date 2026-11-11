@@ -33,6 +33,9 @@ pub struct Entry {
     pub at: u64,
     /// For our own devices only: "read up to here", "delete for me".
     pub private: bool,
+    /// A group change: every member gets these, whenever they joined.
+    #[serde(default)]
+    pub change: bool,
 }
 
 /// The stored events in order.
@@ -150,13 +153,13 @@ impl Counters {
         &self,
         number: u64,
         log: &Log,
-        shares: impl Fn(&Conversation, &Person) -> bool,
+        shares: impl Fn(&Entry, u64, &Person) -> bool,
     ) -> bool {
         let Some(e) = log.get(number) else {
             return false;
         };
         let theirs = self.devices.values().filter(|c| {
-            c.person != self.me && e.author == self.me && !e.private && shares(&e.chat, &c.person)
+            c.person != self.me && e.author == self.me && !e.private && shares(e, number, &c.person)
         });
         let mut theirs = theirs;
         theirs.any(|c| {
@@ -174,7 +177,7 @@ impl Counters {
         &mut self,
         device: &Device,
         log: &Log,
-        shares: impl Fn(&Conversation, &Person) -> bool,
+        shares: impl Fn(&Entry, u64, &Person) -> bool,
         now: u64,
     ) -> Outgoing {
         let me = self.me;
@@ -216,7 +219,7 @@ impl Counters {
         number: u64,
         ok: bool,
         log: &Log,
-        shares: impl Fn(&Conversation, &Person) -> bool,
+        shares: impl Fn(&Entry, u64, &Person) -> bool,
     ) {
         let me = self.me;
         let Some(counter) = self.devices.get_mut(device) else {
@@ -239,13 +242,13 @@ fn meant_for(
     device: &Device,
     person: Person,
     me: Person,
-    shares: &impl Fn(&Conversation, &Person) -> bool,
+    shares: &impl Fn(&Entry, u64, &Person) -> bool,
 ) -> bool {
     let Some(e) = log.get(n) else { return false };
     if person == me {
         e.from != *device
     } else {
-        e.author == me && !e.private && shares(&e.chat, &person)
+        e.author == me && !e.private && shares(e, n, &person)
     }
 }
 
@@ -300,14 +303,15 @@ mod tests {
             from,
             at,
             private: false,
+            change: false,
         }
     }
 
-    fn shares(chat: &Conversation, person: &Person) -> bool {
-        *chat == WITH_BOB && *person == BOB
+    fn shares(e: &Entry, _: u64, person: &Person) -> bool {
+        e.chat == WITH_BOB && *person == BOB
     }
 
-    fn all(_: &Conversation, _: &Person) -> bool {
+    fn all(_: &Entry, _: u64, _: &Person) -> bool {
         true
     }
 

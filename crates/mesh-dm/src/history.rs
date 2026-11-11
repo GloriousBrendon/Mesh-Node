@@ -18,7 +18,7 @@
 //!   `n` and `seq`, so a chat opened from its newest segment alone still
 //!   checks "late and low" and "out of step" (D2).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -90,7 +90,7 @@ pub struct History {
     known: HashMap<Conversation, Where>,
     /// Each group chat's members in its current version; none before its
     /// creation has arrived.
-    members: HashMap<Conversation, BTreeSet<Person>>,
+    members: HashMap<Conversation, BTreeMap<Person, EventId>>,
     /// Events each sender has waiting for a group's creation.
     // ponytail: in memory, so a restart lets a sender start over at MAX_BEFORE_CREATION.
     before_creation: HashMap<(Conversation, Person), usize>,
@@ -242,7 +242,7 @@ impl History {
                 group.add(event, by, change, at);
             }
             if let Some(version) = group.version(&id) {
-                self.members.insert(key, version.members);
+                self.members.insert(key, version.joined);
             }
         }
         Ok(())
@@ -291,6 +291,7 @@ impl History {
                 from: from.device,
                 at: received,
                 private: private(&event.body),
+                change: matches!(event.body, Body::Group(_)),
             };
             let position = u32::try_from(position).map_err(|_| StoreError::Damaged)?;
             missed.push(LogRecord::Stored {
@@ -517,7 +518,7 @@ impl History {
                     if !created_before {
                         open.chat.wipe_senders_not_in(&version.members);
                     }
-                    self.members.insert(*chat, version.members);
+                    self.members.insert(*chat, version.joined);
                 }
                 None => {
                     self.members.remove(chat);
@@ -601,6 +602,7 @@ impl History {
                 from: via,
                 at: *received,
                 private: private(&event.body),
+                change: matches!(event.body, Body::Group(_)),
             };
             records.push(LogRecord::Stored {
                 entry,
@@ -654,8 +656,8 @@ impl History {
 
     /// What `device` gets next, read back from disk.
     pub fn outgoing(&mut self, device: &Device, now: u64) -> Result<Vec<ToSend>, HistoryError> {
-        let (known, members) = (&self.known, &self.members);
-        let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
+        let (known, members, log) = (&self.known, &self.members, &self.log);
+        let shares = |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
         let Outgoing { send, .. } = self.counters.to_send(device, &self.log, shares, now);
         let mut segments: HashMap<(Conversation, u32), Vec<Vec<u8>>> = HashMap::new();
         let mut out = Vec::with_capacity(send.len());
@@ -687,8 +689,9 @@ impl History {
                 }
                 // Wiped since: there's nothing to send, so it counts as taken.
                 None => {
-                    let (known, members) = (&self.known, &self.members);
-                    let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
+                    let (known, members, log) = (&self.known, &self.members, &self.log);
+                    let shares =
+                        |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
                     self.counters.acked(device, number, true, &self.log, shares)
                 }
             }
@@ -698,8 +701,8 @@ impl History {
 
     /// The device answered for event `number`.
     pub fn acked(&mut self, device: &Device, number: u64, ok: bool) {
-        let (known, members) = (&self.known, &self.members);
-        let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
+        let (known, members, log) = (&self.known, &self.members, &self.log);
+        let shares = |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
         self.counters.acked(device, number, ok, &self.log, shares);
     }
 
@@ -729,6 +732,25 @@ impl History {
         self.known.get(&chat).copied()
     }
 
+    /// A group's members in its current version; `None` before its
+    /// creation has arrived, or for a 1:1 chat.
+    pub fn members(&self, at: &Where) -> Option<Vec<Person>> {
+        let joined = self.members.get(&at.key())?;
+        Some(joined.keys().copied().collect())
+    }
+
+    /// A group's current version (name, creator, head), from its chat.
+    pub fn group(
+        &mut self,
+        at: &Where,
+        now: u64,
+    ) -> Result<Option<crate::group::Version>, HistoryError> {
+        let Where::Group(id) = at else {
+            return Ok(None);
+        };
+        Ok(self.chat(at, now)?.group(id))
+    }
+
     /// Who wrote a stored event, from its log entry: no chat is loaded.
     pub fn author_of(&self, id: &EventId) -> Option<Person> {
         Some(self.log.get(self.log.number_of(id)?)?.author)
@@ -736,8 +758,8 @@ impl History {
 
     /// Whether one of the other person's devices has taken our event (D5).
     pub fn is_sent(&self, id: &EventId) -> bool {
-        let (known, members) = (&self.known, &self.members);
-        let shares = |c: &Conversation, p: &Person| in_chat(known, members, c, p);
+        let (known, members, log) = (&self.known, &self.members, &self.log);
+        let shares = |e: &Entry, n: u64, p: &Person| in_chat(known, members, log, e, n, p);
         self.log
             .number_of(id)
             .is_some_and(|n| self.counters.taken_by_others(n, &self.log, shares))
@@ -792,17 +814,25 @@ impl History {
     }
 }
 
-/// Whether `person` is in chat `chat`: the person of a 1:1, a member of a
-/// group's current version.
+/// Whether event `n` (`e`) is for `person`: the person of a 1:1; in a
+/// group, a member of its current version, for its changes always and for
+/// the rest from the change they joined at on.
 fn in_chat(
     known: &HashMap<Conversation, Where>,
-    members: &HashMap<Conversation, BTreeSet<Person>>,
-    chat: &Conversation,
+    members: &HashMap<Conversation, BTreeMap<Person, EventId>>,
+    log: &Log,
+    e: &Entry,
+    n: u64,
     person: &Person,
 ) -> bool {
-    match known.get(chat) {
+    match known.get(&e.chat) {
         Some(Where::Direct(p)) => p == person,
-        Some(Where::Group(_)) => members.get(chat).is_some_and(|m| m.contains(person)),
+        Some(Where::Group(_)) => {
+            let Some(joined) = members.get(&e.chat).and_then(|m| m.get(person)) else {
+                return false;
+            };
+            e.change || log.number_of(joined).is_none_or(|from| n >= from)
+        }
         None => false,
     }
 }
@@ -1351,6 +1381,37 @@ mod tests {
         let texts: Vec<&str> = page.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["early"], "Bob's waited; the stranger's are gone");
         assert_eq!(h.chats(), [group]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Someone added to a group gets its messages from their add on, not the
+    /// ones before; its changes they get all of, to know who's in it.
+    #[test]
+    fn a_new_member_gets_events_from_their_add() {
+        let root = dir("group-join");
+        let group = Where::Group(crate::group_id(&ME.person, &NONCE));
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let made = h.send(&group, create(vec![BOB.person]), NOW).unwrap();
+        h.send(&group, text("before Carol"), NOW).unwrap();
+        let add = Body::Group(crate::event::GroupChange {
+            after: Some(made.id),
+            change: crate::event::Change::Add(CAROL.person),
+        });
+        h.send(&group, add, NOW).unwrap();
+        h.send(&group, text("with Carol"), NOW).unwrap();
+        h.add_device(CAROL.device, CAROL.person);
+        h.add_device(BOB.device, BOB.person);
+        let carol: Vec<Body> = h
+            .outgoing(&CAROL.device, NOW)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.event.body)
+            .collect();
+        // The group's changes (to know who's in it), then from her add on.
+        assert_eq!(carol.len(), 3, "{carol:?}");
+        assert!(!carol.contains(&text("before Carol")));
+        assert_eq!(carol[2], text("with Carol"));
+        assert_eq!(h.outgoing(&BOB.device, NOW).unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(root);
     }
 

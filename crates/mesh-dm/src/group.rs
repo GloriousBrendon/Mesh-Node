@@ -6,7 +6,7 @@
 //! earlier creator change; if neither, the lower first event ID. The result
 //! depends only on which changes are held, never on their arrival order.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::chat::Position;
 use crate::event::{Change, EventId, GroupChange, MAX_MEMBERS};
@@ -20,6 +20,9 @@ pub struct Version {
     pub name: String,
     /// The newest change on the winning line: what a new one follows.
     pub head: EventId,
+    /// The change each member joined at: the creation, or their add. A new
+    /// member gets the group's events from there on.
+    pub joined: BTreeMap<Person, EventId>,
 }
 
 struct Node {
@@ -76,8 +79,10 @@ impl Group {
             members: BTreeSet::from([node.by]),
             name: name.clone(),
             head: *root,
+            joined: BTreeMap::new(),
         };
         start.members.extend(members.iter().take(MAX_MEMBERS - 1));
+        start.joined = start.members.iter().map(|m| (*m, *root)).collect();
         let mut children: HashMap<EventId, Vec<EventId>> = HashMap::new();
         for (id, n) in &self.changes {
             if let Some(after) = n.after {
@@ -93,7 +98,7 @@ impl Group {
             i += 1;
             for child in children.get(&id).into_iter().flatten() {
                 let node = &self.changes[child];
-                if let Some(next) = apply(&versions[&id], node) {
+                if let Some(next) = apply(&versions[&id], *child, node) {
                     versions.insert(*child, next);
                     order.push(*child);
                 }
@@ -133,21 +138,24 @@ impl Group {
 }
 
 /// The version after `node`, if its sender may make that change in `v`.
-fn apply(v: &Version, node: &Node) -> Option<Version> {
+fn apply(v: &Version, id: EventId, node: &Node) -> Option<Version> {
     let member = v.members.contains(&node.by);
     let mut next = v.clone();
     match &node.change {
         Change::Create { .. } => return None,
         Change::Add(who) if member && !v.members.contains(who) && v.members.len() < MAX_MEMBERS => {
             next.members.insert(*who);
+            next.joined.insert(*who, id);
         }
         Change::Remove(who) if node.by == v.creator && member && *who != v.creator => {
             if !next.members.remove(who) {
                 return None;
             }
+            next.joined.remove(who);
         }
         Change::Leave if member => {
             next.members.remove(&node.by);
+            next.joined.remove(&node.by);
         }
         Change::Rename(name) if member => next.name = name.clone(),
         _ => return None,
@@ -350,6 +358,16 @@ mod tests {
             back.add(id, by, change, at);
         }
         assert_eq!(back.version(&id()), g.version(&id()));
+    }
+
+    /// When each member joined: the creation for the first ones, the add
+    /// for later ones. A new member gets events from there on.
+    #[test]
+    fn each_member_joined_somewhere() {
+        let v = group(&[create(), (2, A, Some(1), Change::Add(D), 2)]).unwrap();
+        assert_eq!(v.joined[&C], [1; 16]);
+        assert_eq!(v.joined[&B], [1; 16]);
+        assert_eq!(v.joined[&D], [2; 16]);
     }
 
     #[test]
