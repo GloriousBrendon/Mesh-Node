@@ -7,6 +7,7 @@
 pub mod blob;
 pub mod chat;
 pub mod event;
+pub mod group;
 pub mod store;
 pub mod sync;
 

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::event::{Attachment, Body, Event, EventId};
+use crate::group::{Group, Version};
 use crate::{Device, Person, Sender};
 
 /// How far ahead of the reader's clock an event may be and still show (D2).
@@ -94,6 +95,8 @@ pub struct Chat {
     deleted: HashSet<EventId>,
     /// Stored events to wipe (`take_scrub`).
     scrub: Vec<EventId>,
+    /// A group's changes (D7).
+    group: Group,
 }
 
 #[derive(Default)]
@@ -121,6 +124,7 @@ impl Chat {
             pending: HashMap::new(),
             deleted: HashSet::new(),
             scrub: Vec::new(),
+            group: Group::default(),
         }
     }
 
@@ -284,7 +288,8 @@ impl Chat {
                 }
             }
             Body::Read { up_to } if from.person == self.me => self.mark_read(&up_to),
-            Body::Read { .. } | Body::Group(_) => {}
+            Body::Group(change) => self.group.add(id, from.person, change, at),
+            Body::Read { .. } => {}
         }
     }
 
@@ -419,6 +424,12 @@ impl Chat {
             .iter()
             .filter_map(|(_, id)| message(id))
             .collect()
+    }
+
+    /// A group chat's members and name; `None` for a 1:1 chat, or before
+    /// the creation has arrived.
+    pub fn group(&self) -> Option<Version> {
+        self.group.version()
     }
 
     /// Events whose stored copies must now be wiped: a deleted message, its
@@ -770,6 +781,33 @@ mod tests {
             );
         }
         assert_eq!(only(&chat).2.len(), MAX_REACTIONS, "at most 20 different");
+    }
+
+    #[test]
+    fn group_changes_in_the_chat() {
+        use crate::event::{Change, GroupChange};
+        let mut chat = Chat::new(ME);
+        assert_eq!(chat.group(), None);
+        let create = Body::Group(GroupChange {
+            after: None,
+            change: Change::Create {
+                name: "hike".into(),
+                members: vec![ME, BOB.person],
+            },
+        });
+        let rename = Body::Group(GroupChange {
+            after: Some([1; 16]),
+            change: Change::Rename("trip".into()),
+        });
+        // The rename comes first and waits for the creation.
+        chat.take(BOB, body(2, 20, rename), NOW);
+        chat.take(ALICE, body(1, 10, create), NOW);
+        let group = chat.group().unwrap();
+        assert_eq!(
+            (group.creator, group.name.as_str(), group.members.len()),
+            (ALICE.person, "trip", 3)
+        );
+        assert!(chat.messages().is_empty(), "changes aren't messages");
     }
 
     #[test]
