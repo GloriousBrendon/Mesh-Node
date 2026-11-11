@@ -128,11 +128,18 @@ impl Chat {
         }
     }
 
-    /// The `seq` for this device's next event: one more than the highest
-    /// held that isn't ahead of `now` (D2).
-    pub fn next_seq(&self, now: u64) -> u64 {
+    /// The `seq` for `device`'s next event: one more than the highest held
+    /// that isn't ahead of `now`, or than the device's own last, whichever is
+    /// higher (D2).
+    pub fn next_seq(&self, device: &Device, now: u64) -> u64 {
         let held = self.held.values().map(|h| h.event.seq);
-        held.filter(|&seq| seq <= now).max().unwrap_or(0) + 1
+        let caught_up = held.filter(|&seq| seq <= now).max().unwrap_or(0);
+        // Never at or below our own last: readers would drop it as out of step.
+        let ours = self
+            .steps
+            .get(device)
+            .and_then(|s| s.values().max().copied());
+        caught_up.max(ours.unwrap_or(0)) + 1
     }
 
     /// Takes in an event from `from`, at the reader's clock `now`.
@@ -466,6 +473,36 @@ mod tests {
         device: [30; 32],
     };
 
+    const MINE: Sender = Sender {
+        person: ME,
+        device: [10; 32],
+    };
+
+    /// A device never numbers at or below its own last event: not when its
+    /// clock steps back, nor for two sends in one millisecond once `seq` has
+    /// reached the clock. Readers would drop the repeat as out of step.
+    #[test]
+    fn a_device_never_repeats_its_own_seq() {
+        let mut chat = Chat::new(ME);
+        // Sent at NOW, then the clock stepped back a minute.
+        chat.take(MINE, text(1, NOW, 1), NOW);
+        let back = NOW - 60_000;
+        assert_eq!(chat.next_seq(&MINE.device, back), NOW + 1);
+        // Two sends in one millisecond, seq already at the clock.
+        let seq = chat.next_seq(&MINE.device, NOW);
+        assert_eq!(chat.take(MINE, text(2, seq, 2), NOW), Taken::Shown);
+        let again = chat.next_seq(&MINE.device, NOW);
+        assert!(again > seq, "{again} after {seq}");
+        assert_eq!(chat.take(MINE, text(3, again, 3), NOW), Taken::Shown);
+        // Another device's events ahead of our clock still don't count.
+        let laptop = Sender {
+            device: [11; 32],
+            ..MINE
+        };
+        chat.take(laptop, text(4, NOW + 120_000, 1), NOW);
+        assert_eq!(chat.next_seq(&MINE.device, NOW), again + 1);
+    }
+
     pub(super) fn text(id: u8, seq: u64, n: u64) -> Event {
         Event {
             version: VERSION,
@@ -505,14 +542,14 @@ mod tests {
     #[test]
     fn a_sender_ignores_a_held_seq_ahead_of_its_clock() {
         let mut chat = Chat::new(ME);
-        assert_eq!(chat.next_seq(NOW), 1, "a new chat");
+        assert_eq!(chat.next_seq(&MINE.device, NOW), 1, "a new chat");
         chat.take(ALICE, text(1, NOW - 10, 1), NOW);
-        assert_eq!(chat.next_seq(NOW), NOW - 9);
+        assert_eq!(chat.next_seq(&MINE.device, NOW), NOW - 9);
         // A forger's jump, still within the 5 minutes: shown, not taken up.
         chat.take(BOB, text(2, NOW + 60_000, 1), NOW);
-        assert_eq!(chat.next_seq(NOW), NOW - 9);
+        assert_eq!(chat.next_seq(&MINE.device, NOW), NOW - 9);
         // Once the clock passes it, it is.
-        assert_eq!(chat.next_seq(NOW + 60_000), NOW + 60_001);
+        assert_eq!(chat.next_seq(&MINE.device, NOW + 60_000), NOW + 60_001);
     }
 
     #[test]
@@ -574,12 +611,12 @@ mod tests {
             device: [40; 32],
         };
         bob_view.take(forger, text(8, NOW + AHEAD_SHOWN, 1), NOW);
-        let seq = bob_view.next_seq(NOW);
+        let seq = bob_view.next_seq(&BOB.device, NOW);
         assert_eq!(seq, NOW - 999, "the jump didn't carry");
         assert_eq!(left_out.take(BOB, text(2, seq, 1), NOW), Taken::Shown);
         // Even after the clocks pass the jump, Bob's next is within range.
         let later = NOW + AHEAD_SHOWN + 1;
-        let seq = bob_view.next_seq(later);
+        let seq = bob_view.next_seq(&BOB.device, later);
         assert_eq!(left_out.take(BOB, text(3, seq, 2), later), Taken::Shown);
         assert_eq!(ids(&left_out), [1, 2, 3]);
     }
