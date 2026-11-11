@@ -6,7 +6,8 @@
 //! - A chat record is `received u64 | sender person [32] | sender device
 //!   [32] | event`, so a reopened chat shows the same times and knows who
 //!   sent what. A wiped record becomes empty, keeping every position.
-//! - The log is a stream of its own (a reserved conversation): one record
+//! - The log is a stream of its own, where no conversation ID reaches
+//!   (`Store::open_log`): one record
 //!   per stored event (its number's entry and where it's kept) or per
 //!   deleted message. It's read whole at open: that's the set of every event
 //!   held, which refuses late copies, and the deletions, which refuse late
@@ -22,15 +23,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::chat::{Chat, Position, Taken};
+use crate::chat::{Chat, Position, Refusal, Taken};
 use crate::event::{Body, Event, EventError, EventId, VERSION};
 use crate::store::{ChatFiles, Conversation, Store, StoreError};
 use crate::sync::{Counters, Entry, Log, Outgoing};
-use crate::{Device, Person, Sender};
+use crate::{Device, Person, Sender, Where};
 
-/// The log's stream: no real conversation has this ID (they're random or
-/// derived from a pair secret).
-const LOG: Conversation = [0xFF; 16];
 const RECORD_HEAD: usize = 8 + 32 + 32;
 
 #[derive(Serialize, Deserialize)]
@@ -100,7 +98,7 @@ impl History {
             deleted: HashMap::new(),
             counters: Counters::new(me.person),
             chats: HashMap::new(),
-            log_files: store.open(&LOG)?,
+            log_files: store.open_log()?,
             store,
         };
         for n in 0..history.log_files.segments() {
@@ -191,18 +189,15 @@ impl History {
     }
 
     /// A chat, loaded from its newest segment if it isn't yet.
-    pub fn chat(&mut self, chat: &Conversation, now: u64) -> Result<&Chat, HistoryError> {
-        self.load(chat, now)?;
-        Ok(&self.chats[chat].chat)
+    pub fn chat(&mut self, at: &Where, now: u64) -> Result<&Chat, HistoryError> {
+        let chat = at.key();
+        self.load(&chat, now)?;
+        Ok(&self.chats[&chat].chat)
     }
 
     /// Makes, stores and returns this device's next event in `chat`.
-    pub fn send(
-        &mut self,
-        chat: &Conversation,
-        body: Body,
-        now: u64,
-    ) -> Result<Event, HistoryError> {
+    pub fn send(&mut self, at: &Where, body: Body, now: u64) -> Result<Event, HistoryError> {
+        let chat = &at.key();
         self.load(chat, now)?;
         let open = &self.chats[chat];
         let device = self.me.device;
@@ -218,7 +213,7 @@ impl History {
             body,
         };
         event.to_bytes()?;
-        self.receive(chat, self.me, vec![event.clone()], now)?;
+        self.receive(at, self.me, vec![event.clone()], now)?;
         Ok(event)
     }
 
@@ -226,11 +221,19 @@ impl History {
     /// sync per batch. An error means nothing in the batch is acknowledged.
     pub fn receive(
         &mut self,
-        chat: &Conversation,
+        at: &Where,
         from: Sender,
         events: Vec<Event>,
         now: u64,
     ) -> Result<Vec<Taken>, HistoryError> {
+        // A 1:1 chat takes events only from that person and our own devices.
+        if let Where::Direct(peer) = at
+            && from.person != *peer
+            && from.person != self.me.person
+        {
+            return Ok(vec![Taken::Refused(Refusal::NotInChat); events.len()]);
+        }
+        let chat = &at.key();
         self.load(chat, now)?;
         let mut taken = Vec::with_capacity(events.len());
         let mut kept = Vec::new();
@@ -458,12 +461,13 @@ fn decode(record: &[u8]) -> Result<Option<(u64, Sender, Event)>, HistoryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::Refusal;
     use crate::store::SEGMENT_EVENTS;
     use std::path::PathBuf;
 
     const NOW: u64 = 1_800_000_000_000;
     const KEY: [u8; 32] = [7; 32];
-    const CHAT: Conversation = [3; 16];
+    const CHAT: Where = Where::Direct([2; 32]);
     const ME: Sender = Sender {
         person: [1; 32],
         device: [10; 32],
@@ -471,6 +475,10 @@ mod tests {
     const BOB: Sender = Sender {
         person: [2; 32],
         device: [20; 32],
+    };
+    const CAROL: Sender = Sender {
+        person: [4; 32],
+        device: [40; 32],
     };
 
     fn dir(name: &str) -> PathBuf {
@@ -575,12 +583,61 @@ mod tests {
             .unwrap();
         assert_eq!(taken, [Taken::Duplicate, Taken::Ignored]);
         // Nothing of it is on disk, even sealed and read back.
-        let mut files = Store::new(&root, &KEY).open(&CHAT).unwrap();
+        let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
         for n in 0..files.segments() {
             for record in files.read(n).unwrap() {
                 assert!(!record.windows(4).any(|w| w == b"oops"), "{n}");
             }
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A 1:1 chat takes events only from that person and our own devices.
+    #[test]
+    fn a_one_to_one_chat_takes_only_that_person_and_us() {
+        let root = dir("one-to-one");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let taken = h
+            .receive(&CHAT, CAROL, vec![bobs(1, NOW, 1, text("not Bob"))], NOW)
+            .unwrap();
+        assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
+        let laptop = Sender {
+            device: [11; 32],
+            ..ME
+        };
+        let taken = h
+            .receive(&CHAT, laptop, vec![bobs(2, NOW, 1, text("mine"))], NOW)
+            .unwrap();
+        assert_eq!(taken, [Taken::Shown]);
+        drop(h);
+        assert_eq!(
+            texts(&mut History::open(&root, &KEY, ME).unwrap()),
+            ["mine"]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// No group ID reaches the log, or a 1:1 chat: not the log's old
+    /// reserved ID, and not the storage key of my chat with Bob.
+    #[test]
+    fn a_group_id_reaches_neither_the_log_nor_a_one_to_one_chat() {
+        let root = dir("group-ids");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.receive(&CHAT, BOB, vec![bobs(1, NOW, 1, text("from Bob"))], NOW)
+            .unwrap();
+        for id in [[0xFF; 16], CHAT.key()] {
+            let intruder = bobs(id[0], NOW, 1, text("intruder"));
+            let taken = h
+                .receive(&Where::Group(id), CAROL, vec![intruder], NOW)
+                .unwrap();
+            assert_eq!(taken, [Taken::Shown], "its own group chat");
+        }
+        drop(h);
+        // The log still opens, and Bob's chat has only Bob's message.
+        let mut again = History::open(&root, &KEY, ME).unwrap();
+        assert_eq!(texts(&mut again), ["from Bob"]);
+        let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
+        assert_eq!(files.read(0).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -27,6 +27,9 @@ const NAME_CONTEXT: &str = "mesh/v1/dm-store-name";
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 const INDEX: &str = "index";
+/// What a record belongs to, in its binding: a chat, or the log.
+const CHAT_STREAM: u8 = 0;
+const LOG_STREAM: u8 = 1;
 
 pub type Conversation = [u8; 16];
 
@@ -49,6 +52,8 @@ pub struct Store {
 pub struct ChatFiles {
     dir: PathBuf,
     seal: Zeroizing<[u8; 32]>,
+    /// A chat's stream, or the log's: part of every record's binding.
+    stream: u8,
     conversation: Conversation,
     segments: u32,
     /// Events in the newest segment, and the bytes they take.
@@ -68,7 +73,24 @@ impl Store {
 
     /// A chat's files; reads only its newest segment.
     pub fn open(&self, conversation: &Conversation) -> Result<ChatFiles, StoreError> {
-        let name = blake3::keyed_hash(&self.names, conversation);
+        let name = [&b"chat"[..], conversation].concat();
+        self.open_files(&name, CHAT_STREAM, conversation)
+    }
+
+    /// The history's own log (history.rs). Its folder name and its records'
+    /// binding come from a different input than any chat's, so no
+    /// conversation ID reaches it.
+    pub fn open_log(&self) -> Result<ChatFiles, StoreError> {
+        self.open_files(b"log", LOG_STREAM, &[0; 16])
+    }
+
+    fn open_files(
+        &self,
+        name: &[u8],
+        stream: u8,
+        conversation: &Conversation,
+    ) -> Result<ChatFiles, StoreError> {
+        let name = blake3::keyed_hash(&self.names, name);
         let hex: String = name.as_bytes()[..16]
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -91,6 +113,7 @@ impl Store {
         let mut files = ChatFiles {
             dir,
             seal: self.seal.clone(),
+            stream,
             conversation: *conversation,
             segments,
             last: (0, 0),
@@ -124,11 +147,12 @@ impl ChatFiles {
     }
 
     /// What every sealed thing in this chat is bound to.
-    fn aad(&self, segment: u32, position: u32) -> [u8; 24] {
-        let mut aad = [0u8; 24];
-        aad[..16].copy_from_slice(&self.conversation);
-        aad[16..20].copy_from_slice(&segment.to_be_bytes());
-        aad[20..].copy_from_slice(&position.to_be_bytes());
+    fn aad(&self, segment: u32, position: u32) -> [u8; 25] {
+        let mut aad = [0u8; 25];
+        aad[0] = self.stream;
+        aad[1..17].copy_from_slice(&self.conversation);
+        aad[17..21].copy_from_slice(&segment.to_be_bytes());
+        aad[21..].copy_from_slice(&position.to_be_bytes());
         aad
     }
 
@@ -523,6 +547,45 @@ mod tests {
         let mut events_now = events(0..3);
         events_now.extend(events(4..5));
         assert_eq!(store.open(&CHAT).unwrap().read(0).unwrap(), events_now);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The log lives where no conversation ID reaches: no chat opens its
+    /// folder, and its records don't open as a chat's (PLAN-dm, chat IDs).
+    #[test]
+    fn no_conversation_reaches_the_log() {
+        let (store, dir) = store("log");
+        let mut log = store.open_log().unwrap();
+        log.append(&events(0..3)).unwrap();
+        for id in [[0xFF; 16], [0; 16], CHAT] {
+            assert_eq!(store.open(&id).unwrap().segments(), 0, "{id:?}");
+        }
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "only the log's folder"
+        );
+        // Copied into a chat, its records are refused.
+        let mut chat = store.open(&[0xFF; 16]).unwrap();
+        chat.append(&events(0..1)).unwrap();
+        // Two folders now; the log's segment holds three records, the chat's one.
+        let dirs: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let size = |p: &PathBuf| fs::read(p.join("00000000.seg")).unwrap().len();
+        let (log_dir, chat_dir) = if size(&dirs[0]) > size(&dirs[1]) {
+            (&dirs[0], &dirs[1])
+        } else {
+            (&dirs[1], &dirs[0])
+        };
+        fs::copy(log_dir.join("00000000.seg"), chat_dir.join("00000000.seg")).unwrap();
+        let mut chat = store.open(&[0xFF; 16]).unwrap();
+        assert!(
+            chat.read(0).unwrap().is_empty(),
+            "a newest segment that doesn't open is empty"
+        );
+        assert_eq!(store.open_log().unwrap().read(0).unwrap(), events(0..3));
         let _ = fs::remove_dir_all(dir);
     }
 

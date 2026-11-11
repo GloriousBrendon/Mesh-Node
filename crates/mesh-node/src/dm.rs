@@ -10,6 +10,7 @@
 
 use super::*;
 use mesh_dm::Sender as DmSender;
+use mesh_dm::Where;
 use mesh_dm::chat::Taken;
 use mesh_dm::event::Event;
 use mesh_dm::history::History;
@@ -23,8 +24,8 @@ const OK: u8 = 0;
 /// The answer for a frame that couldn't be opened or stored: send it again.
 const FAILED: u8 = 1;
 /// Where a 1:1 chat with `peer` is kept on our devices.
-pub(super) fn direct_chat(peer: &MeshId) -> Chat {
-    mesh_dm::direct_chat(&peer.to_bytes())
+pub(super) fn direct_chat(peer: &MeshId) -> Where {
+    Where::Direct(peer.to_bytes())
 }
 
 /// Writes the frames, finishes, and reads the reader's answers: one byte
@@ -89,7 +90,7 @@ impl Helper {
         }
         history.add_device(device, id.to_bytes());
         let shares = |chat: &Chat, person: &[u8; 32]| {
-            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p))
+            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p).key())
         };
         let mut out = match history.outgoing(&device, shares, unix_now() * 1000) {
             Ok(out) => out,
@@ -138,7 +139,7 @@ impl Helper {
         let Some(history) = &mut self.dm else { return };
         let Some(answers) = answers else { return };
         let shares = |chat: &Chat, person: &[u8; 32]| {
-            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p))
+            MeshId::from_bytes(person).is_ok_and(|p| *chat == direct_chat(&p).key())
         };
         for (number, ok) in numbers.iter().zip(&answers) {
             history.acked(&device, *number, *ok, shares);
@@ -232,8 +233,8 @@ mod tests {
             RootKey::generate().unwrap().id(),
             RootKey::generate().unwrap().id(),
         );
-        assert_ne!(direct_chat(&a), direct_chat(&b));
-        assert_eq!(direct_chat(&a), direct_chat(&a));
+        assert_ne!(direct_chat(&a).key(), direct_chat(&b).key());
+        assert_eq!(direct_chat(&a).key(), direct_chat(&a).key());
     }
 
     /// PLAN-dm Task 9b, criterion 4: one device takes in 10,000 events from
@@ -297,8 +298,9 @@ mod tests {
         // device as ours while the envelopes use the pair's session: the
         // same opening and storing, event for event.
         a_history.add_device(device, alice.to_bytes());
-        let shares =
-            |c: &Chat, p: &[u8; 32]| MeshId::from_bytes(p).is_ok_and(|p| *c == direct_chat(&p));
+        let shares = |c: &Chat, p: &[u8; 32]| {
+            MeshId::from_bytes(p).is_ok_and(|p| *c == direct_chat(&p).key())
+        };
         let started = std::time::Instant::now();
         let mut intake = std::time::Duration::ZERO;
         let mut taken = 0;

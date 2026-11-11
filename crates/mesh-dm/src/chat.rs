@@ -65,6 +65,9 @@ pub enum Refusal {
     /// A higher `n` with a lower `seq` than an event from the same device,
     /// or the same `n` twice.
     OutOfStep,
+    /// From someone who isn't in this chat: a 1:1 chat takes events only
+    /// from that person and our own devices.
+    NotInChat,
 }
 
 struct Held {

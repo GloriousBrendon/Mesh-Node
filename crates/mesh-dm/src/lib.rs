@@ -12,10 +12,25 @@ pub mod history;
 pub mod store;
 pub mod sync;
 
-/// Where a 1:1 chat with `peer` (their ID's bytes) is kept on our devices.
-pub fn direct_chat(peer: &Person) -> store::Conversation {
-    let key = blake3::derive_key("mesh/v1/dm-chat", peer);
-    key[..16].try_into().expect("16 bytes")
+/// Which chat an event belongs to, as e2ee says: a 1:1 with a person, or a
+/// group. Each kind's storage key comes from its own input, so no group ID
+/// can name a 1:1 chat's files (and none reaches the log, store.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Where {
+    Direct(Person),
+    Group([u8; 16]),
+}
+
+impl Where {
+    /// Where the chat is kept on this device.
+    pub fn key(&self) -> store::Conversation {
+        let input = match self {
+            Where::Direct(person) => [&[1u8][..], person].concat(),
+            Where::Group(id) => [&[2u8][..], id].concat(),
+        };
+        let key = blake3::derive_key("mesh/v1/dm-chat", &input);
+        key[..16].try_into().expect("16 bytes")
+    }
 }
 
 /// A person: their Mesh ID's 32 bytes.
