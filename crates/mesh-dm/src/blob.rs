@@ -196,6 +196,7 @@ pub const MAX_KEPT: u64 = 10 * 1000 * 1000 * 1000;
 /// A sealed chunk's length: the plain chunk and its tag.
 const SEALED_CHUNK: u64 = CHUNK as u64 + 16;
 const META_FORMAT: u8 = 1;
+const NOTE_CONTEXT: &str = "mesh/v1/dm-kept";
 
 /// Which chats hold a kept file, and whether we sent it (D13).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -208,18 +209,52 @@ pub struct Kept {
 /// fetched, so this device can pass them on to others in the chat.
 pub struct Blobs {
     dir: std::path::PathBuf,
+    /// Seals each file's note, which names its chats.
+    seal: zeroize::Zeroizing<[u8; 32]>,
+}
+
+fn blob_path(dir: &std::path::Path, hash: &[u8; 32], ext: &str) -> std::path::PathBuf {
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{hex}.{ext}"))
+}
+
+/// Sealed chunk `index` of the file kept in `dir`, if there; needs no key.
+pub fn read_chunk(
+    dir: &std::path::Path,
+    hash: &[u8; 32],
+    index: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::{Read, Seek};
+    let mut file = match std::fs::File::open(blob_path(dir, hash, "blob")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let start = index.saturating_mul(SEALED_CHUNK);
+    if start >= file.metadata()?.len() {
+        return Ok(None);
+    }
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut chunk = Vec::with_capacity(SEALED_CHUNK as usize);
+    file.take(SEALED_CHUNK).read_to_end(&mut chunk)?;
+    Ok(Some(chunk))
 }
 
 impl Blobs {
-    pub fn new(dir: &std::path::Path) -> Self {
+    pub fn new(dir: &std::path::Path, data_key: &[u8; 32]) -> Self {
         Self {
             dir: dir.to_owned(),
+            seal: zeroize::Zeroizing::new(blake3::derive_key(NOTE_CONTEXT, data_key)),
         }
     }
 
     fn path(&self, hash: &[u8; 32], ext: &str) -> std::path::PathBuf {
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        self.dir.join(format!("{hex}.{ext}"))
+        blob_path(&self.dir, hash, ext)
+    }
+
+    fn cipher(&self) -> chacha20poly1305::XChaCha20Poly1305 {
+        use chacha20poly1305::KeyInit;
+        chacha20poly1305::XChaCha20Poly1305::new(&(*self.seal).into())
     }
 
     /// Seals the file at `source` with a fresh key and keeps it as ours, for
@@ -260,9 +295,18 @@ impl Blobs {
         if !kept.chats.contains(&chat) {
             kept.chats.push(chat);
         }
-        let mut bytes = vec![META_FORMAT];
-        bytes.extend(postcard::to_stdvec(&kept).expect("to memory"));
-        mesh_identity::write_atomically(&self.path(hash, "kept"), &bytes)
+        let mut plain = vec![META_FORMAT];
+        plain.extend(postcard::to_stdvec(&kept).expect("to memory"));
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Bound to its file, so a note can't be moved to another.
+        let payload = chacha20poly1305::aead::Payload {
+            msg: &plain,
+            aad: hash,
+        };
+        let sealed = chacha20poly1305::aead::Aead::encrypt(&self.cipher(), &nonce.into(), payload)
+            .map_err(|_| std::io::Error::other("couldn't seal a kept file's note"))?;
+        mesh_identity::write_atomically(&self.path(hash, "kept"), &[&nonce[..], &sealed].concat())
     }
 
     /// Keeps a file fetched from someone, chunk by chunk as they came, once
@@ -283,20 +327,7 @@ impl Blobs {
 
     /// Sealed chunk `index` of a kept file.
     pub fn chunk(&self, hash: &[u8; 32], index: u64) -> std::io::Result<Option<Vec<u8>>> {
-        use std::io::{Read, Seek};
-        let mut file = match std::fs::File::open(self.path(hash, "blob")) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let start = index.saturating_mul(SEALED_CHUNK);
-        if start >= file.metadata()?.len() {
-            return Ok(None);
-        }
-        file.seek(std::io::SeekFrom::Start(start))?;
-        let mut chunk = Vec::with_capacity(SEALED_CHUNK as usize);
-        file.take(SEALED_CHUNK).read_to_end(&mut chunk)?;
-        Ok(Some(chunk))
+        read_chunk(&self.dir, hash, index)
     }
 
     /// Which chats hold a kept file, and whether it's ours.
@@ -306,7 +337,15 @@ impl Blobs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        match bytes.split_first() {
+        let damaged = || std::io::Error::other("a kept file's note is damaged");
+        let (nonce, sealed) = bytes.split_first_chunk::<24>().ok_or_else(damaged)?;
+        let payload = chacha20poly1305::aead::Payload {
+            msg: sealed,
+            aad: hash,
+        };
+        let plain = chacha20poly1305::aead::Aead::decrypt(&self.cipher(), nonce.into(), payload)
+            .map_err(|_| damaged())?;
+        match plain.split_first() {
             Some((&META_FORMAT, rest)) => postcard::from_bytes(rest)
                 .map(Some)
                 .map_err(|_| std::io::Error::other("a kept file's note is damaged")),
@@ -354,7 +393,7 @@ impl Blobs {
                 continue;
             };
             let meta = entry.metadata()?;
-            let ours = self.kept(&hash)?.is_some_and(|k| k.ours);
+            let ours = self.kept(&hash).ok().flatten().is_some_and(|k| k.ours);
             kept.push((ours, meta.modified()?, meta.len(), hash));
         }
         let mut total: u64 = kept.iter().map(|k| k.2).sum();
@@ -464,7 +503,30 @@ mod tests {
     fn blobs(name: &str) -> (Blobs, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("mesh-blobs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        (Blobs::new(&dir), dir)
+        (Blobs::new(&dir, &[3; 32]), dir)
+    }
+
+    /// The note of which chats hold a file is sealed: a 1:1's friend isn't
+    /// named on disk, and another data key can't read it.
+    #[test]
+    fn the_kept_note_names_no_friend() {
+        let (b, dir) = blobs("note");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("photo.jpg");
+        std::fs::write(&source, file(10)).unwrap();
+        let (_, hash, _) = b.add_file(&source, CHAT).unwrap();
+        let (_, other, sealed) = seal(&file(20));
+        b.add_fetched(&other, &sealed, CHAT).unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(!bytes.windows(32).any(|w| w == [7; 32]), "names the friend");
+        }
+        assert_eq!(b.kept(&hash).unwrap().unwrap().chats, vec![CHAT]);
+        assert!(
+            Blobs::new(&dir, &[4; 32]).kept(&hash).is_err(),
+            "another key"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     const CHAT: crate::Where = crate::Where::Direct([7; 32]);

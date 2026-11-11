@@ -9,7 +9,7 @@
 
 use super::*;
 use mesh_dm::Where;
-use mesh_dm::blob::{Blobs, MAX_KEPT, Opener, chunks};
+use mesh_dm::blob::{Blobs, MAX_KEPT, Opener, chunks, read_chunk};
 use mesh_dm::event::{Attachment, Body, EventId, MAX_PREVIEW};
 
 /// The transport service files move on.
@@ -85,7 +85,6 @@ pub(super) async fn serve_blob(
         }
         *count += 1;
     }
-    let blobs = Blobs::new(&dir);
     let mut allowed: Option<[u8; 32]> = None;
     loop {
         let read = mesh_transport::frame::read_frame(&mut stream.recv);
@@ -107,7 +106,7 @@ pub(super) async fn serve_blob(
             }
             allowed = Some(hash);
         }
-        let chunk = blobs.chunk(&hash, index).ok().flatten().unwrap_or_default();
+        let chunk = (read_chunk(&dir, &hash, index).ok().flatten()).unwrap_or_default();
         if mesh_transport::frame::write_frame(&mut stream.send, &chunk)
             .await
             .is_err()
@@ -129,11 +128,18 @@ impl Helper {
         self.path.parent().unwrap_or(Path::new(".")).join("blobs")
     }
 
+    /// The kept files; their notes are sealed with the data key, so only
+    /// while unlocked.
+    fn blobs(&self) -> Result<Blobs, Fail> {
+        let store = (self.store.as_ref()).ok_or_else(|| Fail("locked", "locked".to_owned()))?;
+        Ok(Blobs::new(&self.blobs_dir(), store.data_key()))
+    }
+
     /// Whether `id` may fetch the kept file `hash`: they're in a chat that
     /// holds it (one of ours, a 1:1 with them, a group they're in).
     pub(super) fn may_fetch(&self, id: &MeshId, hash: &[u8; 32]) -> bool {
         let me = self.store.as_ref().map(Keystore::id);
-        let Ok(Some(kept)) = Blobs::new(&self.blobs_dir()).kept(hash) else {
+        let Ok(Ok(Some(kept))) = self.blobs().map(|b| b.kept(hash)) else {
             return false;
         };
         kept.chats.iter().any(|at| {
@@ -171,7 +177,7 @@ impl Helper {
 
     /// Drops a deleted message's kept file and any copy opened from it.
     pub(super) fn drop_file(&self, (message, hash): &(EventId, [u8; 32])) {
-        if let Err(e) = Blobs::new(&self.blobs_dir()).remove(hash) {
+        if let Ok(Err(e)) = self.blobs().map(|b| b.remove(hash)) {
             eprintln!("mesh-node: couldn't drop a kept file: {e}");
         }
         let prefix = format!("{}-", e2ee::hex(message));
@@ -203,7 +209,7 @@ impl Helper {
                 .ok_or_else(|| Fail("bad-args", format!("{func} is missing argument {}", i + 1)))
         };
         let at = self.dm_chat(arg(0)?)?;
-        let blobs = Blobs::new(&self.blobs_dir());
+        let blobs = self.blobs()?;
         match func {
             "dmSendFile" => {
                 let source = Path::new(arg(1)?);
@@ -299,7 +305,7 @@ impl Helper {
                 json!({ "fn": "dmFetch", "kind": "unavailable", "message": "nobody connected has that file" }),
             );
         };
-        let blobs = Blobs::new(&self.blobs_dir());
+        let Ok(blobs) = self.blobs() else { return };
         if let Err(e) = blobs
             .add_fetched(&file.hash, &sealed, at)
             .and_then(|()| blobs.evict(MAX_KEPT))
@@ -322,7 +328,7 @@ impl Helper {
         index: usize,
         file: &Attachment,
     ) -> Result<(), Fail> {
-        let blobs = Blobs::new(&self.blobs_dir());
+        let blobs = self.blobs()?;
         let io = |e: std::io::Error| Fail("io", format!("couldn't open that file: {e}"));
         let mut opener = Opener::new(file.key, file.hash, file.size)
             .map_err(|e| Fail("unavailable", e.to_string()))?;
