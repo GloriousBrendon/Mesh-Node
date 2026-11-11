@@ -31,6 +31,8 @@ pub struct Entry {
     pub from: Device,
     /// When it was stored, in milliseconds.
     pub at: u64,
+    /// For our own devices only: "read up to here", "delete for me".
+    pub private: bool,
 }
 
 /// The stored events in order.
@@ -215,7 +217,7 @@ fn meant_for(
     if person == me {
         e.from != *device
     } else {
-        e.author == me && shares(&e.chat, &person)
+        e.author == me && !e.private && shares(&e.chat, &person)
     }
 }
 
@@ -269,6 +271,7 @@ mod tests {
             author,
             from,
             at,
+            private: false,
         }
     }
 

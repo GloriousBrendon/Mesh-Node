@@ -5,8 +5,9 @@
 //! it on the `e2ee` service with the "answer" flag. The reader opens and
 //! stores the events, then answers each frame `ok` or `failed`; the
 //! counters move past what's `ok`. A child of `helper`, so it works on the
-//! same `Helper`. 1:1 chats only for now: groups and own-device sync come
-//! with Tasks 10 and 11.
+//! same `Helper`. Our own devices get everything, forwarded with its chat,
+//! author and first arrival (D8, Task 10). 1:1 chats; groups wait on a
+//! decision about how their events are encrypted.
 
 use super::*;
 use mesh_dm::Sender as DmSender;
@@ -81,6 +82,7 @@ impl Helper {
     /// One device's next batch, if none is in flight to it.
     fn dm_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
         let device = *addr.device.as_bytes();
+        let own = self.store.as_ref().is_some_and(|s| s.id() == *id);
         let (Some(history), Some(e2ee), Some(net)) = (&mut self.dm, &mut self.e2ee, &self.net)
         else {
             return;
@@ -100,7 +102,12 @@ impl Helper {
         if out.is_empty() {
             return;
         }
-        let bodies: Vec<Vec<u8>> = out.iter().filter_map(|t| t.event.to_bytes().ok()).collect();
+        // Our own devices get each event with its chat and author (D8).
+        let bodies: Vec<Vec<u8>> = if own {
+            out.iter().map(mesh_dm::history::forward).collect()
+        } else {
+            out.iter().filter_map(|t| t.event.to_bytes().ok()).collect()
+        };
         if bodies.len() != out.len() {
             return eprintln!("mesh-node: a stored message didn't encode");
         }
@@ -185,6 +192,47 @@ impl Helper {
             }
             Err(e) => {
                 eprintln!("mesh-node: couldn't store chat events: {e}");
+                for i in frames {
+                    answers[i] = FAILED;
+                }
+            }
+        }
+    }
+}
+
+/// One chat and author's events in a synced stream: the frames they came
+/// in, and each with its first arrival.
+type Run = (Where, DmSender, Vec<usize>, Vec<(u64, Event)>);
+
+impl Helper {
+    /// History another of our devices passed on: stored as it was there,
+    /// each run of one chat and author as one batch.
+    pub(super) fn dm_take_synced(
+        &mut self,
+        via: &[u8; 32],
+        synced: Vec<(usize, (Where, DmSender, u64, Event))>,
+        answers: &mut [u8],
+    ) {
+        let Some(history) = &mut self.dm else {
+            for (i, _) in synced {
+                answers[i] = FAILED;
+            }
+            return;
+        };
+        let now = unix_now() * 1000;
+        let mut runs: Vec<Run> = Vec::new();
+        for (i, (at, author, received, event)) in synced {
+            match runs.last_mut() {
+                Some(run) if run.0 == at && run.1 == author => {
+                    run.2.push(i);
+                    run.3.push((received, event));
+                }
+                _ => runs.push((at, author, vec![i], vec![(received, event)])),
+            }
+        }
+        for (at, author, frames, events) in runs {
+            if let Err(e) = history.receive_synced(&at, author, *via, events, now) {
+                eprintln!("mesh-node: couldn't store synced history: {e}");
                 for i in frames {
                     answers[i] = FAILED;
                 }

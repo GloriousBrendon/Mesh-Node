@@ -150,6 +150,12 @@ impl Chat {
 
     /// Takes in an event from `from`, at the reader's clock `now`.
     pub fn take(&mut self, from: Sender, event: Event, now: u64) -> Taken {
+        self.take_received(from, event, now, now)
+    }
+
+    /// As `take`, for an event that first arrived at `received` on another
+    /// of our devices (history sync): the time it shows is that arrival.
+    pub fn take_received(&mut self, from: Sender, event: Event, now: u64, received: u64) -> Taken {
         if self.held.contains_key(&event.id) || self.deleted.contains(&event.id) {
             return Taken::Duplicate;
         }
@@ -178,7 +184,7 @@ impl Chat {
             Held {
                 sender: from,
                 event,
-                received: now,
+                received,
                 waiting,
             },
         );

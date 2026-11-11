@@ -935,6 +935,7 @@ impl Helper {
             }
             Back::Connected(id) => {
                 self.send_waiting(&id);
+                self.dm_deliver(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
                     // with ours if it's missing something (`Back::Synced`).
@@ -944,7 +945,6 @@ impl Helper {
                     self.changed(None);
                 }
                 self.keys_for(&id);
-                self.dm_deliver(&id);
                 return self.present_to(&id);
             }
             Back::Synced(synced) => {
@@ -952,6 +952,7 @@ impl Helper {
                 let own = self.store.as_ref().map(Keystore::id);
                 if let Some(own) = own {
                     self.send_waiting(&own);
+                    self.dm_deliver(&own);
                 }
                 return self.synced(&theirs, &from);
             }
@@ -1123,6 +1124,7 @@ impl Helper {
         let mut replies = Vec::new();
         let mut notes = Vec::new();
         let mut events = Vec::new();
+        let mut synced = Vec::new();
         let (mut unknown, mut fresh) = (false, false);
         let envelopes: Vec<Vec<u8>> = frames.iter().map(|(_, e)| e.clone()).collect();
         // One save for the whole stream (PLAN-dm Task 8).
@@ -1159,6 +1161,18 @@ impl Helper {
                             continue;
                         }
                         if opened.kind == NoteKind::Message {
+                            // History from another of our devices (dm D8)
+                            // carries its chat, author and first arrival.
+                            if opened.conversation == Conversation::Direct(id)
+                                && opened.sender == id
+                                && self.store.as_ref().is_some_and(|s| s.id() == id)
+                            {
+                                match mesh_dm::history::unforward(&opened.body) {
+                                    Some(forwarded) => synced.push((i, forwarded)),
+                                    None => eprintln!("mesh-node: synced history didn't read"),
+                                }
+                                continue;
+                            }
                             // A bad event is dropped and counted (dm D14), and answered ok.
                             match mesh_dm::event::Event::from_bytes(&opened.body) {
                                 Ok(event) => events.push((i, event)),
@@ -1178,6 +1192,9 @@ impl Helper {
         }
         if !events.is_empty() {
             self.dm_take(&id, &device, events, &mut answers);
+        }
+        if !synced.is_empty() {
+            self.dm_take_synced(&device, synced, &mut answers);
         }
         if let Some(reply) = reply {
             let _ = reply.send(answers);

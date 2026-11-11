@@ -89,8 +89,46 @@ pub struct History {
 /// An event to send a device, with its number for the ack.
 pub struct ToSend {
     pub number: u64,
-    pub chat: Conversation,
+    /// Which chat, as e2ee names it.
+    pub at: Where,
+    /// Who wrote it, and when it first arrived here.
+    pub from: Sender,
+    pub received: u64,
     pub event: Event,
+}
+
+/// An event as it goes to another of our devices (D8): which chat, who wrote
+/// it and when it first arrived, so that device stores it as it is here.
+#[derive(Serialize, Deserialize)]
+struct Forward {
+    at: Where,
+    person: Person,
+    device: Device,
+    received: u64,
+    event: Vec<u8>,
+}
+
+/// The body that carries `t` to another of our devices.
+pub fn forward(t: &ToSend) -> Vec<u8> {
+    let forward = Forward {
+        at: t.at,
+        person: t.from.person,
+        device: t.from.device,
+        received: t.received,
+        event: t.event.to_bytes().expect("checked when stored"),
+    };
+    postcard::to_stdvec(&forward).expect("to memory")
+}
+
+/// A forwarded body: the chat, the author, the first arrival, the event.
+pub fn unforward(bytes: &[u8]) -> Option<(Where, Sender, u64, Event)> {
+    let f: Forward = postcard::from_bytes(bytes).ok()?;
+    let event = Event::from_bytes(&f.event).ok()?;
+    let from = Sender {
+        person: f.person,
+        device: f.device,
+    };
+    Some((f.at, from, f.received, event))
 }
 
 impl History {
@@ -147,6 +185,7 @@ impl History {
                     author: from.person,
                     from: from.device,
                     at: received,
+                    private: private(&event.body),
                 };
                 let position = u32::try_from(position).map_err(|_| StoreError::Damaged)?;
                 missed.push(LogRecord::Stored {
@@ -297,6 +336,20 @@ impl History {
         events: Vec<Event>,
         now: u64,
     ) -> Result<Vec<Taken>, HistoryError> {
+        let events = events.into_iter().map(|e| (now, e)).collect();
+        self.receive_synced(at, from, from.device, events, now)
+    }
+
+    /// Events another of our devices passed on (`via`), each with the time
+    /// it first arrived there; `from` wrote them.
+    pub fn receive_synced(
+        &mut self,
+        at: &Where,
+        from: Sender,
+        via: Device,
+        events: Vec<(u64, Event)>,
+        now: u64,
+    ) -> Result<Vec<Taken>, HistoryError> {
         // A 1:1 chat takes events only from that person and our own devices.
         if let Where::Direct(peer) = at
             && from.person != *peer
@@ -308,7 +361,7 @@ impl History {
         self.load(chat, now)?;
         let mut taken = Vec::with_capacity(events.len());
         let mut kept = Vec::new();
-        for event in events {
+        for (received, event) in events {
             if self.log.number_of(&event.id).is_some() {
                 taken.push(Taken::Duplicate);
                 continue;
@@ -323,9 +376,9 @@ impl History {
                 self.load_segment(chat, segment, now)?;
             }
             let open = self.chats.get_mut(chat).expect("loaded");
-            let t = open.chat.take(from, event.clone(), now);
+            let t = open.chat.take_received(from, event.clone(), now, received);
             if matches!(t, Taken::Shown | Taken::Waiting) {
-                kept.push(event);
+                kept.push((received, event));
             }
             taken.push(t);
         }
@@ -335,7 +388,7 @@ impl History {
                 at: *at,
             }])?;
         }
-        self.store_kept(chat, from, kept, now)?;
+        self.store_kept(chat, from, via, kept)?;
         self.wipe(chat)?;
         let open = &self.chats[chat];
         let index = ChatIndex {
@@ -352,8 +405,8 @@ impl History {
         &mut self,
         chat: &Conversation,
         from: Sender,
-        kept: Vec<Event>,
-        now: u64,
+        via: Device,
+        kept: Vec<(u64, Event)>,
     ) -> Result<(), HistoryError> {
         if kept.is_empty() {
             return Ok(());
@@ -361,20 +414,21 @@ impl History {
         let open = self.chats.get_mut(chat).expect("loaded");
         let places = open.files.next_places(kept.len());
         let mut records = Vec::with_capacity(kept.len());
-        for event in &kept {
-            records.push(encode(now, from, event)?);
+        for (received, event) in &kept {
+            records.push(encode(*received, from, event)?);
         }
         open.files.append(&records)?;
         let newest = open.files.segments() - 1;
         open.loaded.insert(newest);
         let mut records = Vec::with_capacity(kept.len());
-        for (event, (segment, position)) in kept.iter().zip(places) {
+        for ((received, event), (segment, position)) in kept.iter().zip(places) {
             let entry = Entry {
                 id: event.id,
                 chat: *chat,
                 author: from.person,
-                from: from.device,
-                at: now,
+                from: via,
+                at: *received,
+                private: private(&event.body),
             };
             records.push(LogRecord::Stored {
                 entry,
@@ -450,11 +504,18 @@ impl History {
             }
             let record = segments[&(chat, segment)].get(position as usize);
             match record.map(|r| decode(r)).transpose()?.flatten() {
-                Some((_, _, event)) => out.push(ToSend {
-                    number,
-                    chat,
-                    event,
-                }),
+                Some((received, from, event)) => {
+                    let Some(at) = self.known.get(&chat).copied() else {
+                        continue;
+                    };
+                    out.push(ToSend {
+                        number,
+                        at,
+                        from,
+                        received,
+                        event,
+                    });
+                }
                 // Wiped since: there's nothing to send, so it counts as taken.
                 None => self
                     .counters
@@ -484,6 +545,18 @@ impl History {
     pub fn counter(&self, device: &Device) -> Option<u64> {
         self.counters.counter(device)
     }
+}
+
+/// For our own devices only: "read up to here" and "delete for me" (D3, D9).
+fn private(body: &Body) -> bool {
+    matches!(
+        body,
+        Body::Read { .. }
+            | Body::Delete {
+                everyone: false,
+                ..
+            }
+    )
 }
 
 /// What an edit, delete or reaction points at.
@@ -736,6 +809,78 @@ mod tests {
         drop(again);
         let mut third = History::open(&root, &KEY, ME).unwrap();
         assert_eq!(third.outgoing(&laptop, shares, NOW).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Own-device sync (D8): the desk's history reaches the laptop as it is,
+    /// authors and times kept, and nothing goes back where it came from.
+    #[test]
+    fn history_syncs_to_our_own_device() {
+        let (desk_dir, laptop_dir) = (dir("sync-desk"), dir("sync-laptop"));
+        let laptop_me = Sender {
+            device: [11; 32],
+            ..ME
+        };
+        let mut desk = History::open(&desk_dir, &KEY, ME).unwrap();
+        let mut laptop = History::open(&laptop_dir, &KEY, laptop_me).unwrap();
+        desk.send(&CHAT, text("from the desk"), NOW).unwrap();
+        desk.receive(&CHAT, BOB, vec![bobs(1, NOW + 1, 1, text("from Bob"))], NOW)
+            .unwrap();
+        desk.add_device(laptop_me.device, ME.person);
+        let out = desk
+            .outgoing(&laptop_me.device, shares, NOW + 60_000)
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        for t in &out {
+            let (at, author, received, event) = unforward(&forward(t)).unwrap();
+            let taken = laptop
+                .receive_synced(
+                    &at,
+                    author,
+                    ME.device,
+                    vec![(received, event)],
+                    NOW + 60_000,
+                )
+                .unwrap();
+            assert_eq!(taken, [Taken::Shown]);
+        }
+        assert_eq!(texts(&mut laptop), ["from the desk", "from Bob"]);
+        let chat = laptop.chat(&CHAT, NOW + 60_000).unwrap();
+        assert_eq!(
+            chat.display_time(&[1; 16]),
+            Some(NOW),
+            "the desk's arrival time"
+        );
+        // The laptop sends none of it back to the desk.
+        laptop.add_device(ME.device, ME.person);
+        assert!(laptop.outgoing(&ME.device, shares, NOW).unwrap().is_empty());
+        for d in [desk_dir, laptop_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// "Read up to here" and "delete for me" go only to our own devices.
+    #[test]
+    fn private_events_go_to_our_devices_only() {
+        let root = dir("private");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let said = h.send(&CHAT, text("hi"), NOW).unwrap();
+        let gone = h.send(&CHAT, text("gone"), NOW).unwrap();
+        h.send(&CHAT, Body::Read { up_to: said.id }, NOW).unwrap();
+        // Deleted for me: wiped here, so there's nothing of it to send.
+        let only_me = Body::Delete {
+            target: gone.id,
+            everyone: false,
+        };
+        h.send(&CHAT, only_me, NOW).unwrap();
+        h.add_device(BOB.device, BOB.person);
+        h.add_device([11; 32], ME.person);
+        assert_eq!(
+            h.outgoing(&BOB.device, shares, NOW).unwrap().len(),
+            1,
+            "the message only"
+        );
+        assert_eq!(h.outgoing(&[11; 32], shares, NOW).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
