@@ -42,6 +42,12 @@ enum LogRecord {
         chat: Conversation,
         id: EventId,
     },
+    /// A chat, logged before its first event is written, so an open can
+    /// find events a crash left in it without a number.
+    Chat {
+        chat: Conversation,
+        at: Where,
+    },
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -75,6 +81,8 @@ pub struct History {
     /// Each stored event's number, by ID.
     numbers: HashMap<EventId, u64>,
     deleted: HashMap<Conversation, HashSet<EventId>>,
+    /// Every chat with events, and which chat each storage key is.
+    known: HashMap<Conversation, Where>,
     counters: Counters,
     chats: HashMap<Conversation, Open>,
 }
@@ -96,6 +104,7 @@ impl History {
             places: HashMap::new(),
             numbers: HashMap::new(),
             deleted: HashMap::new(),
+            known: HashMap::new(),
             counters: Counters::new(me.person),
             chats: HashMap::new(),
             log_files: store.open_log()?,
@@ -111,7 +120,61 @@ impl History {
         if let Some(bytes) = history.log_files.index()? {
             history.counters = postcard::from_bytes(&bytes).map_err(|_| StoreError::Damaged)?;
         }
+        history.number_the_missed()?;
         Ok(history)
+    }
+
+    /// Events a crash left in a chat's newest segment with no number (the
+    /// chat file is written before the log) get one now, so they're still
+    /// delivered.
+    // ponytail: reads every chat's newest segment at unlock; fine for hundreds of chats, keep a "last written" mark if unlock grows slow.
+    fn number_the_missed(&mut self) -> Result<(), HistoryError> {
+        let chats: Vec<Conversation> = self.known.keys().copied().collect();
+        let mut missed = Vec::new();
+        for chat in chats {
+            let mut files = self.store.open(&chat)?;
+            let Some(newest) = files.segments().checked_sub(1) else {
+                continue;
+            };
+            for (position, record) in files.read(newest)?.iter().enumerate() {
+                let Some((received, from, event)) = decode(record)? else {
+                    continue;
+                };
+                if self.numbers.contains_key(&event.id) {
+                    continue;
+                }
+                let entry = Entry {
+                    id: event.id,
+                    chat,
+                    author: from.person,
+                    from: from.device,
+                    at: received,
+                };
+                let position = u32::try_from(position).map_err(|_| StoreError::Damaged)?;
+                missed.push(LogRecord::Stored {
+                    entry,
+                    segment: newest,
+                    position,
+                });
+            }
+        }
+        self.log(missed)
+    }
+
+    /// Appends records to the log (one sync), then takes them in.
+    fn log(&mut self, records: Vec<LogRecord>) -> Result<(), HistoryError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let bytes: Vec<Vec<u8>> = records
+            .iter()
+            .map(|r| postcard::to_stdvec(r).expect("to memory"))
+            .collect();
+        self.log_files.append(&bytes)?;
+        for record in records {
+            self.remember(record);
+        }
+        Ok(())
     }
 
     /// Takes in one log record, read back or just written.
@@ -130,6 +193,9 @@ impl History {
             }
             LogRecord::Deleted { chat, id } => {
                 self.deleted.entry(chat).or_default().insert(id);
+            }
+            LogRecord::Chat { chat, at } => {
+                self.known.insert(chat, at);
             }
         }
     }
@@ -258,6 +324,12 @@ impl History {
             }
             taken.push(t);
         }
+        if !kept.is_empty() && !self.known.contains_key(chat) {
+            self.log(vec![LogRecord::Chat {
+                chat: *chat,
+                at: *at,
+            }])?;
+        }
         self.store_kept(chat, from, kept, now)?;
         self.wipe(chat)?;
         let open = &self.chats[chat];
@@ -290,8 +362,7 @@ impl History {
         open.files.append(&records)?;
         let newest = open.files.segments() - 1;
         open.loaded.insert(newest);
-        let mut log = Vec::with_capacity(kept.len());
-        let mut remembered = Vec::with_capacity(kept.len());
+        let mut records = Vec::with_capacity(kept.len());
         for (event, (segment, position)) in kept.iter().zip(places) {
             let entry = Entry {
                 id: event.id,
@@ -300,18 +371,13 @@ impl History {
                 from: from.device,
                 at: now,
             };
-            let record = LogRecord::Stored {
+            records.push(LogRecord::Stored {
                 entry,
                 segment,
                 position,
-            };
-            log.push(postcard::to_stdvec(&record).expect("to memory"));
-            remembered.push(record);
+            });
         }
-        self.log_files.append(&log)?;
-        for record in remembered {
-            self.remember(record);
-        }
+        self.log(records)?;
         Ok(())
     }
 
@@ -342,18 +408,10 @@ impl History {
         if deleted.is_empty() {
             return Ok(());
         }
-        let records: Vec<LogRecord> = deleted
+        let records = deleted
             .into_iter()
-            .map(|id| LogRecord::Deleted { chat: *chat, id })
-            .collect();
-        let bytes: Vec<Vec<u8>> = records
-            .iter()
-            .map(|r| postcard::to_stdvec(r).expect("to memory"))
-            .collect();
-        self.log_files.append(&bytes)?;
-        for record in records {
-            self.remember(record);
-        }
+            .map(|id| LogRecord::Deleted { chat: *chat, id });
+        self.log(records.collect())?;
         Ok(())
     }
 
@@ -638,6 +696,40 @@ mod tests {
         assert_eq!(texts(&mut again), ["from Bob"]);
         let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
         assert_eq!(files.read(0).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A crash after the chat file was written but before the log: the
+    /// event is in the chat with no number. At the next open it gets one,
+    /// so it's still delivered, not just shown.
+    #[test]
+    fn an_event_the_log_missed_gets_a_number_at_open() {
+        let root = dir("missed");
+        let laptop: Device = [11; 32];
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.add_device(laptop, ME.person);
+        h.send(&CHAT, text("logged"), NOW).unwrap();
+        h.save_counters().unwrap();
+        drop(h);
+        // What the crash left: the record in the chat, none in the log.
+        let missed = Event {
+            version: VERSION,
+            id: [9; 16],
+            time: NOW,
+            seq: NOW,
+            n: 2,
+            body: text("unlogged"),
+        };
+        let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
+        files.append(&[encode(NOW, ME, &missed).unwrap()]).unwrap();
+        let mut again = History::open(&root, &KEY, ME).unwrap();
+        let out = again.outgoing(&laptop, shares, NOW).unwrap();
+        let sent: Vec<Body> = out.into_iter().map(|t| t.event.body).collect();
+        assert_eq!(sent, [text("logged"), text("unlogged")]);
+        // Numbered once: a third open finds nothing missing.
+        drop(again);
+        let mut third = History::open(&root, &KEY, ME).unwrap();
+        assert_eq!(third.outgoing(&laptop, shares, NOW).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
