@@ -143,3 +143,38 @@ fn a_new_device_links_with_a_code() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// The new device gives up while you're deciding. A later "Link" mustn't add
+/// it to the device list.
+#[test]
+fn a_late_yes_doesnt_add_a_device_that_left() {
+    let dirs = ["seed", "desk", "laptop"].map(|n| temp_dir(&format!("link-late-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut desk, _) = helper(&dirs[1], &relay, &ticket, "alice");
+    let mut laptop = start(&dirs[2], &relay, &ticket);
+    let code = desk.expect("linkStart", &[], "meshLink")["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    laptop.send("linkJoin", &[&code, LAPTOP]);
+    let (binding, asked) = next(&mut desk);
+    assert_eq!(binding, "meshLinkConfirm", "{asked}");
+    laptop.quit();
+
+    // The desk notices the laptop left, and the click finds nothing to link.
+    let (binding, gone) = next(&mut desk);
+    assert_eq!(binding, "meshError", "{gone}");
+    let err = desk.expect("linkConfirm", &["true"], "meshError");
+    assert_eq!(err["kind"], "no-link", "{err}");
+    let identity = desk.expect("idStatus", &[], "meshIdentity");
+    assert_eq!(identity["devices"].as_array().unwrap().len(), 1);
+
+    desk.quit();
+    seed.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

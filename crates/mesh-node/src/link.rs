@@ -26,6 +26,9 @@ const LINK: &str = "link";
 const STEP: Duration = Duration::from_secs(30);
 /// How long E waits for you to say yes to the new device.
 const CONFIRM_WAIT: Duration = Duration::from_secs(120);
+/// How long N waits for each frame. The identity comes only after you
+/// confirm on E, so this must outlast E's wait for you.
+const NEW_READ_WAIT: Duration = Duration::from_secs(CONFIRM_WAIT.as_secs() + STEP.as_secs());
 /// How long a throwaway node has to reach its relay.
 const ONLINE_WAIT: Duration = Duration::from_secs(15);
 
@@ -168,6 +171,13 @@ impl Helper {
             let _ = to_peer.send(None);
             emit("meshDone", json!({ "fn": "linkConfirm" }));
             return Ok(());
+        }
+        // The session ended a moment ago and the loop hasn't heard yet.
+        if to_peer.is_closed() {
+            return Err(Fail(
+                "gone",
+                "the new device stopped waiting; start again".to_owned(),
+            ));
         }
         let message = initiator.confirm(self.unlocked()?, unix_now())?;
         let _ = to_peer.send(Some(message));
@@ -405,7 +415,7 @@ async fn existing_session(
             Ok(Some(stream)) => stream,
             _ => return Err(("expired", "the link code expired; make a new one")),
         };
-        pipe(report, stream.send, stream.recv, from_loop).await
+        pipe(report, stream.send, stream.recv, from_loop, STEP).await
     }
     .await;
     node.close().await;
@@ -439,7 +449,7 @@ async fn new_session(
         frame::write_frame(&mut send, &hello)
             .await
             .map_err(|_| unreachable)?;
-        pipe(report, send, recv, from_loop).await
+        pipe(report, send, recv, from_loop, NEW_READ_WAIT).await
     }
     .await;
     node.close().await;
@@ -482,16 +492,25 @@ async fn pipe(
     mut send: impl AsyncWrite + Unpin,
     mut recv: impl AsyncRead + Unpin,
     mut from_loop: UnboundedReceiver<Option<Vec<u8>>>,
+    read_wait: Duration,
 ) -> Ended {
     let quiet = ("timeout", "the other device stopped answering");
     loop {
-        match tokio::time::timeout(STEP, frame::read_frame(&mut recv)).await {
+        match tokio::time::timeout(read_wait, frame::read_frame(&mut recv)).await {
             Ok(Ok(Some(frame))) => report.send(LinkEvent::Frame(frame)),
             Ok(Ok(None)) => return Ok(()),
             _ => return Err(quiet),
         }
-        // A person may be deciding on the other end of this one.
-        match tokio::time::timeout(CONFIRM_WAIT, from_loop.recv()).await {
+        // A person may be deciding on this end. If the other side leaves
+        // meanwhile (or sends out of turn), the session ends now, so a later
+        // click can't link a device that's gone.
+        let answer = tokio::select! {
+            answer = tokio::time::timeout(CONFIRM_WAIT, from_loop.recv()) => answer,
+            _ = frame::read_frame(&mut recv) => {
+                return Err(("gone", "the other device stopped waiting; start again"));
+            }
+        };
+        match answer {
             Ok(Some(Some(answer))) => {
                 frame::write_frame(&mut send, &answer)
                     .await
@@ -503,5 +522,40 @@ async fn pipe(
             }
             Err(_) => return Err(("timeout", "nobody confirmed the new device in time")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N's wait for the identity must outlast E's wait for you to confirm,
+    /// plus a step for it to arrive.
+    #[test]
+    fn the_new_device_waits_out_a_slow_confirm() {
+        assert!(NEW_READ_WAIT >= CONFIRM_WAIT + STEP, "N gives up first");
+    }
+
+    /// While E waits for you, N leaving ends the session at once, so a
+    /// later click can't add a device that's gone.
+    #[tokio::test]
+    async fn the_existing_device_notices_the_new_one_leaving() {
+        let (ours, theirs) = tokio::io::duplex(1024);
+        let (recv, send) = tokio::io::split(ours);
+        let (back, _answers) = tokio::sync::mpsc::unbounded_channel();
+        let report = Report { session: 1, back };
+        // Kept open, but never answers: you haven't clicked.
+        let (_to_peer, from_loop) = unbounded_channel();
+        let peer = async move {
+            let (_, mut write) = tokio::io::split(theirs);
+            frame::write_frame(&mut write, b"device").await.unwrap();
+            // N gives up.
+        };
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(pipe(&report, send, recv, from_loop, STEP), peer)
+        })
+        .await
+        .expect("still waiting for a click after N left");
+        assert!(ended.is_err(), "N leaving is a failure");
     }
 }
