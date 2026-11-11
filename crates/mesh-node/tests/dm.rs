@@ -526,3 +526,273 @@ fn a_message_before_the_add_shows_once_it_lands() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// Another device for `name`'s identity, restored from its backup.
+fn restored(
+    from: &mut Helper,
+    name: &str,
+    dir: &std::path::Path,
+    relay: &Relay,
+    seed: &str,
+) -> Helper {
+    std::fs::create_dir_all(dir).unwrap();
+    let backup = dir.join("backup.mkb");
+    let backup = backup.to_str().unwrap();
+    ask(from, "idExport", &[backup, name, PASSWORD], "meshDone");
+    let mut h = Helper::start_with(dir, relay, &["--seed", seed, "--record-ttl", TTL]);
+    assert_eq!(h.event().0, "meshIdentity");
+    h.expect(
+        "idImport",
+        &[backup, name, PASSWORD, PASSWORD],
+        "meshIdentity",
+    );
+    assert_eq!(h.event().0, "meshCodes");
+    h.net_state("online");
+    h
+}
+
+/// Opens `chat` until its page satisfies `done` (pages and notes come by
+/// themselves too, so this asks again rather than waiting for one).
+fn page_until(h: &mut Helper, chat: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let page = ask(h, "dmOpen", &[chat], "meshDmMessages");
+        if done(&page) {
+            return page;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the page never came right: {page}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn locks(h: &mut Helper) {
+    ask(h, "idLock", &[], "meshIdentity");
+}
+
+fn unlocks(h: &mut Helper, name: &str) {
+    h.send("idUnlock", &[name, PASSWORD]);
+    until(h, "meshIdentity", |i| i["state"] == "unlocked");
+}
+
+/// The process test (SPEC-dm, PLAN-dm Task 14): Alice on a desktop and a
+/// laptop from her backup, Bob and Carol, all friends.
+#[test]
+fn the_process_test() {
+    let names = ["seed", "desk", "laptop", "bob", "carol", "bob2", "restored"];
+    let dirs = names.map(|n| temp_dir(&format!("process-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut desk, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut bob, id_b) = helper(&dirs[3], &relay, &ticket, "bob");
+    let (mut carol, id_c) = helper(&dirs[4], &relay, &ticket, "carol");
+    all_friends(&mut [(&mut desk, &id_a), (&mut bob, &id_b), (&mut carol, &id_c)]);
+    let mut laptop = restored(&mut desk, "alice", &dirs[2], &relay, &ticket);
+    laptop.social_until(|s| has(s, "friends", &id_b));
+
+    // Alice messages Bob: Bob's device and her laptop get it. Bob replies,
+    // edits, reacts and deletes; her two devices agree.
+    ask(
+        &mut desk,
+        "dmSend",
+        &[&id_b, "p1 hello Bob"],
+        "meshDmMessages",
+    );
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "p1 hello Bob");
+    page_until(&mut laptop, &id_b, |p| texts(p) == ["p1 hello Bob"]);
+    let p1 = page_until(&mut bob, &id_a, |p| texts(p).len() == 1)["events"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reply = ask(
+        &mut bob,
+        "dmSend",
+        &[&id_a, "p2 hi Alice"],
+        "meshDmMessages",
+    );
+    let reply = reply["events"][1]["id"].as_str().unwrap().to_owned();
+    ask(&mut bob, "dmEdit", &[&reply, "p2 edited"], "meshDmMessages");
+    ask(&mut bob, "dmReact", &[&p1, "🎉", "true"], "meshDmMessages");
+    ask(&mut bob, "dmSend", &[&id_a, "p3 oops"], "meshDmMessages");
+    let oops = page_until(&mut bob, &id_a, |p| texts(p).len() == 3)["events"][2]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ask(&mut bob, "dmDelete", &[&oops, "true"], "meshDmMessages");
+    let agreed = |p: &Value| {
+        texts(p) == ["p1 hello Bob", "p2 edited"] && p["events"][0]["reactions"][0]["emoji"] == "🎉"
+    };
+    // Each of her devices marks it sent once it knows Bob's took it.
+    let on_desk = page_until(&mut desk, &id_b, |p| {
+        agreed(p) && p["events"][0]["sent"] == true
+    });
+    page_until(&mut laptop, &id_b, |p| p["events"] == on_desk["events"]);
+
+    // Bob locks. Alice sends three and locks (her laptop too, so nothing
+    // else of hers can pass them on). Both unlock: they arrive in order,
+    // and "sending" turned to "sent".
+    locks(&mut laptop);
+    locks(&mut bob);
+    for m in ["waiting one", "waiting two", "waiting three"] {
+        desk.send("dmSend", &[&id_b, m]);
+        page_until(&mut desk, &id_b, |p| {
+            (p["events"].as_array().unwrap().iter()).any(|e| e["text"] == m && e["sent"] == false)
+        });
+    }
+    locks(&mut desk);
+    unlocks(&mut bob, "bob");
+    unlocks(&mut desk, "alice");
+    page_until(&mut bob, &id_a, |p| {
+        texts(p).ends_with(&[
+            "waiting one".into(),
+            "waiting two".into(),
+            "waiting three".into(),
+        ])
+    });
+    page_until(&mut desk, &id_b, |p| {
+        (p["events"].as_array().unwrap().iter())
+            .filter(|e| e["from"] == id_a.as_str())
+            .all(|e| e["sent"] == true)
+    });
+
+    // Bob's second device: Alice's next message reaches it too (a fresh
+    // session back when the one-time key went to his first, e2ee D4).
+    let mut bob2 = restored(&mut bob, "bob", &dirs[5], &relay, &ticket);
+    bob2.social_until(|s| has(s, "friends", &id_a));
+    ask(
+        &mut desk,
+        "dmSend",
+        &[&id_b, "b2 to both of Bob's"],
+        "meshDmMessages",
+    );
+    page_until(&mut bob2, &id_a, |p| {
+        texts(p).contains(&"b2 to both of Bob's".to_owned())
+    });
+
+    // The laptop, locked all this while, catches up from the desk (D8):
+    // Alice's own messages only come from her own devices.
+    unlocks(&mut laptop, "alice");
+    let caught = |p: &Value| {
+        texts(p).ends_with(&[
+            "waiting one".into(),
+            "waiting two".into(),
+            "waiting three".into(),
+            "b2 to both of Bob's".into(),
+        ])
+    };
+    page_until(&mut laptop, &id_b, caught);
+
+    // A new device restored from Alice's backup gets her whole history.
+    let mut fresh = restored(&mut desk, "alice", &dirs[6], &relay, &ticket);
+    let whole = page_until(&mut desk, &id_b, caught);
+    page_until(&mut fresh, &id_b, |p| texts(p) == texts(&whole));
+
+    // A group with Bob and Carol and a 5 MB file. Bob fetches it; Carol
+    // gets it from Bob while all of Alice's devices are locked.
+    desk.send(
+        "dmGroupCreate",
+        &[&format!("{id_b},{id_c}"), "trailhead crew"],
+    );
+    let made = until(&mut desk, "meshDmChats", |c| {
+        (c["chats"].as_array().unwrap().iter()).any(|c| c["kind"] == "group")
+    });
+    let g = (made["chats"].as_array().unwrap().iter())
+        .find(|c| c["kind"] == "group")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let plain: Vec<u8> = (0..5_000_000u32).map(|i| (i % 253) as u8).collect();
+    let source = dirs[1].join("map.png");
+    std::fs::write(&source, &plain).unwrap();
+    desk.send("dmSendFile", &[&g, source.to_str().unwrap()]);
+    let has_map = |p: &Value| {
+        (p["events"].as_array().unwrap().iter()).any(|e| e["attachments"][0]["name"] == "map.png")
+    };
+    let sent = page_until(&mut desk, &g, has_map);
+    let file = (sent["events"].as_array().unwrap().iter())
+        .find(|e| e["attachments"][0]["name"] == "map.png")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page_until(&mut bob, &g, has_map);
+    let got = ask(&mut bob, "dmFetch", &[&g, &file, "0"], "meshDmFile");
+    assert_eq!(std::fs::read(got["path"].as_str().unwrap()).unwrap(), plain);
+    page_until(&mut carol, &g, has_map);
+    for h in [&mut desk, &mut laptop, &mut fresh] {
+        locks(h);
+    }
+    let got = ask(&mut carol, "dmFetch", &[&g, &file, "0"], "meshDmFile");
+    assert_eq!(
+        std::fs::read(got["path"].as_str().unwrap()).unwrap(),
+        plain,
+        "from Bob"
+    );
+
+    // Alice removes Carol: Carol can't read the next message.
+    unlocks(&mut desk, "alice");
+    ask(&mut desk, "dmGroupRemove", &[&g, &id_c], "meshDmChats");
+    ask(
+        &mut desk,
+        "dmSend",
+        &[&g, "g2 without Carol"],
+        "meshDmMessages",
+    );
+    page_until(&mut bob, &g, |p| {
+        texts(p).contains(&"g2 without Carol".to_owned())
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    let theirs = ask(&mut carol, "dmOpen", &[&g], "meshDmMessages");
+    assert!(
+        !texts(&theirs).contains(&"g2 without Carol".to_owned()),
+        "{theirs}"
+    );
+
+    // No ID, conversation ID or text in any helper's stderr or the seed's
+    // log and files.
+    let stderr = [desk, laptop, bob, carol, bob2, fresh]
+        .map(Helper::quit)
+        .concat();
+    let mut seed_text = seed.stop().concat();
+    let mut walk = vec![dirs[0].clone()];
+    while let Some(dir) = walk.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                walk.push(entry.path());
+            } else if let Ok(bytes) = std::fs::read(entry.path()) {
+                seed_text += &String::from_utf8_lossy(&bytes);
+            }
+        }
+    }
+    let secrets = [
+        id_a.as_str(),
+        id_b.as_str(),
+        id_c.as_str(),
+        g.as_str(),
+        p1.as_str(),
+        file.as_str(),
+        "p1 hello Bob",
+        "p2 hi Alice",
+        "p2 edited",
+        "p3 oops",
+        "waiting one",
+        "waiting two",
+        "waiting three",
+        "b2 to both of Bob's",
+        "g2 without Carol",
+        "map.png",
+        "trailhead crew",
+    ];
+    for secret in secrets {
+        assert!(!stderr.contains(secret), "a helper logged {secret:?}");
+        assert!(!seed_text.contains(secret), "the seed has {secret:?}");
+    }
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
