@@ -212,11 +212,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
                 continue;
             }
             _ = refresh.tick() => {
-                if let Some(history) = &mut helper.dm
-                    && let Err(e) = history.sweep_waiting(unix_now() * 1000)
-                {
-                    eprintln!("mesh-node: couldn't sweep the chat history: {e}");
-                }
+                helper.dm_retry_all();
                 helper.publish();
                 helper.dial_contacts();
                 helper.sync_own();
@@ -297,6 +293,9 @@ struct Helper {
     dm: Option<mesh_dm::history::History>,
     /// Devices a batch of chat events is on its way to.
     dm_flight: HashSet<[u8; 32]>,
+    /// Devices that answered `failed` to some events: sent again soon, then
+    /// on each refresh, until a batch goes through whole.
+    dm_retry: HashMap<[u8; 32], (MeshId, MeshAddr)>,
     /// The chat open on screen (`dmOpen`), which gets its page again when
     /// it changes; others get a note.
     dm_open: Option<mesh_dm::Where>,
@@ -358,6 +357,8 @@ enum Back {
     Envelopes(Box<Incoming>),
     /// A device answered a batch of chat events, or didn't (`None`).
     DmAnswered(Box<Answered>),
+    /// Time to send again to a device that answered `failed`.
+    DmRetry([u8; 32]),
     /// A typing signal: whose, which device, the frame (D10).
     Typing(Box<(MeshId, [u8; 32], Vec<u8>)>),
     /// Someone asks for a kept file's chunks: whose, the file's hash, and
@@ -417,6 +418,7 @@ impl Helper {
             link_session: 0,
             dm: None,
             dm_flight: HashSet::new(),
+            dm_retry: HashMap::new(),
             dm_open: None,
             typing_last: HashMap::new(),
         };
@@ -913,6 +915,12 @@ impl Helper {
             Back::DmAnswered(got) => {
                 let (id, addr, numbers, answers) = *got;
                 return self.dm_answered(id, addr, numbers, answers);
+            }
+            Back::DmRetry(device) => {
+                if let Some((id, addr)) = self.dm_retry.get(&device).cloned() {
+                    self.dm_deliver_to(&id, addr);
+                }
+                return;
             }
             Back::Unsent(unsent) => {
                 let (device, envelopes) = *unsent;
@@ -1528,6 +1536,7 @@ impl Helper {
             self.clear_opened(|_| true);
         }
         self.dm_flight.clear();
+        self.dm_retry.clear();
         self.dm_open = None;
         self.devices_at.clear();
         self.waiting.clear();

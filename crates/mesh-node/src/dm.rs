@@ -26,6 +26,8 @@ const OK: u8 = 0;
 const FAILED: u8 = 1;
 /// Shown text in a notification, at most (as WhatsApp's).
 const NOTIFY_CHARS: usize = 100;
+/// After a `failed` answer, the first try again; later ones go on refresh.
+const RETRY_SOON: Duration = Duration::from_secs(5);
 /// Messages in one page of `dmOpen`.
 const PAGE: usize = 50;
 
@@ -170,7 +172,7 @@ impl Helper {
     }
 
     /// One device's next batch, if none is in flight to it.
-    fn dm_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
+    pub(super) fn dm_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
         let device = *addr.device.as_bytes();
         let own = self.store.as_ref().is_some_and(|s| s.id() == *id);
         let (Some(history), Some(e2ee), Some(net)) = (&mut self.dm, &mut self.e2ee, &self.net)
@@ -245,6 +247,23 @@ impl Helper {
             let _ = self.emit_page(&open, None);
         }
         if answers.iter().all(|ok| *ok) {
+            self.dm_retry.remove(&device);
+            self.dm_deliver_to(&id, addr);
+        } else if self.dm_retry.insert(device, (id, addr)).is_none() {
+            // Not taken yet (an add that hasn't arrived there, D7): again
+            // soon, then on each refresh.
+            let back = self.back.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RETRY_SOON).await;
+                let _ = back.send(Back::DmRetry(device));
+            });
+        }
+    }
+
+    /// The refresh: every device that answered `failed` gets another try.
+    pub(super) fn dm_retry_all(&mut self) {
+        let waiting: Vec<_> = self.dm_retry.values().cloned().collect();
+        for (id, addr) in waiting {
             self.dm_deliver_to(&id, addr);
         }
     }
@@ -803,11 +822,15 @@ impl Helper {
                 chats.push(at);
             }
         }
-        // Our own devices' history isn't news: no notes, just what's open.
+        // Our own devices' history isn't news: no notes, just what's open
+        // and the list (a chat made there shows here).
         if let Some(open) = self.dm_open
             && chats.contains(&open)
         {
             let _ = self.emit_page(&open, None);
+        }
+        if !chats.is_empty() {
+            let _ = self.emit_chats();
         }
     }
 }

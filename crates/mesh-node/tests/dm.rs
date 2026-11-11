@@ -420,3 +420,95 @@ fn a_file_goes_by_chunks() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// A member's message that came before their add (answered `failed`)
+/// goes again by itself once the add arrives (D7): Dave writes to a group
+/// Alice just added him to, while her laptop holds it without him. Only
+/// her desk tells the laptop of her own change, and does so later.
+#[test]
+fn a_message_before_the_add_shows_once_it_lands() {
+    let dirs = ["seed", "desk", "laptop", "bob", "dave"].map(|n| temp_dir(&format!("early-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut desk, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut bob, id_b) = helper(&dirs[3], &relay, &ticket, "bob");
+    let (mut dave, id_d) = helper(&dirs[4], &relay, &ticket, "dave");
+    all_friends(&mut [(&mut desk, &id_a), (&mut bob, &id_b), (&mut dave, &id_d)]);
+
+    // Alice links her laptop.
+    let mut laptop =
+        Helper::start_with(&dirs[2], &relay, &["--seed", &ticket, "--record-ttl", TTL]);
+    assert_eq!(laptop.event().0, "meshIdentity");
+    let code = desk.expect("linkStart", &[], "meshLink")["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    laptop.send("linkJoin", &[&code, "laptop"]);
+    until(&mut desk, "meshLinkConfirm", |_| true);
+    desk.send("linkConfirm", &["true"]);
+    until(&mut laptop, "meshLinkReceived", |_| true);
+    laptop.send("linkFinish", &["alice", PASSWORD]);
+    until(&mut laptop, "meshIdentity", |i| i["state"] == "unlocked");
+    until(&mut laptop, "meshCodes", |_| true);
+    laptop.net_state("online");
+    laptop.social_until(|s| has(s, "friends", &id_d));
+
+    // A group of Alice and Bob, on both of Alice's devices.
+    let made = ask(&mut desk, "dmGroupCreate", &[&id_b, "trip"], "meshDmChats");
+    let g = made["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "group")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let members = |n: usize| {
+        let g = g.clone();
+        move |c: &Value| {
+            (c["chats"].as_array().unwrap().iter())
+                .any(|c| c["id"] == g.as_str() && c["members"].as_array().unwrap().len() == n)
+        }
+    };
+    until(&mut laptop, "meshDmChats", members(2));
+
+    // The laptop is away while the desk adds Dave, who writes at once.
+    ask(&mut laptop, "idLock", &[], "meshIdentity");
+    ask(&mut desk, "dmGroupAdd", &[&g, &id_d], "meshDmChats");
+    until(&mut dave, "meshDmChats", members(3));
+    ask(&mut dave, "dmSend", &[&g, "hi from Dave"], "meshDmMessages");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "hi from Dave");
+
+    // The desk goes; the laptop comes back and gets Dave's message before
+    // it knows he's in: refused for now.
+    ask(&mut desk, "idLock", &[], "meshIdentity");
+    laptop.send("idUnlock", &["alice", PASSWORD]);
+    until(&mut laptop, "meshIdentity", |i| i["state"] == "unlocked");
+    std::thread::sleep(Duration::from_secs(5));
+
+    // The desk comes back and passes the add on; Dave sends nothing more.
+    desk.send("idUnlock", &["alice", PASSWORD]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let page = ask(&mut laptop, "dmOpen", &[&g], "meshDmMessages");
+        if texts(&page).contains(&"hi from Dave".to_owned()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Dave's message never showed");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let stderr = [desk, laptop, bob, dave].map(Helper::quit).concat();
+    assert!(
+        stderr.contains("chat events refused"),
+        "it was refused first"
+    );
+    assert!(!stderr.contains("hi from Dave"));
+    seed.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

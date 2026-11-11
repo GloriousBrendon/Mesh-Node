@@ -59,13 +59,6 @@ struct ChatIndex {
     group: Vec<(EventId, Person, GroupChange, Position)>,
 }
 
-/// Events from one sender that may wait for groups' creations, across all
-/// groups (D7).
-pub const MAX_BEFORE_CREATION: usize = 100;
-/// Days an event may wait for its group's creation before it's wiped.
-pub const WAIT_FOR_CREATION_DAYS: u64 = 7;
-const DAY_MS: u64 = 24 * 3600 * 1000;
-
 /// Signs group changes with this person's ID key (`RootKey::sign_bytes`
 /// under `GROUP_SIGNATURE`): History holds no keys itself.
 pub type Signer = Box<dyn Fn(&[u8]) -> [u8; 64] + Send>;
@@ -125,9 +118,6 @@ pub struct History {
     members: HashMap<Conversation, BTreeMap<Person, EventId>>,
     /// Who each group change goes to (group.rs `audience`).
     audience: HashMap<Conversation, BTreeMap<EventId, BTreeSet<Person>>>,
-    /// Events each sender has waiting for a group's creation.
-    // ponytail: in memory, so a restart lets a sender start over at MAX_BEFORE_CREATION.
-    before_creation: HashMap<(Conversation, Person), usize>,
     counters: Counters,
     chats: HashMap<Conversation, Open>,
     signer: Option<Signer>,
@@ -281,7 +271,6 @@ impl History {
             known: HashMap::new(),
             members: HashMap::new(),
             audience: HashMap::new(),
-            before_creation: HashMap::new(),
             counters: Counters::new(me.person),
             signer: None,
             chats: HashMap::new(),
@@ -301,28 +290,7 @@ impl History {
         }
         history.number_the_missed()?;
         history.load_members()?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-        history.sweep_waiting(now)?;
         Ok(history)
-    }
-
-    /// Wipes events that have waited WAIT_FOR_CREATION_DAYS for their
-    /// group's creation. Run at open, and by the caller now and then.
-    pub fn sweep_waiting(&mut self, now: u64) -> Result<(), HistoryError> {
-        let waiting: Vec<Conversation> = (self.known.iter())
-            .filter(|(key, at)| matches!(at, Where::Group(_)) && !self.members.contains_key(*key))
-            .map(|(key, _)| *key)
-            .collect();
-        let before = now.saturating_sub(WAIT_FOR_CREATION_DAYS * DAY_MS);
-        for chat in waiting {
-            self.load(&chat, now)?;
-            let open = self.chats.get_mut(&chat).expect("loaded");
-            open.chat.wipe_received_by(before);
-            self.wipe(&chat)?;
-        }
-        Ok(())
     }
 
     /// Each group chat's members, from its index alone, so delivery and the
@@ -595,9 +563,6 @@ impl History {
             Where::Group(id) => Some(*id),
             Where::Direct(_) => None,
         };
-        let created_before = group
-            .and_then(|id| self.chats[chat].chat.group(&id))
-            .is_some();
         let mut taken = Vec::with_capacity(events.len());
         let mut kept = Vec::new();
         for (received, event) in events {
@@ -657,12 +622,6 @@ impl History {
             let open = self.chats.get_mut(chat).expect("loaded");
             match open.chat.group(&id) {
                 Some(version) => {
-                    // Created just now: what waited is checked (D7), and no
-                    // longer counts as waiting.
-                    if !created_before {
-                        open.chat.wipe_senders_not_in(&version.members);
-                        self.before_creation.retain(|(c, _), _| c != chat);
-                    }
                     self.members.insert(*chat, version.joined);
                     self.audience.insert(*chat, version.audience);
                 }
@@ -684,11 +643,10 @@ impl History {
     }
 
     /// Why a group event doesn't count (D7), if it doesn't: a creation that
-    /// doesn't hash to the group's ID from its sender; once created, a
-    /// sender who isn't a member of the current version; before, one with
-    /// too many events already waiting.
+    /// doesn't hash to the group's ID from its sender; a sender who isn't
+    /// a member of the current version, or any before it's created.
     fn group_refuses(
-        &mut self,
+        &self,
         chat: &Conversation,
         id: &[u8; 16],
         from: &Sender,
@@ -709,22 +667,9 @@ impl History {
             Some(version) if version.audience.values().any(|a| a.contains(&from.person)) => {
                 Some(Refusal::NotInChat)
             }
-            Some(_) => Some(Refusal::NotYetMember),
-            None => {
-                // Across all groups: one sender can't fill many of them.
-                let waiting: usize = (self.before_creation.iter())
-                    .filter(|((_, person), _)| *person == from.person)
-                    .map(|(_, n)| n)
-                    .sum();
-                if waiting >= MAX_BEFORE_CREATION {
-                    return Some(Refusal::TooManyWaiting);
-                }
-                *self
-                    .before_creation
-                    .entry((*chat, from.person))
-                    .or_default() += 1;
-                None
-            }
+            // Never one, or the group's creation hasn't come: may not have
+            // reached us yet, so the sender keeps it and tries again.
+            _ => Some(Refusal::NotYetMember),
         }
     }
 
@@ -1240,7 +1185,7 @@ mod tests {
             let taken = h
                 .receive(&Where::Group(id), CAROL, vec![intruder], NOW)
                 .unwrap();
-            assert_eq!(taken, [Taken::Shown], "its own group chat");
+            assert_eq!(taken, [Taken::Refused(Refusal::NotYetMember)], "not stored");
         }
         drop(h);
         // The log still opens, and Bob's chat has only Bob's message.
@@ -1560,11 +1505,11 @@ mod tests {
         assert_eq!(me.history.chats(), [group]);
     }
 
-    /// Before its creation arrives a group's events wait: not shown, no chat
-    /// listed, at most MAX_BEFORE_CREATION per sender. When it comes, the
-    /// members' events show and anyone else's are wiped.
+    /// Before its creation arrives a group's events are refused as "not
+    /// yet" (answered `failed`, so the sender keeps them): not stored, no
+    /// chat listed. Sent again once it has come, they show.
     #[test]
-    fn before_its_creation_a_group_waits() {
+    fn before_its_creation_a_group_refuses_for_now() {
         let (mut me, mut bob, mut carol) = (
             Member::new("w-me"),
             Member::new("w-bob"),
@@ -1574,37 +1519,20 @@ mod tests {
         carol.pass_to(&mut bob);
         let early = bob.history.send(&group, text("early"), NOW).unwrap();
         // Bob's message reaches me before the creation does.
-        assert_eq!(
-            me.history
-                .receive(&group, bob.me, vec![early], NOW)
-                .unwrap(),
-            [Taken::Shown]
-        );
-        let stranger = Sender {
-            person: [9; 32],
-            device: [90; 32],
-        };
-        for i in 0..MAX_BEFORE_CREATION as u64 {
-            let mut e = bobs(0, NOW + 10 + i, i + 1, text("spam"));
-            e.id[..8].copy_from_slice(&i.to_be_bytes());
-            e.id[8] = 0xEE;
-            me.history.receive(&group, stranger, vec![e], NOW).unwrap();
-        }
-        let over = bobs(250, NOW + 5000, 5000, text("one more"));
-        let taken = me
-            .history
-            .receive(&group, stranger, vec![over], NOW)
+        let taken = (me.history)
+            .receive(&group, bob.me, vec![early.clone()], NOW)
             .unwrap();
-        assert_eq!(taken, [Taken::Refused(Refusal::TooManyWaiting)]);
-        assert!(
-            me.history.chats().is_empty(),
-            "not listed before its creation"
-        );
+        assert_eq!(taken, [Taken::Refused(Refusal::NotYetMember)]);
+        assert!(me.history.chats().is_empty(), "not listed");
         assert!(me.history.page(&group, None, 50, NOW).unwrap().0.is_empty());
         carol.pass_to(&mut me);
+        let taken = (me.history)
+            .receive(&group, bob.me, vec![early], NOW)
+            .unwrap();
+        assert_eq!(taken, [Taken::Shown]);
         let (page, _) = me.history.page(&group, None, 50, NOW).unwrap();
         let texts: Vec<&str> = page.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(texts, ["early"], "Bob's waited; the stranger's are gone");
+        assert_eq!(texts, ["early"]);
         assert_eq!(me.history.chats(), [group]);
     }
 
@@ -1869,65 +1797,6 @@ mod tests {
         let late = d.history.send(&group, text("I left"), NOW).unwrap();
         let taken = a.history.receive(&group, d.me, vec![late], NOW).unwrap();
         assert_eq!(taken, [Taken::Refused(Refusal::NotInChat)]);
-    }
-
-    /// Events waiting for a group's creation count per sender across all
-    /// groups, not per group.
-    #[test]
-    fn waiting_is_capped_per_sender_across_groups() {
-        let mut me = Member::new("cap-me");
-        let stranger = Sender {
-            person: [9; 32],
-            device: [90; 32],
-        };
-        let mut sent = 0u64;
-        for (group, count) in [([1; 16], 60), ([2; 16], MAX_BEFORE_CREATION as u64 - 60)] {
-            for _ in 0..count {
-                let mut e = bobs(0, NOW + sent, sent + 1, text("spam"));
-                e.id[..8].copy_from_slice(&sent.to_be_bytes());
-                me.history
-                    .receive(&Where::Group(group), stranger, vec![e], NOW)
-                    .unwrap();
-                sent += 1;
-            }
-        }
-        let over = bobs(250, NOW + 5000, 5000, text("one more"));
-        let taken = me
-            .history
-            .receive(&Where::Group([3; 16]), stranger, vec![over], NOW)
-            .unwrap();
-        assert_eq!(taken, [Taken::Refused(Refusal::TooManyWaiting)]);
-    }
-
-    /// Events still waiting for a creation after WAIT_FOR_CREATION_DAYS are
-    /// wiped.
-    #[test]
-    fn waiting_events_are_wiped_after_some_days() {
-        let mut me = Member::new("old-me");
-        let group = Where::Group([4; 16]);
-        let stranger = Sender {
-            person: [9; 32],
-            device: [90; 32],
-        };
-        me.history
-            .receive(
-                &group,
-                stranger,
-                vec![bobs(1, NOW, 1, text("forever?"))],
-                NOW,
-            )
-            .unwrap();
-        let day = 24 * 3600 * 1000;
-        me.history
-            .sweep_waiting(NOW + WAIT_FOR_CREATION_DAYS * day - 1)
-            .unwrap();
-        let mut files = Store::new(&me.dir, &KEY).open(&group.key()).unwrap();
-        assert!(!files.read(0).unwrap()[0].is_empty(), "still waiting");
-        me.history
-            .sweep_waiting(NOW + WAIT_FOR_CREATION_DAYS * day)
-            .unwrap();
-        let mut files = Store::new(&me.dir, &KEY).open(&group.key()).unwrap();
-        assert!(files.read(0).unwrap()[0].is_empty(), "wiped");
     }
 
     /// Every saved format carries a number; one from a newer version of

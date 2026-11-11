@@ -539,31 +539,6 @@ impl Chat {
         self.group.add(id, by, change, at);
     }
 
-    /// Wipes every held event that arrived at or before `t` (milliseconds).
-    pub fn wipe_received_by(&mut self, t: u64) {
-        let old: Vec<EventId> = (self.held.iter())
-            .filter(|(_, h)| h.received <= t)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in old {
-            self.folded.remove(&id);
-            self.wipe(id);
-        }
-    }
-
-    /// Wipes every held event whose sender isn't one of `members`: a group's
-    /// events that waited for its creation and turn out to be from outside.
-    pub fn wipe_senders_not_in(&mut self, members: &BTreeSet<Person>) {
-        let outside: Vec<EventId> = (self.held.iter())
-            .filter(|(_, h)| !members.contains(&h.sender.person))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in outside {
-            self.folded.remove(&id);
-            self.wipe(id);
-        }
-    }
-
     /// Events whose stored copies must now be wiped: a deleted message, its
     /// edits and its reactions (D3, D11). Taken once.
     pub fn take_scrub(&mut self) -> Vec<EventId> {
