@@ -1956,4 +1956,78 @@ mod tests {
         assert_eq!(again.outgoing(&laptop, NOW).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    fn rss_kb() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        (status.lines())
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches(" kB").parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// PLAN-dm Task 15: unlock (open) time and memory with MESH_EVENTS
+    /// events in the history (default 100,000), and the newest page of a
+    /// chat that size. The history is built on the real disk under target/
+    /// once; run again for numbers from a fresh process.
+    #[test]
+    #[ignore = "a measurement: MESH_EVENTS=1000000 cargo test --release -p mesh-dm at_scale -- --ignored --nocapture"]
+    fn at_scale() {
+        let n: u64 = std::env::var("MESH_EVENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/measure-{n}"));
+        if !root.join("built").exists() {
+            let _ = std::fs::remove_dir_all(&root);
+            let mut h = History::open(&root, &KEY, ME).unwrap();
+            let started = std::time::Instant::now();
+            for batch in 0..n.div_ceil(500) {
+                let events = (batch * 500..((batch + 1) * 500).min(n))
+                    .map(|i| {
+                        let mut e = bobs(
+                            0,
+                            NOW - n + i,
+                            i + 1,
+                            text(&format!("message {i:>7} on the trail, about forty")),
+                        );
+                        e.id[..8].copy_from_slice(&i.to_be_bytes());
+                        e
+                    })
+                    .collect();
+                h.receive(&CHAT, BOB, events, NOW).unwrap();
+            }
+            std::fs::write(root.join("built"), b"").unwrap();
+            eprintln!(
+                "built {n} events in {:?}; run again for fresh numbers",
+                started.elapsed()
+            );
+            return;
+        }
+        let before = rss_kb();
+        let started = std::time::Instant::now();
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        let opened = started.elapsed();
+        let held = rss_kb().saturating_sub(before);
+        let started = std::time::Instant::now();
+        let (page, _) = h.page(&CHAT, None, 50, NOW).unwrap();
+        let paged = started.elapsed();
+        assert_eq!(page.len(), 50);
+        let bytes: u64 = walk_size(&root);
+        eprintln!(
+            "{n} events: open {opened:?}, +{} MB held ({} bytes an event), newest page {paged:?}, {} MB on disk",
+            held / 1024,
+            held * 1024 / n,
+            bytes / 1_000_000
+        );
+    }
+
+    fn walk_size(dir: &Path) -> u64 {
+        (std::fs::read_dir(dir).into_iter().flatten().flatten())
+            .map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() => walk_size(&e.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
 }
