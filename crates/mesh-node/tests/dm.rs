@@ -349,6 +349,20 @@ fn a_file_goes_by_chunks() {
         (Some("trail.pdf"), Some("application/pdf"), Some(300_000))
     );
     let event = sent["events"][0]["id"].as_str().unwrap().to_owned();
+    // Past 100 MB: refused before anything is kept (a sparse file).
+    let big = dirs[1].join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(100 * 1000 * 1000 + 1)
+        .unwrap();
+    let err = ask(
+        &mut alice,
+        "dmSendFile",
+        &[&id_b, big.to_str().unwrap()],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "too-long", "{err}");
+    std::fs::remove_file(&big).unwrap();
 
     let told = until(&mut bob, "meshDmNotify", |_| true);
     assert_eq!(told["text"], "trail.pdf");

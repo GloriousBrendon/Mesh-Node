@@ -9,7 +9,7 @@
 
 use super::*;
 use mesh_dm::Where;
-use mesh_dm::blob::{Blobs, MAX_KEPT, Opener, chunks, read_chunk};
+use mesh_dm::blob::{BlobError, Blobs, MAX_KEPT, Opener, chunks, read_chunk};
 use mesh_dm::event::{Attachment, Body, EventId, MAX_PREVIEW};
 
 /// The transport service files move on.
@@ -47,6 +47,15 @@ fn request(hash: &[u8; 32], index: u64) -> Vec<u8> {
 
 /// Asks one device for every chunk of `file`, checking each as it comes and
 /// the whole at the end. `None` if it hasn't the file or anything is wrong.
+/// The files a message carries, by hash.
+fn files_in(body: &Body) -> Vec<[u8; 32]> {
+    match body {
+        Body::Text { attachments, .. } => attachments.iter().map(|a| a.hash).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// ponytail: a file's sealed chunks gather in memory, up to 100 MB (MAX_FILE) per fetch at once; write them to a temp file as they come if that's too much.
 async fn fetch_from(node: &Node, addr: &MeshAddr, file: &Attachment) -> Option<Vec<Vec<u8>>> {
     let (_, mut send, mut recv) = node.open(addr, BLOB).await.ok()?;
     let mut opener = Opener::new(file.key, file.hash, file.size).ok()?;
@@ -157,28 +166,26 @@ impl Helper {
     pub(super) fn files_of_deleted(
         &mut self,
         events: &[mesh_dm::event::Event],
-    ) -> Vec<Option<(EventId, [u8; 32])>> {
+    ) -> Vec<Option<(EventId, Vec<[u8; 32]>)>> {
         let Some(history) = &mut self.dm else {
             return vec![None; events.len()];
         };
         (events.iter())
             .map(|e| match &e.body {
-                Body::Delete { target, .. } => match history.event(target) {
-                    Ok(Some(mesh_dm::event::Event {
-                        body: Body::Text { attachments, .. },
-                        ..
-                    })) => attachments.first().map(|a| (*target, a.hash)),
-                    _ => None,
-                },
+                Body::Delete { target, .. } => {
+                    (history.event(target).ok().flatten()).map(|e| (*target, files_in(&e.body)))
+                }
                 _ => None,
             })
             .collect()
     }
 
-    /// Drops a deleted message's kept file and any copy opened from it.
-    pub(super) fn drop_file(&self, (message, hash): &(EventId, [u8; 32])) {
-        if let Ok(Err(e)) = self.blobs().map(|b| b.remove(hash)) {
-            eprintln!("mesh-node: couldn't drop a kept file: {e}");
+    /// Drops a deleted message's kept files and any copy opened from them.
+    pub(super) fn drop_file(&self, (message, hashes): &(EventId, Vec<[u8; 32]>)) {
+        for hash in hashes {
+            if let Ok(Err(e)) = self.blobs().map(|b| b.remove(hash)) {
+                eprintln!("mesh-node: couldn't drop a kept file: {e}");
+            }
         }
         let prefix = format!("{}-", e2ee::hex(message));
         self.clear_opened(|name| name.starts_with(&prefix));
@@ -217,7 +224,8 @@ impl Helper {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let (key, hash, size) = blobs.add_file(source, at).map_err(|e| {
-                    let kind = if e.to_string().contains("100 MB") {
+                    let too_big = e.get_ref().and_then(|e| e.downcast_ref::<BlobError>());
+                    let kind = if too_big == Some(&BlobError::TooBig) {
                         "too-long"
                     } else {
                         "io"
@@ -372,5 +380,30 @@ impl Helper {
             json!({ "id": super::dm::chat_text(at), "message": message, "index": index, "path": path.to_string_lossy() }),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deleted message takes every one of its files with it (D13).
+    #[test]
+    fn every_attachment_of_a_message() {
+        let file = |hash| Attachment {
+            key: [0; 32],
+            hash,
+            size: 1,
+            name: "a".to_owned(),
+            mime: "text/plain".to_owned(),
+            preview: None,
+        };
+        let body = Body::Text {
+            text: String::new(),
+            reply_to: None,
+            attachments: vec![file([1; 32]), file([2; 32])],
+        };
+        assert_eq!(files_in(&body), [[1; 32], [2; 32]]);
+        assert!(files_in(&Body::Read { up_to: [0; 16] }).is_empty());
     }
 }
