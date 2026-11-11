@@ -2,15 +2,18 @@
 //! friended, asked, been asked by, blocked or removed, and your chosen status.
 //! It's the same on every device of yours: a last-writer-wins map keyed by ID,
 //! each entry stamped `(changed, by)` (time, then device key to break ties).
-//! Removals stay as tombstones for 90 days so an old copy can't bring them
-//! back.
+//! Removals stay as tombstones, the newest [`MAX_REMOVED`] of them, so an old
+//! copy can't bring them back.
 
 use serde::{Deserialize, Serialize};
 
+use crate::contacts::MAX_CONTACTS;
 use crate::id::MeshId;
 
-/// How long a `removed` tombstone is kept.
-pub const TOMBSTONE_LIFE: u64 = 90 * 24 * 3600;
+/// `removed` tombstones kept; past this the oldest go (SPEC-social D11).
+/// ponytail: after this many removals the oldest removed ID could come back
+/// from a device that still calls them a friend; raise it if that's seen.
+pub const MAX_REMOVED: usize = MAX_CONTACTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -150,10 +153,8 @@ impl Account {
     }
 
     /// Takes whatever is newer in `other`, entry by entry. True if anything
-    /// changed here. An entry we don't have that would let someone in, last
-    /// changed a tombstone's life ago, isn't taken: we may have removed them
-    /// and since dropped the tombstone (audit finding 14).
-    pub fn merge(&mut self, other: &Account, now: u64) -> bool {
+    /// changed here.
+    pub fn merge(&mut self, other: &Account) -> bool {
         let mut changed = false;
         for theirs in &other.entries {
             match self.entries.iter_mut().find(|e| e.id == theirs.id) {
@@ -162,8 +163,6 @@ impl Account {
                     *ours = theirs.clone();
                     changed = true;
                 }
-                None if theirs.kind != Kind::Blocked
-                    && theirs.changed.saturating_add(TOMBSTONE_LIFE) <= now => {}
                 None => {
                     self.entries.push(theirs.clone());
                     changed = true;
@@ -178,10 +177,22 @@ impl Account {
         changed
     }
 
-    /// Drops tombstones older than [`TOMBSTONE_LIFE`].
-    pub fn prune(&mut self, now: u64) {
+    /// Drops the oldest tombstones beyond [`MAX_REMOVED`].
+    pub fn prune(&mut self) {
+        let mut stamps: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::Removed)
+            .map(Entry::stamp)
+            .collect();
+        if stamps.len() <= MAX_REMOVED {
+            return;
+        }
+        stamps.sort_unstable();
+        // Ties (one device, one second) may keep a few more: harmless.
+        let oldest_kept = stamps[stamps.len() - MAX_REMOVED];
         self.entries
-            .retain(|e| e.kind != Kind::Removed || e.changed + TOMBSTONE_LIFE > now);
+            .retain(|e| e.kind != Kind::Removed || e.stamp() >= oldest_kept);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -225,9 +236,9 @@ mod tests {
         laptop.set_status(Status::Dnd, LAPTOP, 10);
 
         let mut a = desk.clone();
-        assert!(a.merge(&laptop, 0));
+        assert!(a.merge(&laptop));
         let mut b = laptop.clone();
-        b.merge(&desk, 0);
+        b.merge(&desk);
         // Same entries whichever way round (order in the list aside).
         for who in [&alice, &bob] {
             assert_eq!(a.get(who), b.get(who));
@@ -238,8 +249,8 @@ mod tests {
 
         // Idempotent.
         let before = a.clone();
-        assert!(!a.merge(&laptop, 0));
-        assert!(!a.merge(&before, 0));
+        assert!(!a.merge(&laptop));
+        assert!(!a.merge(&before));
         assert_eq!(a, before);
     }
 
@@ -251,58 +262,65 @@ mod tests {
         let mut laptop = Account::default();
         laptop.change(&alice, LAPTOP, 100, kind(Kind::Blocked));
         let mut a = desk.clone();
-        a.merge(&laptop, 0);
+        a.merge(&laptop);
         assert_eq!(a.kind(&alice), Some(Kind::Blocked));
-        laptop.merge(&desk, 0);
+        laptop.merge(&desk);
         assert_eq!(laptop.kind(&alice), Some(Kind::Blocked));
 
         // A device whose clock is behind still makes a newer change.
         a.change(&alice, DESK, 5, kind(Kind::Friend));
         let mut b = laptop.clone();
-        assert!(b.merge(&a, 0));
+        assert!(b.merge(&a));
         assert_eq!(b.kind(&alice), Some(Kind::Friend));
     }
 
     #[test]
-    fn tombstones_beat_older_adds_and_expire() {
+    fn tombstones_beat_older_adds_and_only_the_oldest_beyond_the_cap_go() {
         let alice = id();
         let mut old = Account::default();
         old.change(&alice, DESK, 100, kind(Kind::Friend));
         let mut new = Account::default();
         new.change(&alice, LAPTOP, 200, kind(Kind::Removed));
         let mut merged = new.clone();
-        assert!(!merged.merge(&old, 0));
+        assert!(!merged.merge(&old));
         assert_eq!(merged.kind(&alice), Some(Kind::Removed));
 
-        merged.prune(200 + TOMBSTONE_LIFE - 1);
-        assert_eq!(merged.kind(&alice), Some(Kind::Removed));
-        merged.prune(200 + TOMBSTONE_LIFE);
+        // One more removal than the cap: Alice's, the oldest, goes.
+        for i in 0..MAX_REMOVED as u64 {
+            merged.change(&id(), DESK, 300 + i, kind(Kind::Removed));
+        }
+        merged.prune();
         assert_eq!(merged.kind(&alice), None);
+        assert_eq!(merged.entries().len(), MAX_REMOVED);
         // Other kinds are never pruned.
-        old.prune(u64::MAX / 2);
+        old.prune();
         assert_eq!(old.kind(&alice), Some(Kind::Friend));
     }
 
-    /// A laptop unused past a tombstone's life still says "friend" about
-    /// someone the desk removed and has since forgotten removing. That
-    /// mustn't bring them back (audit finding 14).
+    /// A newly linked device, or one restored from an old backup, has no
+    /// entry for a friend made long ago. It must still take them.
     #[test]
-    fn a_stale_device_cant_bring_back_an_expired_removal() {
-        let (alice, eve) = (id(), id());
+    fn an_empty_account_takes_an_old_friend() {
+        let alice = id();
         let mut laptop = Account::default();
         laptop.change(&alice, LAPTOP, 100, kind(Kind::Friend));
-        laptop.change(&eve, LAPTOP, 100, kind(Kind::Blocked));
         let mut desk = Account::default();
-        let now = 100 + TOMBSTONE_LIFE;
-        // Its tombstone for Alice is gone: it has no entry at all.
-        assert!(desk.merge(&laptop, now));
-        assert_eq!(desk.kind(&alice), None, "an old friend came back");
-        // A block only ever keeps someone out: it still comes across.
-        assert_eq!(desk.kind(&eve), Some(Kind::Blocked));
-        // A recent add still does, as does one we already hold.
-        laptop.change(&alice, LAPTOP, now, kind(Kind::Friend));
-        assert!(desk.merge(&laptop, now));
+        assert!(desk.merge(&laptop));
         assert_eq!(desk.kind(&alice), Some(Kind::Friend));
+    }
+
+    /// Removals are kept for good, so a device unused for months can't bring
+    /// back someone removed since (audit finding 14).
+    #[test]
+    fn an_old_removal_still_beats_a_stale_friend() {
+        let alice = id();
+        let mut laptop = Account::default();
+        laptop.change(&alice, LAPTOP, 100, kind(Kind::Friend));
+        let mut desk = Account::default();
+        desk.change(&alice, DESK, 200, kind(Kind::Removed));
+        desk.prune();
+        assert!(!desk.merge(&laptop));
+        assert_eq!(desk.kind(&alice), Some(Kind::Removed));
     }
 
     #[test]

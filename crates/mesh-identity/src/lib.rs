@@ -17,7 +17,7 @@ mod password;
 mod remember;
 mod safety;
 
-pub use account::{Account, Entry, Kind, Status, TOMBSTONE_LIFE};
+pub use account::{Account, Entry, Kind, MAX_REMOVED, Status};
 pub use addr::{
     AddrError, AddrRecord, MAX_E2EE_FIELD, MAX_RECORD_LEN, MAX_RELAY_LEN, addr_outer, open_addr,
     seal_addr,
