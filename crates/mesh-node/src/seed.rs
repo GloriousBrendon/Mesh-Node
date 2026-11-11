@@ -12,6 +12,7 @@ use crate::saved::Snapshot;
 use crate::{addrs, knocks};
 use mesh_identity::{DeviceCert, DeviceKey, RootKey, unix_now};
 use mesh_transport::{Config, Limits, MeshAddr, Node, Relays, ServiceStream, frame};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,6 +52,62 @@ struct Counts {
     gets: AtomicU64,
     knock_puts: AtomicU64,
     knock_gets: AtomicU64,
+    callers: Mutex<Callers>,
+}
+
+/// Callers told apart in one hour's count, at most (memory).
+const MAX_COUNTED_CALLERS: usize = 100_000;
+const ARRIVED_RELAYED: u8 = 1;
+const ARRIVED_DIRECT: u8 = 2;
+
+/// How this hour's callers arrived: by throwaway key, in memory only, and
+/// only counts are ever logged (D10).
+#[derive(Default)]
+struct Callers {
+    seen: HashMap<[u8; 32], u8>,
+    /// Requests from callers past `MAX_COUNTED_CALLERS`, not told apart.
+    beyond: u64,
+}
+
+/// One hour's callers: direct only, relayed only, both, and requests beyond
+/// the count.
+#[derive(Debug, PartialEq, Eq)]
+struct Arrivals {
+    direct: usize,
+    relayed: usize,
+    both: usize,
+    beyond: u64,
+}
+
+impl Callers {
+    fn saw(&mut self, device: [u8; 32], direct: bool) {
+        let how = if direct {
+            ARRIVED_DIRECT
+        } else {
+            ARRIVED_RELAYED
+        };
+        let full = self.seen.len() >= MAX_COUNTED_CALLERS;
+        match self.seen.get_mut(&device) {
+            Some(seen) => *seen |= how,
+            None if full => self.beyond += 1,
+            None => {
+                self.seen.insert(device, how);
+            }
+        }
+    }
+
+    /// This hour's counts; the next hour starts empty.
+    fn take(&mut self) -> Arrivals {
+        let count = |how| self.seen.values().filter(|&&s| s == how).count();
+        let arrivals = Arrivals {
+            direct: count(ARRIVED_DIRECT),
+            relayed: count(ARRIVED_RELAYED),
+            both: count(ARRIVED_DIRECT | ARRIVED_RELAYED),
+            beyond: self.beyond,
+        };
+        *self = Self::default();
+        arrivals
+    }
 }
 
 #[derive(Clone)]
@@ -184,6 +241,8 @@ async fn announce(node: Arc<Node>) {
 
 async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
     while let Some(stream) = node.next_stream().await {
+        let device = *stream.peer.device.as_bytes();
+        lock(&counts.callers).saw(device, stream.direct_ip.is_some());
         let (stores, counts) = (stores.clone(), counts.clone());
         let count = |n: &AtomicU64| {
             n.fetch_add(1, Ordering::Relaxed);
@@ -381,8 +440,14 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>) {
             store.len()
         };
         let take = |n: &AtomicU64| n.swap(0, Ordering::Relaxed);
+        let Arrivals {
+            direct,
+            relayed,
+            both,
+            beyond,
+        } = lock(&counts.callers).take();
         eprintln!(
-            "mesh-node seed: last hour {} holds, {} lookups ({} found, {} slowed), {} revokes, {} address puts, {} address gets, {} request puts, {} request gets; {held} held, {records} address records, {requests} requests",
+            "mesh-node seed: last hour {} holds, {} lookups ({} found, {} slowed), {} revokes, {} address puts, {} address gets, {} request puts, {} request gets; {held} held, {records} address records, {requests} requests; callers {direct} direct, {relayed} relayed, {both} both ways, {beyond} requests from callers not told apart",
             take(&counts.holds),
             take(&counts.lookups),
             take(&counts.found),
@@ -485,4 +550,46 @@ fn lock<S>(store: &Mutex<S>) -> std::sync::MutexGuard<'_, S> {
     store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callers_are_counted_by_how_they_arrived() {
+        let mut callers = Callers::default();
+        callers.saw([1; 32], true);
+        callers.saw([1; 32], true);
+        callers.saw([2; 32], false);
+        // Relayed first, then direct once a path was found.
+        callers.saw([3; 32], false);
+        callers.saw([3; 32], true);
+        let hour = Arrivals {
+            direct: 1,
+            relayed: 1,
+            both: 1,
+            beyond: 0,
+        };
+        assert_eq!(callers.take(), hour);
+        let empty = Arrivals {
+            direct: 0,
+            relayed: 0,
+            both: 0,
+            beyond: 0,
+        };
+        assert_eq!(callers.take(), empty, "a new hour");
+
+        for i in 0..MAX_COUNTED_CALLERS as u32 + 2 {
+            let mut device = [0; 32];
+            device[..4].copy_from_slice(&i.to_be_bytes());
+            callers.saw(device, false);
+        }
+        callers.saw([0; 32], true);
+        let full = callers.take();
+        assert_eq!(
+            (full.relayed, full.both, full.beyond),
+            (MAX_COUNTED_CALLERS - 1, 1, 2)
+        );
+    }
 }
