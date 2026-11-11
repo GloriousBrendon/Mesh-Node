@@ -8,7 +8,7 @@
 //! for up to 30 days and 2,000 events; past that they're given up for that
 //! device. Our own devices get everything, except what came from them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,19 +34,22 @@ pub struct Entry {
 }
 
 /// The stored events in order.
+// ponytail: all in memory, about 150 bytes an event with History's places (15 MB at 100,000, 150 MB at a million); past about a million, keep the IDs and places on disk and page the entries.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Log {
     entries: Vec<Entry>,
+    /// Each event's number, by ID: what refuses a late copy.
     #[serde(skip)]
-    ids: HashSet<EventId>,
+    ids: HashMap<EventId, u64>,
 }
 
 impl Log {
     /// Numbers a newly stored event; `None` if it's already here.
     pub fn take(&mut self, entry: Entry) -> Option<u64> {
-        if !self.ids.insert(entry.id) {
+        if self.ids.contains_key(&entry.id) {
             return None;
         }
+        self.ids.insert(entry.id, self.len() + 1);
         self.entries.push(entry);
         Some(self.len())
     }
@@ -54,6 +57,11 @@ impl Log {
     pub fn get(&self, number: u64) -> Option<&Entry> {
         let index = usize::try_from(number.checked_sub(1)?).ok()?;
         self.entries.get(index)
+    }
+
+    /// The number an event was stored under, if it's here.
+    pub fn number_of(&self, id: &EventId) -> Option<u64> {
+        self.ids.get(id).copied()
     }
 
     pub fn len(&self) -> u64 {
@@ -66,7 +74,9 @@ impl Log {
 
     /// After loading: rebuilds what isn't saved.
     pub fn loaded(mut self) -> Self {
-        self.ids = self.entries.iter().map(|e| e.id).collect();
+        self.ids = (self.entries.iter().enumerate())
+            .map(|(i, e)| (e.id, i as u64 + 1))
+            .collect();
         self
     }
 }

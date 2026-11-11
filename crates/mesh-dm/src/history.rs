@@ -76,10 +76,9 @@ pub struct History {
     me: Sender,
     log: Log,
     log_files: ChatFiles,
-    /// Each stored event's number → chat, segment and position.
-    places: HashMap<u64, (Conversation, u32, u32)>,
-    /// Each stored event's number, by ID.
-    numbers: HashMap<EventId, u64>,
+    /// Where each stored event is kept, by number (from 1): segment and
+    /// position. Its chat is in the log's entry.
+    places: Vec<(u32, u32)>,
     deleted: HashMap<Conversation, HashSet<EventId>>,
     /// Every chat with events, and which chat each storage key is.
     known: HashMap<Conversation, Where>,
@@ -101,8 +100,7 @@ impl History {
         let mut history = Self {
             me,
             log: Log::default(),
-            places: HashMap::new(),
-            numbers: HashMap::new(),
+            places: Vec::new(),
             deleted: HashMap::new(),
             known: HashMap::new(),
             counters: Counters::new(me.person),
@@ -140,7 +138,7 @@ impl History {
                 let Some((received, from, event)) = decode(record)? else {
                     continue;
                 };
-                if self.numbers.contains_key(&event.id) {
+                if self.log.number_of(&event.id).is_some() {
                     continue;
                 }
                 let entry = Entry {
@@ -159,6 +157,15 @@ impl History {
             }
         }
         self.log(missed)
+    }
+
+    /// Where event `number` is kept: its chat, segment and position.
+    fn place(&self, number: u64) -> Option<(Conversation, u32, u32)> {
+        let chat = self.log.get(number)?.chat;
+        let (segment, position) = *self
+            .places
+            .get(usize::try_from(number.checked_sub(1)?).ok()?)?;
+        Some((chat, segment, position))
     }
 
     /// Appends records to the log (one sync), then takes them in.
@@ -185,10 +192,8 @@ impl History {
                 segment,
                 position,
             } => {
-                let (id, chat) = (entry.id, entry.chat);
-                if let Some(number) = self.log.take(entry) {
-                    self.places.insert(number, (chat, segment, position));
-                    self.numbers.insert(id, number);
+                if self.log.take(entry).is_some() {
+                    self.places.push((segment, position));
                 }
             }
             LogRecord::Deleted { chat, id } => {
@@ -304,15 +309,15 @@ impl History {
         let mut taken = Vec::with_capacity(events.len());
         let mut kept = Vec::new();
         for event in events {
-            if self.numbers.contains_key(&event.id) {
+            if self.log.number_of(&event.id).is_some() {
                 taken.push(Taken::Duplicate);
                 continue;
             }
             // An edit, delete or reaction of an old message: read its segment
             // first, so it folds in (or is refused) now.
             if let Some(target) = target(&event.body)
-                && let Some(&(c, segment, _)) =
-                    self.numbers.get(&target).and_then(|n| self.places.get(n))
+                && let Some((c, segment, _)) =
+                    self.log.number_of(&target).and_then(|n| self.place(n))
                 && c == *chat
             {
                 self.load_segment(chat, segment, now)?;
@@ -383,15 +388,16 @@ impl History {
 
     /// Wipes what the chat says to (D3), and logs its deletions.
     fn wipe(&mut self, chat: &Conversation) -> Result<(), HistoryError> {
-        let open = self.chats.get_mut(chat).expect("loaded");
+        let scrub = self.chats.get_mut(chat).expect("loaded").chat.take_scrub();
         let mut by_segment: HashMap<u32, HashSet<u32>> = HashMap::new();
-        for id in open.chat.take_scrub() {
-            if let Some(&(_, segment, position)) =
-                self.numbers.get(&id).and_then(|n| self.places.get(n))
+        for id in scrub {
+            if let Some((_, segment, position)) =
+                self.log.number_of(&id).and_then(|n| self.place(n))
             {
                 by_segment.entry(segment).or_default().insert(position);
             }
         }
+        let open = self.chats.get_mut(chat).expect("loaded");
         for (segment, positions) in by_segment {
             let mut at = 0u32;
             open.files.rewrite(segment, |record| {
@@ -431,7 +437,7 @@ impl History {
         let mut segments: HashMap<(Conversation, u32), Vec<Vec<u8>>> = HashMap::new();
         let mut out = Vec::with_capacity(send.len());
         for number in send {
-            let Some(&(chat, segment, position)) = self.places.get(&number) else {
+            let Some((chat, segment, position)) = self.place(number) else {
                 continue;
             };
             if let std::collections::hash_map::Entry::Vacant(slot) = segments.entry((chat, segment))
