@@ -667,14 +667,11 @@ impl Helper {
             "linkFinish" => self.link_finish(arg(0)?, arg(1)?).await?,
             "netStatus" => self.emit_net(),
             "netTicket" => {
-                // Relay only: a ticket shown to people carries no LAN address.
-                let addr = self.node()?.addr();
-                let ticket = MeshAddr {
-                    direct: Vec::new(),
-                    ..addr
-                }
-                .ticket()
-                .map_err(|_| Fail("offline", "not connected to a relay yet".to_owned()))?;
+                let ticket = self
+                    .node()?
+                    .addr()
+                    .ticket()
+                    .map_err(|_| Fail("offline", "not connected to a relay yet".to_owned()))?;
                 emit("meshTicket", json!({ "ticket": ticket }));
             }
             "netPing" => {

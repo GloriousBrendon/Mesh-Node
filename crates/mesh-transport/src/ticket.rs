@@ -24,11 +24,20 @@ pub enum TicketError {
     BadRelay,
 }
 
-/// `mesh://node/<key>?relay=<url>&addr=<ip:port>…`: the relay, any direct
-/// addresses (a seed's fixed one, SPEC-seed D8c), or both. Tickets with only
-/// a relay read as they always have.
+/// `mesh://node/<key>?relay=<url>&addr=<ip:port>…`: the relay, and for a
+/// seed with a fixed address its direct addresses (SPEC-seed D8c). Tickets
+/// with only a relay read as they always have.
 impl MeshAddr {
+    /// Key and relay only, as tickets always were: what people paste around
+    /// never carries an IP (SPEC-transport D10).
     pub fn ticket(&self) -> Result<String, TicketError> {
+        let relay = self.relay.as_ref().ok_or(TicketError::NoRelay)?;
+        Ok(format!("{PREFIX}{}?relay={relay}", self.device))
+    }
+
+    /// With the direct addresses too: only for a seed's public address
+    /// (SPEC-seed D8c).
+    pub fn ticket_with_direct(&self) -> Result<String, TicketError> {
         if self.relay.is_none() && self.direct.is_empty() {
             return Err(TicketError::NoRelay);
         }
@@ -89,11 +98,14 @@ mod tests {
     fn round_trips() {
         let ticket = addr().ticket().unwrap();
         assert!(ticket.starts_with(PREFIX));
-        assert!(
-            !ticket.contains("addr="),
-            "no direct address, none in the ticket"
-        );
-        // A seed's fixed address goes in, and comes back out.
+        // ticket() never carries an IP, even when the address has one: it's
+        // what people paste around (D10).
+        let lan = MeshAddr {
+            direct: vec!["192.168.1.2:4000".parse().unwrap()],
+            ..addr()
+        };
+        assert_eq!(lan.ticket(), Ok(ticket.clone()));
+        // A seed's fixed address goes in only by asking, and comes back out.
         let with_ip = MeshAddr {
             direct: vec![
                 "203.0.113.5:7400".parse().unwrap(),
@@ -101,7 +113,7 @@ mod tests {
             ],
             ..addr()
         };
-        let fixed = with_ip.ticket().unwrap();
+        let fixed = with_ip.ticket_with_direct().unwrap();
         assert!(
             fixed.contains("&addr=203.0.113.5:7400&addr=[2001:db8::5]:7400"),
             "{fixed}"
@@ -113,7 +125,7 @@ mod tests {
             ..with_ip
         };
         assert_eq!(
-            MeshAddr::from_ticket(&direct_only.ticket().unwrap()),
+            MeshAddr::from_ticket(&direct_only.ticket_with_direct().unwrap()),
             Ok(direct_only)
         );
         assert_eq!(

@@ -254,7 +254,7 @@ async fn announce(node: Arc<Node>, public: Option<std::net::SocketAddr>) {
         direct: public.into_iter().collect(),
         ..node.addr()
     };
-    match addr.ticket() {
+    match addr.ticket_with_direct() {
         Ok(ticket) => eprintln!("mesh-node seed: ticket {ticket}"),
         Err(e) => eprintln!("mesh-node seed: no ticket: {e}"),
     }
