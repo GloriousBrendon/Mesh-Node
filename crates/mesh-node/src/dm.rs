@@ -238,7 +238,8 @@ mod tests {
 
     /// PLAN-dm Task 9b, criterion 4: one device takes in 10,000 events from
     /// another, on disk, through e2ee, the frames and the acks. The network
-    /// itself isn't in it: 10,000 small frames are about 3 MB.
+    /// itself isn't in it: 10,000 small frames are about 3 MB, well under a
+    /// second on a LAN.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "a measurement: cargo test --release -p mesh-node intake -- --ignored --nocapture"]
     async fn intake_of_ten_thousand_events() {
@@ -252,8 +253,9 @@ mod tests {
             let device = DeviceKey::generate().unwrap();
             let cert = DeviceCert::issue(&root, &device.public(), name, now).unwrap();
             let devices = DeviceList::first(&root, cert).unwrap();
-            let dir =
-                std::env::temp_dir().join(format!("mesh-intake-{name}-{}", std::process::id()));
+            // On the real disk, not /tmp, which may be RAM: syncs must cost.
+            let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+            let dir = target.join(format!("mesh-intake-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let e2ee = E2ee::open(&dir, &KEY, &root, &device, &devices, now).unwrap();
             let me = DmSender {
@@ -289,7 +291,12 @@ mod tests {
         let stored = started.elapsed();
 
         let device = b_device.public().to_bytes();
-        a_history.add_device(device, bob.to_bytes());
+        // Criterion 4 is a new device of our own taking in history, which
+        // has no limit; a friend's device gets the newest 2,000 (D5). Own-
+        // device encryption comes with Task 10, so the counters treat this
+        // device as ours while the envelopes use the pair's session: the
+        // same opening and storing, event for event.
+        a_history.add_device(device, alice.to_bytes());
         let shares =
             |c: &Chat, p: &[u8; 32]| MeshId::from_bytes(p).is_ok_and(|p| *c == direct_chat(&p));
         let started = std::time::Instant::now();
