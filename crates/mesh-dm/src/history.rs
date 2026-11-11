@@ -179,42 +179,58 @@ impl History {
         Ok(history)
     }
 
-    /// Events a crash left in a chat's newest segment with no number (the
-    /// chat file is written before the log) get one now, so they're still
-    /// delivered.
+    /// Events a crash left in a chat with no number (the chat file is
+    /// written before the log) get one now, so they're still delivered.
     // ponytail: reads every chat's newest segment at unlock; fine for hundreds of chats, keep a "last written" mark if unlock grows slow.
     fn number_the_missed(&mut self) -> Result<(), HistoryError> {
         let chats: Vec<Conversation> = self.known.keys().copied().collect();
         let mut missed = Vec::new();
         for chat in chats {
             let mut files = self.store.open(&chat)?;
-            let Some(newest) = files.segments().checked_sub(1) else {
-                continue;
-            };
-            for (position, record) in files.read(newest)?.iter().enumerate() {
-                let Some((received, from, event)) = decode(record)? else {
-                    continue;
-                };
-                if self.log.number_of(&event.id).is_some() {
-                    continue;
+            // From the newest segment back, until one has nothing missing:
+            // a batch can cross into a new segment (next_places).
+            for segment in (0..files.segments()).rev() {
+                let before = missed.len();
+                self.missed_in(&mut files, chat, segment, &mut missed)?;
+                if missed.len() == before {
+                    break;
                 }
-                let entry = Entry {
-                    id: event.id,
-                    chat,
-                    author: from.person,
-                    from: from.device,
-                    at: received,
-                    private: private(&event.body),
-                };
-                let position = u32::try_from(position).map_err(|_| StoreError::Damaged)?;
-                missed.push(LogRecord::Stored {
-                    entry,
-                    segment: newest,
-                    position,
-                });
             }
         }
         self.log(missed)
+    }
+
+    /// The events in one segment with no number, as log records.
+    fn missed_in(
+        &self,
+        files: &mut ChatFiles,
+        chat: Conversation,
+        segment: u32,
+        missed: &mut Vec<LogRecord>,
+    ) -> Result<(), HistoryError> {
+        for (position, record) in files.read(segment)?.iter().enumerate() {
+            let Some((received, from, event)) = decode(record)? else {
+                continue;
+            };
+            if self.log.number_of(&event.id).is_some() {
+                continue;
+            }
+            let entry = Entry {
+                id: event.id,
+                chat,
+                author: from.person,
+                from: from.device,
+                at: received,
+                private: private(&event.body),
+            };
+            let position = u32::try_from(position).map_err(|_| StoreError::Damaged)?;
+            missed.push(LogRecord::Stored {
+                entry,
+                segment,
+                position,
+            });
+        }
+        Ok(())
     }
 
     /// Where event `number` is kept: its chat, segment and position.
@@ -1043,6 +1059,41 @@ mod tests {
         h.acked(&BOB.device, out[0].number, true);
         assert!(h.is_sent(&to_bob.id));
         assert!(!h.is_sent(&to_carol.id), "Carol is offline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The batch a crash cut short crossed into a new segment: the events
+    /// at the end of the one before it get numbers too.
+    #[test]
+    fn missed_events_across_a_segment_boundary_get_numbers() {
+        let root = dir("missed-across");
+        let laptop: Device = [11; 32];
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        for i in 0..SEGMENT_EVENTS - 2 {
+            h.send(&CHAT, text(&format!("logged {i}")), NOW).unwrap();
+        }
+        drop(h);
+        // Four unlogged: two finish segment 0, two start segment 1.
+        let missed: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| {
+                let event = Event {
+                    version: VERSION,
+                    id: [200 + i; 16],
+                    time: NOW,
+                    seq: NOW + u64::from(i),
+                    n: SEGMENT_EVENTS as u64 + u64::from(i),
+                    body: text(&format!("unlogged {i}")),
+                };
+                encode(NOW, ME, &event).unwrap()
+            })
+            .collect();
+        let mut files = Store::new(&root, &KEY).open(&CHAT.key()).unwrap();
+        files.append(&missed).unwrap();
+        assert_eq!(files.segments(), 2);
+        let mut again = History::open(&root, &KEY, ME).unwrap();
+        again.add_device(laptop, ME.person);
+        let out = again.outgoing(&laptop, NOW).unwrap();
+        assert_eq!(out.len(), SEGMENT_EVENTS + 2, "all of them");
         let _ = std::fs::remove_dir_all(root);
     }
 
