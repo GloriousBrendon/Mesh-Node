@@ -105,6 +105,15 @@ impl DeviceKey {
         self.0.sign(&signed_bytes(domain, body))
     }
 
+    /// What collects this device's mail from `mail_box` (SPEC-mailbox M6):
+    /// only this device can make it, so neither the sender nor our other
+    /// devices can empty its slot. The holder keeps its hash.
+    pub fn mail_collect_secret(&self, mail_box: &[u8; 16]) -> Zeroizing<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new_derive_key("mesh/v1/mail-collect");
+        hasher.update(self.secret_bytes().as_ref()).update(mail_box);
+        Zeroizing::new(*hasher.finalize().as_bytes())
+    }
+
     /// X25519 between this device key and `their` device key (the e2ee seal,
     /// SPEC-e2ee D8). `None` for a weak key, whose result would be predictable.
     pub fn diffie_hellman(&self, their: &VerifyingKey) -> Option<Zeroizing<[u8; 32]>> {
@@ -262,6 +271,12 @@ impl fmt::Display for Link {
     }
 }
 
+/// The collect tag a holder keeps for a claim: the collect secret's hash
+/// (SPEC-mailbox M6).
+pub fn mail_collect_tag(secret: &[u8; 32]) -> [u8; 32] {
+    *blake3::hash(secret).as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +385,18 @@ mod tests {
             prop_assert_eq!(MeshId::parse(&id.to_string()), Ok(id));
             prop_assert_eq!(Link::parse(&id.link()), Ok(Link::Id(id)));
         }
+    }
+
+    #[test]
+    fn a_collect_secret_is_the_devices_and_the_boxs() {
+        let (a, b) = (
+            DeviceKey::generate().unwrap(),
+            DeviceKey::generate().unwrap(),
+        );
+        let one = a.mail_collect_secret(&[1; 16]);
+        assert_eq!(*one, *a.mail_collect_secret(&[1; 16]));
+        assert_ne!(*one, *a.mail_collect_secret(&[2; 16]));
+        assert_ne!(*one, *b.mail_collect_secret(&[1; 16]));
+        assert_ne!(mail_collect_tag(&one), *one);
     }
 }

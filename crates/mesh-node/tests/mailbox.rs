@@ -2,6 +2,8 @@
 //! the mail services on, collected when they come back. The acceptance
 //! tests, by number.
 
+use mesh_identity::{DeviceCert, DeviceKey, RootKey, mail_collect_tag};
+use mesh_transport::{Config, MeshAddr, Node, Relays, frame};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -189,4 +191,104 @@ fn test_1_one_to_one() {
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// A bare Mesh device on the relay, to ask a seed things directly.
+async fn client(relay: &Relay) -> Node {
+    let (root, key) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
+    let cert = DeviceCert::issue(&root, &key.public(), "client", 1).unwrap();
+    let config = Config {
+        relays: Relays::Custom(vec![relay.url.parse().unwrap()]),
+        ..Config::default()
+    };
+    let node = Node::start(&key, &cert, config).await.unwrap();
+    assert!(node.online(Duration::from_secs(10)).await);
+    node
+}
+
+/// One batched request, one answer.
+async fn ask_seed(node: &Node, seed: &MeshAddr, service: &str, request: &[u8]) -> Vec<u8> {
+    let (_, mut send, mut recv) = node.open(seed, service).await.expect("open");
+    frame::write_frame(&mut send, request).await.unwrap();
+    send.finish().unwrap();
+    frame::read_frame(&mut recv)
+        .await
+        .unwrap()
+        .expect("an answer")
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+const OK: u8 = 0;
+const NO_BOX: u8 = 2;
+const TAKEN: u8 = 3;
+
+/// Test 6, first part (PLAN-mailbox Task 2): nothing is held for a slot
+/// nobody claimed, and only the claimer's collect secret collects.
+#[test]
+fn test_6_junk_unclaimed_and_secrets() {
+    let dir = temp_dir("mail6-seed");
+    let relay = Relay::start();
+    let mut seed = Seed::start_with(&dir, &relay, &["--mail"]);
+    let addr = MeshAddr::from_ticket(&seed.ticket()).unwrap();
+    relay.runtime.block_on(async {
+        let node = client(&relay).await;
+        let at = [[1u8; 16].as_slice(), &[2u8; 8]].concat();
+        let secret = [7u8; 32];
+        let put = [at.clone(), vec![9; 100]].concat();
+        // A stranger's put into a slot nobody claimed: no-box.
+        assert_eq!(ask_seed(&node, &addr, "mail-put", &put).await, [NO_BOX]);
+        let claim = |tag: [u8; 32]| {
+            [
+                at.clone(),
+                tag.to_vec(),
+                (now() + 86_400).to_be_bytes().to_vec(),
+            ]
+            .concat()
+        };
+        let tag = mail_collect_tag(&secret);
+        assert_eq!(
+            ask_seed(&node, &addr, "mail-claim", &claim(tag)).await,
+            [OK]
+        );
+        // Someone else's tag can't take over a standing claim; a renewal can.
+        let other = mail_collect_tag(&[8; 32]);
+        assert_eq!(
+            ask_seed(&node, &addr, "mail-claim", &claim(other)).await,
+            [TAKEN]
+        );
+        assert_eq!(
+            ask_seed(&node, &addr, "mail-claim", &claim(tag)).await,
+            [OK]
+        );
+        assert_eq!(ask_seed(&node, &addr, "mail-put", &put).await, [OK]);
+        // The wrong secret collects nothing and deletes nothing.
+        let get = |s: [u8; 32]| [at.clone(), s.to_vec()].concat();
+        assert_eq!(
+            ask_seed(&node, &addr, "mail-get", &get([8; 32])).await,
+            [NO_BOX]
+        );
+        let take = |s: [u8; 32]| [get(s), 1u32.to_be_bytes().to_vec()].concat();
+        assert_eq!(
+            ask_seed(&node, &addr, "mail-take", &take([8; 32])).await,
+            [NO_BOX]
+        );
+        let got = ask_seed(&node, &addr, "mail-get", &get(secret)).await;
+        assert_eq!(got[..2], [0, 1], "one envelope");
+        assert_eq!(
+            ask_seed(&node, &addr, "mail-take", &take(secret)).await,
+            [OK]
+        );
+        let got = ask_seed(&node, &addr, "mail-get", &get(secret)).await;
+        assert_eq!(got, [0, 0], "taken");
+        node.close().await;
+    });
+    seed.stop();
+    drop(relay.runtime);
+    let _ = std::fs::remove_dir_all(dir);
 }

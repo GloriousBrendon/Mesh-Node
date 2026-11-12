@@ -9,15 +9,17 @@
 //! A child of `helper`, as `dm` is.
 
 // ponytail: PLAN-mailbox Task 1, the thin path. The first `--seed` is the
-// only holder, this week's box the only one, no claims; marks and `mseq`s
+// only holder, this week's box the only one, claimed at unlock and at each
+// refresh (Task 7 claims ahead, pads and renews daily); marks and `mseq`s
 // live in memory (Task 11 saves them); receipts carry `ok` only (Task 8);
 // friends' devices only (Task 13 adds our own).
 
 use super::*;
 use crate::mailstore;
 use mesh_e2ee::{MAIL, MailHead, RECEIPT, open_mail, seal_mail};
-use mesh_identity::{PairKeys, VerifyingKey, week_of};
+use mesh_identity::{PairKeys, VerifyingKey, mail_collect_tag, week_of};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 /// Lock and quit wait this long for puts under way (mailbox *Limits*).
 pub(super) const MAIL_FLUSH: Duration = Duration::from_secs(3);
@@ -41,10 +43,16 @@ pub(super) struct Mail {
     pub(super) collecting: bool,
 }
 
+/// One contact's box for us this week: whose, the box and slot, the collect
+/// secret, and a claim of it.
+type Slot = (MeshId, [u8; ADDRESS], Zeroizing<[u8; 32]>, Vec<u8>);
+
 /// What a collect found in one contact's box for us.
 pub(super) struct Found {
     pub id: MeshId,
     pub address: [u8; ADDRESS],
+    /// What collects and deletes it.
+    pub secret: Zeroizing<[u8; 32]>,
     pub sealed: Vec<Vec<u8>>,
 }
 
@@ -181,19 +189,53 @@ impl Helper {
         }
     }
 
-    /// At unlock: collect this week's mail for this device, from every
-    /// contact's box, before any live sending.
-    pub(super) fn mail_collect(&mut self) {
-        let (Some(store), Some(net), Some(seed)) = (&self.store, &self.net, self.seeds.first())
-        else {
-            return;
+    /// This week's box and slot for each contact, the collect secret, and
+    /// a claim of it.
+    fn mail_slots(&self) -> Vec<Slot> {
+        let Some(store) = &self.store else {
+            return Vec::new();
         };
         let (me, device) = (store.id(), store.device_key().public());
-        let mut asked = Vec::new();
+        let expiry = (unix_now() + mailstore::CLAIM_LIFE).to_be_bytes();
+        let mut out = Vec::new();
         for contact in store.contacts() {
             if let Some(keys) = store.pair_keys(&contact.id()) {
-                asked.push((contact.id(), mail_address(&keys, &me, &device)));
+                let at = mail_address(&keys, &me, &device);
+                let mail_box = at[..mailstore::BOX].try_into().expect("16 bytes");
+                let secret = store.device_key().mail_collect_secret(&mail_box);
+                let claim = [&at[..], &mail_collect_tag(&secret), &expiry].concat();
+                out.push((contact.id(), at, secret, claim));
             }
+        }
+        out
+    }
+
+    /// Claims this week's slot in every contact's box (M6).
+    pub(super) fn mail_claim(&self) {
+        let (Some(net), Some(seed)) = (&self.net, self.seeds.first()) else {
+            return;
+        };
+        let claims: Vec<Vec<u8>> = self.mail_slots().into_iter().map(|s| s.3).collect();
+        if claims.is_empty() {
+            return;
+        }
+        let (anon, seed) = (net.anon.clone(), seed.clone());
+        tokio::spawn(async move {
+            let _ = seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims).await;
+        });
+    }
+
+    /// At unlock: claim, and collect this week's mail for this device from
+    /// every contact's box, before any live sending.
+    pub(super) fn mail_collect(&mut self) {
+        let (Some(net), Some(seed)) = (&self.net, self.seeds.first()) else {
+            return;
+        };
+        let (mut asked, mut claims, mut gets) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, at, secret, claim) in self.mail_slots() {
+            claims.push(claim);
+            gets.push([&at[..], &secret[..]].concat());
+            asked.push((id, at, secret));
         }
         if asked.is_empty() {
             return;
@@ -201,16 +243,20 @@ impl Helper {
         self.mail.collecting = true;
         let (anon, seed, back) = (net.anon.clone(), seed.clone(), self.back.clone());
         tokio::spawn(async move {
-            let requests: Vec<Vec<u8>> = asked.iter().map(|(_, a)| a.to_vec()).collect();
-            let asking = seed::ask_many(&anon, &seed, seed::MAIL_GET, &requests);
-            let answers = tokio::time::timeout(HOLDER_WAIT, asking).await;
+            let claiming = seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims);
+            let collecting = seed::ask_many(&anon, &seed, seed::MAIL_GET, &gets);
+            let both = async { tokio::join!(claiming, collecting) };
+            let answers = tokio::time::timeout(HOLDER_WAIT, both)
+                .await
+                .map(|(_, got)| got);
             let found = match answers {
                 Ok(Ok(answers)) => (asked.into_iter().zip(answers))
-                    .filter_map(|((id, address), answer)| {
+                    .filter_map(|((id, address, secret), answer)| {
                         let sealed = mailstore::read_got(&answer)?;
                         (!sealed.is_empty()).then_some(Found {
                             id,
                             address,
+                            secret,
                             sealed,
                         })
                     })
@@ -233,6 +279,7 @@ impl Helper {
         for Found {
             id,
             address,
+            secret,
             sealed,
         } in found
         {
@@ -250,7 +297,8 @@ impl Helper {
             for (head, body) in got_receipts {
                 acked |= self.mail_receipt(&head, &body);
             }
-            takes.push([&address[..], &(sealed.len() as u32).to_be_bytes()].concat());
+            let count = (sealed.len() as u32).to_be_bytes();
+            takes.push([&address[..], &secret[..], &count].concat());
             // Olm needs each sender device's mail in its order (M8).
             mail.sort_by_key(|(head, _)| (head.sender, head.mseq));
             let keys = self.store.as_ref().and_then(|s| s.pair_keys(&id));

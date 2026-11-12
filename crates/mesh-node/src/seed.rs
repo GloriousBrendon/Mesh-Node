@@ -26,6 +26,7 @@ pub const ADDR_GET: &str = "addr-get";
 pub const KNOCK_PUT: &str = "knock-put";
 pub const KNOCK_GET: &str = "knock-get";
 /// The mail services (SPEC-mailbox), only with `--mail`.
+pub const MAIL_CLAIM: &str = "mail-claim";
 pub const MAIL_PUT: &str = "mail-put";
 pub const MAIL_GET: &str = "mail-get";
 pub const MAIL_TAKE: &str = "mail-take";
@@ -73,6 +74,7 @@ struct Counts {
     gets: AtomicU64,
     knock_puts: AtomicU64,
     knock_gets: AtomicU64,
+    mail_claims: AtomicU64,
     mail_puts: AtomicU64,
     mail_gets: AtomicU64,
     mail_takes: AtomicU64,
@@ -174,7 +176,7 @@ pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), Str
     };
     let mut services = vec![HOLD, GET, REVOKE, ADDR_PUT, ADDR_GET, KNOCK_PUT, KNOCK_GET];
     if options.mail {
-        services.extend([MAIL_PUT, MAIL_GET, MAIL_TAKE]);
+        services.extend([MAIL_CLAIM, MAIL_PUT, MAIL_GET, MAIL_TAKE]);
     }
     let config = Config {
         relays,
@@ -307,23 +309,27 @@ async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
                     .get(caller, request, &codes, now)
                     .to_bytes()
             })),
-            MAIL_PUT | MAIL_GET | MAIL_TAKE if stores.mail.is_some() => {
+            MAIL_CLAIM | MAIL_PUT | MAIL_GET | MAIL_TAKE if stores.mail.is_some() => {
                 let mail = stores.mail.clone().expect("checked");
                 let service = stream.service.clone();
-                tokio::spawn(answer_batch(stream, move |_, request, _| {
+                tokio::spawn(answer_batch(stream, move |_, request, now| {
                     let mut mail = lock(&mail);
                     match service.as_str() {
+                        MAIL_CLAIM => {
+                            count(&counts.mail_claims);
+                            vec![mail.claim(request, now) as u8]
+                        }
                         MAIL_PUT => {
                             count(&counts.mail_puts);
-                            vec![mail.put(request) as u8]
+                            vec![mail.put(request, now) as u8]
                         }
                         MAIL_GET => {
                             count(&counts.mail_gets);
-                            mail.get(request)
+                            mail.get(request, now)
                         }
                         _ => {
                             count(&counts.mail_takes);
-                            vec![mail.take(request) as u8]
+                            vec![mail.take(request, now) as u8]
                         }
                     }
                 }))
@@ -517,7 +523,8 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
         if let Some(mail) = &stores.mail {
             let held = lock(mail).len();
             eprintln!(
-                "mesh-node seed: last hour mail {} puts, {} collects, {} takes; {held} envelopes held",
+                "mesh-node seed: last hour mail {} claims, {} puts, {} collects, {} takes; {held} envelopes held",
+                take(&counts.mail_claims),
                 take(&counts.mail_puts),
                 take(&counts.mail_gets),
                 take(&counts.mail_takes),

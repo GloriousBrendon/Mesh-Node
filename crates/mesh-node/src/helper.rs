@@ -215,6 +215,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             }
             _ = refresh.tick() => {
                 helper.dm_retry_all();
+                helper.mail_claim();
                 helper.mail_out_all();
                 helper.publish();
                 helper.dial_contacts();
