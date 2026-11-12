@@ -199,6 +199,8 @@ pub struct E2ee {
     /// When each device last got a fresh session from `unwedge`. In memory:
     /// a restart allowing one more is fine.
     unwedged: HashMap<Key, u64>,
+    /// Opening mail: no fresh session is sent back (SPEC-mailbox M8).
+    mail: bool,
     /// `None` keeps everything in memory (tests).
     store: Option<Store>,
     pub(crate) dirty: Dirty,
@@ -274,6 +276,7 @@ impl E2ee {
             direct: HashMap::new(),
             groups: Groups::default(),
             unwedged: HashMap::new(),
+            mail: false,
             store: None,
             dirty: Dirty::default(),
             #[cfg(test)]
@@ -362,6 +365,7 @@ impl E2ee {
             direct,
             groups,
             unwedged: HashMap::new(),
+            mail: false,
             store: Some(store),
             dirty: Dirty::default(),
             #[cfg(test)]
@@ -859,6 +863,20 @@ impl E2ee {
         Ok(opened)
     }
 
+    /// `decrypt_batch` for collected mail (SPEC-mailbox M8): a first
+    /// message that can't be opened is `CantOpen`, and no fresh session is
+    /// sent back. The sender hears of it by receipt (M16).
+    pub fn decrypt_mail_batch(
+        &mut self,
+        envelopes: &[Vec<u8>],
+        now: u64,
+    ) -> Result<Vec<Result<Received, E2eeError>>, E2eeError> {
+        self.mail = true;
+        let opened = self.decrypt_batch(envelopes, now);
+        self.mail = false;
+        opened
+    }
+
     /// `decrypt` without the save.
     fn open_envelope(&mut self, bytes: &[u8], now: u64) -> Result<Received, E2eeError> {
         let envelope = Envelope::from_bytes(bytes)?;
@@ -868,7 +886,7 @@ impl E2ee {
             return Ok(out);
         }
         let (sender, device, inside) = match self.open_olm(&envelope) {
-            Err(E2eeError::CantOpen) if envelope.kind == EnvelopeType::OlmFirst => {
+            Err(E2eeError::CantOpen) if envelope.kind == EnvelopeType::OlmFirst && !self.mail => {
                 return self.unwedge(&envelope, now);
             }
             opened => opened?,
@@ -1519,5 +1537,30 @@ pub(crate) mod tests {
             bob.e2ee.decrypt(&lost, NOW).err(),
             Some(E2eeError::CantOpen)
         );
+    }
+
+    /// Collected mail starts no session repair (SPEC-mailbox M8): a first
+    /// message that can't be opened is `CantOpen`, with nothing sent back,
+    /// even when live would answer it.
+    #[test]
+    fn mail_that_cant_open_starts_no_repair() {
+        let (mut alice, mut bob) = (device(), device());
+        let mut laptop = laptop_of(&mut alice, true);
+        friends(&mut alice, &mut bob);
+        friends(&mut laptop, &mut bob);
+        let (bob_id, bob_key) = (bob.who.root.id(), bob.who.device.public());
+        let a = alice
+            .e2ee
+            .encrypt_direct(&bob_id, Kind::TestNote, b"desktop");
+        bob.e2ee.open1(&to(a.unwrap(), &bob_key)).unwrap();
+        let lost = laptop.e2ee.encrypt_direct(&bob_id, Kind::TestNote, b"lost");
+        let lost = to(lost.unwrap(), &bob_key);
+        let got = bob
+            .e2ee
+            .decrypt_mail_batch(std::slice::from_ref(&lost), NOW)
+            .unwrap();
+        assert_eq!(got[0].as_ref().err(), Some(&E2eeError::CantOpen));
+        // Live still answers it: mail didn't use up the hour's repair.
+        assert_eq!(bob.e2ee.decrypt(&lost, NOW).unwrap().replies.len(), 1);
     }
 }

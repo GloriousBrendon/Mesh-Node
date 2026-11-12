@@ -41,6 +41,9 @@ pub(super) const TYPING: &str = "typing";
 const TYPING_GAP: Duration = Duration::from_secs(2);
 
 /// Where a 1:1 chat with `peer` is kept on our devices.
+/// A chat event to take: its frame, its group if it's in one, the event.
+pub(super) type Taking = (usize, Option<[u8; 16]>, Event);
+
 pub(super) fn direct_chat(peer: &MeshId) -> Where {
     Where::Direct(peer.to_bytes())
 }
@@ -299,7 +302,7 @@ impl Helper {
         &mut self,
         id: &MeshId,
         device: &[u8; 32],
-        events: Vec<(usize, Option<[u8; 16]>, Event)>,
+        events: Vec<Taking>,
         answers: &mut [u8],
     ) {
         let from = DmSender {

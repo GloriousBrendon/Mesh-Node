@@ -711,7 +711,7 @@ fn test_11_failed_by_mail() {
 
     // Alice's connection comes back; her add is mailed, and Bob takes it.
     unlocks(&mut alice, "alice");
-    ask(&mut alice, "cutOff", &[], "meshNet");
+    alice.send("cutOff", &[]);
     std::thread::sleep(SETTLE);
     locks(&mut alice);
     unlocks(&mut bob, "bob");
@@ -736,6 +736,203 @@ fn test_11_failed_by_mail() {
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Alice, Bob and Dave, all friends, on one mail seed; a group `g` of Alice
+/// and Bob (with `dave_too`, Dave as well), made by Alice.
+struct Three {
+    relay: Relay,
+    dirs: [std::path::PathBuf; 4],
+    seed: Seed,
+    ticket: String,
+    ids: [String; 3],
+    g: String,
+}
+
+fn three(name: &str, dave_too: bool) -> (Three, Helper, Helper, Helper) {
+    let dirs = ["seed", "alice", "bob", "dave"].map(|n| temp_dir(&format!("{name}-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice", &[]);
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &[]);
+    let (mut dave, id_d) = helper(&dirs[3], &relay, &ticket, "dave", &[]);
+    befriend(&mut alice, &id_a, &mut bob, &id_b);
+    befriend(&mut alice, &id_a, &mut dave, &id_d);
+    befriend(&mut bob, &id_b, &mut dave, &id_d);
+    let made = ask(&mut alice, "dmGroupCreate", &[&id_b, "trip"], "meshDmChats");
+    let g = (made["chats"].as_array().unwrap().iter())
+        .find(|c| c["kind"] == "group")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if dave_too {
+        ask(&mut alice, "dmGroupAdd", &[&g, &id_d], "meshDmChats");
+        until(&mut dave, "meshDmChats", members(&g, 3));
+        until(&mut bob, "meshDmChats", members(&g, 3));
+    } else {
+        until(&mut bob, "meshDmChats", members(&g, 2));
+    }
+    std::thread::sleep(SETTLE);
+    let t = Three {
+        relay,
+        dirs,
+        seed,
+        ticket,
+        ids: [id_a, id_b, id_d],
+        g,
+    };
+    (t, alice, bob, dave)
+}
+
+impl Three {
+    /// The seed again, `day` on.
+    fn seed_at(&mut self, day: u64) {
+        let old = std::mem::replace(
+            &mut self.seed,
+            seed_at(&self.dirs[0], &self.relay, &self.ticket, day),
+        );
+        drop(old);
+    }
+
+    fn done(self, mut logs: Vec<String>) {
+        logs.push(self.seed.stop().concat());
+        assert!(
+            logs.iter()
+                .all(|l| !l.contains("\"d") && !l.contains("hi from Dave"))
+        );
+        drop(self.relay.runtime);
+        for dir in self.dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Test 12. As test 11, but Alice's add is mailed before Bob unlocks, so
+/// Bob collects it and Dave's message in one collect, Dave's put first:
+/// he shows Dave's message straight away and refuses nothing.
+#[test]
+fn test_12_an_add_and_a_message_in_one_collect() {
+    let (t, alice, mut bob, mut dave) = three("mail12", false);
+    locks(&mut bob);
+    let mut logs = vec![alice.quit()];
+    let mut alice = again_with(
+        &t.dirs[1],
+        &t.relay,
+        &[&t.ticket],
+        "alice",
+        0,
+        &["--cut", "seed"],
+    );
+    ask(&mut alice, "dmGroupAdd", &[&t.g, &t.ids[2]], "meshDmChats");
+    until(&mut dave, "meshDmChats", members(&t.g, 3));
+    ask(
+        &mut dave,
+        "dmSend",
+        &[&t.g, "hi from Dave"],
+        "meshDmMessages",
+    );
+    locks(&mut dave);
+    alice.send("cutOff", &[]);
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    page_until(&mut bob, &t.g, |p| {
+        texts(p).contains(&"hi from Dave".to_owned())
+    });
+    let bob_log = bob.quit();
+    assert!(!bob_log.contains("chat events refused"), "nothing refused");
+    logs.extend([alice.quit(), bob_log, dave.quit()]);
+    t.done(logs);
+}
+
+/// Test 13. Alice mails Bob 60 messages; then the two meet live (Bob cut
+/// off from the seed, so he doesn't collect) and Alice sends them again on
+/// the live session; Bob collects the mail afterwards. Every message shows
+/// once; what he can't open any more is dropped quietly, starts no session
+/// repair and leaves no error.
+#[test]
+fn test_13_out_of_order() {
+    let (p, mut alice, id_a, mut bob, id_b) = friends("mail13", true);
+    locks(&mut bob);
+    let sent: Vec<String> = (1..=60).map(|i| format!("m{i}")).collect();
+    for text in &sent {
+        ask(&mut alice, "dmSend", &[&id_b, text], "meshDmMessages");
+    }
+    let mut logs = vec![bob.quit()];
+    let mut bob = again_with(
+        &p.dirs[2],
+        &p.relay,
+        &[&p.ticket],
+        "bob",
+        0,
+        &["--cut", "seed"],
+    );
+    // A page is the newest 50.
+    let newest: Vec<String> = sent[10..].to_vec();
+    page_until(&mut bob, &id_a, |page| texts(page) == newest);
+    page_until(&mut alice, &id_b, |p| {
+        p["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["sent"] == true)
+    });
+    locks(&mut alice);
+    bob.send("cutOff", &[]);
+    locks(&mut bob);
+    unlocks(&mut bob, "bob");
+    std::thread::sleep(SETTLE);
+    let page = page_until(&mut bob, &id_a, |_| true);
+    assert_eq!(texts(&page), newest, "every message once, in order");
+    let bob_log = bob.quit();
+    assert!(
+        !bob_log.contains("couldn't open an envelope"),
+        "no error for mail"
+    );
+    assert!(bob_log.contains("couldn't be opened"), "counted");
+    logs.extend([alice.quit(), bob_log]);
+    p.done(logs, &["m1", "m60"]);
+}
+
+/// Test 16. A group of Alice, Bob and Dave, made by Alice. Bob locks. Over
+/// five days Dave sends "d1" to "d5", mailed to Bob, and locks; Alice sees
+/// each. Alice removes Dave and locks. Bob collects all six in one
+/// collect: "d1" to "d5" show, then the removal; nothing is refused.
+#[test]
+fn test_16_a_removal_and_earlier_messages_in_one_collect() {
+    let (mut t, alice, mut bob, dave) = three("mail16", true);
+    locks(&mut bob);
+    let mut logs = vec![alice.quit(), dave.quit(), bob.quit()];
+    for day in 0..5u64 {
+        t.seed_at(day);
+        let mut alice = again(&t.dirs[1], &t.relay, &[&t.ticket], "alice", day);
+        let mut dave = again(&t.dirs[3], &t.relay, &[&t.ticket], "dave", day);
+        let text = format!("d{}", day + 1);
+        ask(&mut dave, "dmSend", &[&t.g, &text], "meshDmMessages");
+        page_until(&mut alice, &t.g, |p| texts(p).contains(&text));
+        locks(&mut dave);
+        logs.extend([dave.quit(), alice.quit()]);
+    }
+    t.seed_at(5);
+    let mut alice = again(&t.dirs[1], &t.relay, &[&t.ticket], "alice", 5);
+    ask(
+        &mut alice,
+        "dmGroupRemove",
+        &[&t.g, &t.ids[2]],
+        "meshDmChats",
+    );
+    locks(&mut alice);
+    logs.push(alice.quit());
+    let mut bob = again(&t.dirs[2], &t.relay, &[&t.ticket], "bob", 5);
+    until(&mut bob, "meshDmChats", members(&t.g, 2));
+    let page = page_until(&mut bob, &t.g, |p| texts(p).len() >= 5);
+    assert_eq!(texts(&page), ["d1", "d2", "d3", "d4", "d5"]);
+    let bob_log = bob.quit();
+    assert!(!bob_log.contains("chat events refused"), "nothing refused");
+    logs.push(bob_log);
+    t.done(logs);
 }
 
 /// Records that outlast the test, so no refresh comes.

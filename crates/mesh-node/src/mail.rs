@@ -21,6 +21,7 @@ use super::*;
 use crate::mailstore;
 use mesh_e2ee::{MAIL, MailHead, RECEIPT, open_mail, seal_mail};
 use mesh_identity::{PairKeys, VerifyingKey, mail_collect_tag, week_of};
+use std::collections::BTreeMap;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
@@ -479,6 +480,8 @@ impl Helper {
         let (mut opened_count, mut dropped) = (0, 0);
         let mut acked = false;
         let mut again = Vec::new();
+        // Each sender device's mail, whichever box or week it was in.
+        let mut by_sender: BTreeMap<([u8; 32], [u8; 32]), BySender> = BTreeMap::new();
         for Found {
             id,
             address,
@@ -504,7 +507,6 @@ impl Helper {
                 _ => HashSet::new(),
             };
             let me = store.device_key().public().to_bytes();
-            let mut mail: Vec<(MailHead, Vec<u8>)> = Vec::new();
             let mut got_receipts = Vec::new();
             for bytes in &sealed {
                 match open_mail(store.device_key(), ADDRESS, bytes, &tag_key) {
@@ -517,7 +519,12 @@ impl Helper {
                     {
                         dropped += 1
                     }
-                    Ok((head, body)) if head.kind == MAIL => mail.push((head, body)),
+                    Ok((head, body)) if head.kind == MAIL => {
+                        let (_, mail) = by_sender
+                            .entry((id.to_bytes(), head.sender))
+                            .or_insert((id, Vec::new()));
+                        mail.push((head, body));
+                    }
                     Ok(receipt) => got_receipts.push(receipt),
                     Err(_) => dropped += 1,
                 }
@@ -525,47 +532,79 @@ impl Helper {
             for (head, body) in got_receipts {
                 acked |= self.mail_receipt(&id, &head, &body, &mut again);
             }
-            // Olm needs each sender device's mail in its order (M8).
-            mail.sort_by_key(|(head, _)| (head.sender, head.mseq));
-            for (sender, group) in group_by_sender(mail) {
-                let Ok(from_key) = VerifyingKey::from_bytes(&sender) else {
-                    continue;
-                };
-                let known = self.devices_at.get(&sender).map(|(_, a)| a.clone());
-                let Some(from) = known.or_else(|| MeshAddr::from_device(&sender)) else {
-                    continue;
-                };
-                let seqs: Vec<u64> = group.iter().map(|(h, _)| h.mseq).collect();
-                let frames = group.into_iter().map(|(_, e)| (e2ee::WAITED, e)).collect();
-                let (tx, mut rx) = tokio::sync::oneshot::channel();
-                self.envelopes(id, from, frames, Some(tx));
-                let answers = rx.try_recv().unwrap_or_default();
-                let mut receipt = Receipt::default();
-                for (mseq, answer) in seqs.iter().zip(&answers) {
-                    match *answer {
-                        dm::OK => receipt.ok.push(*mseq),
-                        dm::CANT_OPEN => receipt.cant_open.push(*mseq),
-                        _ => receipt.failed.push(*mseq),
-                    }
+        }
+        // Olm opens each sender device's mail in its `mseq` order (M8); the
+        // events wait, to go to dm all together.
+        let mut batches = Vec::new();
+        for ((_, sender), (id, mut mail)) in by_sender {
+            mail.sort_by_key(|(head, _)| head.mseq);
+            mail.dedup_by_key(|(head, _)| head.mseq);
+            let known = self.devices_at.get(&sender).map(|(_, a)| a.clone());
+            let Some(from) = known.or_else(|| MeshAddr::from_device(&sender)) else {
+                continue;
+            };
+            let seqs: Vec<u64> = mail.iter().map(|(h, _)| h.mseq).collect();
+            let frames = mail.into_iter().map(|(_, e)| (e2ee::WAITED, e)).collect();
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let mut events = Vec::new();
+            self.envelopes_in(id, from, frames, Some(tx), Some(&mut events));
+            let answers = rx
+                .try_recv()
+                .unwrap_or_else(|_| vec![dm::FAILED; seqs.len()]);
+            batches.push(Batch {
+                id,
+                sender,
+                seqs,
+                answers,
+                events,
+            });
+        }
+        self.mail_take(&mut batches);
+        let cant_open: usize = (batches.iter())
+            .map(|b| b.answers.iter().filter(|a| **a == dm::CANT_OPEN).count())
+            .sum();
+        if cant_open > 0 {
+            eprintln!("mesh-node: {cant_open} mail envelopes couldn't be opened");
+        }
+        for batch in batches {
+            let Ok(from_key) = VerifyingKey::from_bytes(&batch.sender) else {
+                continue;
+            };
+            let mut receipt = Receipt::default();
+            for (mseq, answer) in batch.seqs.iter().zip(&batch.answers) {
+                match *answer {
+                    dm::OK => receipt.ok.push(*mseq),
+                    dm::CANT_OPEN => receipt.cant_open.push(*mseq),
+                    _ => receipt.failed.push(*mseq),
                 }
-                opened_count += receipt.ok.len();
-                // To the sender's holder, as its newest record names it.
-                let Some(holder) = self.mail.remembered.holder(&sender).map(str::to_owned) else {
-                    continue;
-                };
-                let at = mail_address(&keys, &id, &from_key);
-                let head = MailHead {
-                    sender: me,
-                    kind: RECEIPT,
-                    mseq: 0,
-                };
-                if let Ok(sealed) = seal_mail(&from_key, &at, &head, &tag_key, &receipt.to_bytes())
-                {
-                    receipts
-                        .entry(holder)
-                        .or_default()
-                        .push([&OPEN[..], &sealed].concat());
-                }
+            }
+            opened_count += receipt.ok.len();
+            // To the sender's holder, as its newest record names it.
+            let (Some(store), Some(holder)) =
+                (&self.store, self.mail.remembered.holder(&batch.sender))
+            else {
+                continue;
+            };
+            let Some(keys) = store.pair_keys(&batch.id) else {
+                continue;
+            };
+            let at = mail_address(&keys, &batch.id, &from_key);
+            let head = MailHead {
+                sender: store.device_key().public().to_bytes(),
+                kind: RECEIPT,
+                mseq: 0,
+            };
+            if let Ok(sealed) = seal_mail(
+                &from_key,
+                &at,
+                &head,
+                &keys.mail_tag_key(),
+                &receipt.to_bytes(),
+            ) {
+                receipts
+                    .entry(holder.to_owned())
+                    .or_default()
+                    .push([&OPEN[..], &sealed].concat());
             }
         }
         if dropped > 0 {
@@ -610,6 +649,61 @@ impl Helper {
         for id in again {
             self.mail_out(&id);
         }
+    }
+
+    /// Hands the opened events of every batch to dm in D2's order across
+    /// senders (M8): each chat's events by (`seq`, event ID), whoever sent
+    /// them, given in runs of one sender. What's "not a member yet" (or
+    /// otherwise `failed`) gets one more try at the end, in the same order.
+    fn mail_take(&mut self, batches: &mut [Batch]) {
+        let mut all: Vec<(usize, dm::Taking)> = Vec::new();
+        for (b, batch) in batches.iter_mut().enumerate() {
+            all.extend(
+                std::mem::take(&mut batch.events)
+                    .into_iter()
+                    .map(|t| (b, t)),
+            );
+        }
+        let chat = |b: &Batch, group: &Option<[u8; 16]>| {
+            group.map_or(b.id.to_bytes().to_vec(), |g| g.to_vec())
+        };
+        all.sort_by(|(x, a), (y, b)| {
+            (chat(&batches[*x], &a.1), a.2.seq, a.2.id).cmp(&(
+                chat(&batches[*y], &b.1),
+                b.2.seq,
+                b.2.id,
+            ))
+        });
+        let again: Vec<(usize, dm::Taking)> = self.mail_take_runs(batches, all);
+        if !again.is_empty() {
+            self.mail_take_runs(batches, again);
+        }
+    }
+
+    /// Takes `events` in runs of one sender; those answered `failed`, back.
+    fn mail_take_runs(
+        &mut self,
+        batches: &mut [Batch],
+        events: Vec<(usize, dm::Taking)>,
+    ) -> Vec<(usize, dm::Taking)> {
+        let kept: Vec<(usize, dm::Taking)> = events.clone();
+        let mut runs: Vec<(usize, Vec<dm::Taking>)> = Vec::new();
+        for (b, taking) in events {
+            match runs.last_mut() {
+                Some((last, run)) if *last == b => run.push(taking),
+                _ => runs.push((b, vec![taking])),
+            }
+        }
+        for (b, run) in runs {
+            let batch = &mut batches[b];
+            let (id, sender) = (batch.id, batch.sender);
+            let mut answers = std::mem::take(&mut batch.answers);
+            self.dm_take(&id, &sender, run, &mut answers);
+            batches[b].answers = answers;
+        }
+        kept.into_iter()
+            .filter(|(b, t)| batches[*b].answers[t.0] == dm::FAILED)
+            .collect()
     }
 
     /// A receipt from `id`'s reader device: its `ok`s move our counter; its
@@ -675,20 +769,21 @@ fn refused<E>(answers: Result<Vec<Vec<u8>>, E>) {
 /// A put: reader device, `mseq`, event number.
 type Put = ([u8; 32], u64, u64);
 
+/// A sender device's mail before it's opened: whose box, and the mail.
+type BySender = (MeshId, Vec<Unsealed>);
+
+/// One sender device's collected mail, opened: whose box, the device,
+/// each envelope's `mseq` and answer, and the chat events waiting for dm.
+struct Batch {
+    id: MeshId,
+    sender: [u8; 32],
+    seqs: Vec<u64>,
+    answers: Vec<u8>,
+    events: Vec<dm::Taking>,
+}
+
 /// One piece of mail, unsealed: its head and the envelope inside.
 type Unsealed = (MailHead, Vec<u8>);
-
-/// Sorted mail, in runs of one sender device.
-fn group_by_sender(mail: Vec<Unsealed>) -> Vec<([u8; 32], Vec<Unsealed>)> {
-    let mut runs: Vec<([u8; 32], Vec<Unsealed>)> = Vec::new();
-    for (head, body) in mail {
-        match runs.last_mut() {
-            Some((sender, run)) if *sender == head.sender => run.push((head, body)),
-            _ => runs.push((head.sender, vec![(head, body)])),
-        }
-    }
-    runs
-}
 
 #[cfg(test)]
 mod tests {

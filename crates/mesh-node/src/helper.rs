@@ -1203,6 +1203,21 @@ impl Helper {
         frames: e2ee::Frames,
         reply: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     ) {
+        self.envelopes_in(id, from, frames, reply, None);
+    }
+
+    /// `envelopes`, and with `mail`, as collected mail is opened (SPEC-mailbox
+    /// M8): no fresh session is sent back for what can't be opened, nothing
+    /// is logged per envelope, and the chat events are put on `mail` (by
+    /// frame) for the caller to hand to dm in order, rather than taken here.
+    pub(super) fn envelopes_in(
+        &mut self,
+        id: MeshId,
+        from: MeshAddr,
+        frames: e2ee::Frames,
+        reply: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+        mut mail: Option<&mut Vec<dm::Taking>>,
+    ) {
         let device = *from.device.as_bytes();
         // A relay we read in a record beats a bare connection address.
         self.devices_at.entry(device).or_insert((id, from.clone()));
@@ -1221,7 +1236,11 @@ impl Helper {
         let (mut unknown, mut fresh) = (false, false);
         let envelopes: Vec<Vec<u8>> = frames.iter().map(|(_, e)| e.clone()).collect();
         // One save for the whole stream (PLAN-dm Task 8).
-        let opened = match e2ee.decrypt_batch(&envelopes, unix_now()) {
+        let opened = match mail {
+            Some(_) => e2ee.decrypt_mail_batch(&envelopes, unix_now()),
+            None => e2ee.decrypt_batch(&envelopes, unix_now()),
+        };
+        let opened = match opened {
             Ok(opened) => opened,
             Err(e) => {
                 eprintln!("mesh-node: couldn't save e2ee state: {e}");
@@ -1235,7 +1254,7 @@ impl Helper {
             match result {
                 Err(E2eeError::UnknownSender) => {
                     // ponytail: kept in memory, 256 at most; `mailbox` keeps mail for real.
-                    if self.unopened.len() < 256 {
+                    if self.unopened.len() < 256 && mail.is_none() {
                         self.unopened.push((id, from.clone(), (flags, envelope)));
                     }
                     unknown = true;
@@ -1285,13 +1304,18 @@ impl Helper {
                     replies.extend(got.replies);
                 }
                 Err(e) => {
-                    eprintln!("mesh-node: couldn't open an envelope: {e}");
+                    // Mail that can't be opened is counted by the caller.
+                    if mail.is_none() {
+                        eprintln!("mesh-node: couldn't open an envelope: {e}");
+                    }
                     answers[i] = dm::CANT_OPEN;
                 }
             }
         }
-        if !events.is_empty() {
-            self.dm_take(&id, &device, events, &mut answers);
+        match mail.as_mut() {
+            Some(mail) => mail.extend(events),
+            None if !events.is_empty() => self.dm_take(&id, &device, events, &mut answers),
+            None => {}
         }
         if !synced.is_empty() {
             self.dm_take_synced(&device, synced, &mut answers);
