@@ -7,16 +7,19 @@
 //! mail-put   = token | sealed (its first 24 bytes are box [16] | slot [8])  -> answer u8
 //! token      = len u8 | the seed's `--mail-token` [len] (len 0 for an open seed)
 //! mail-get   = box [16] | slot [8] | collect secret [32]
-//!              -> count u16 | (len u32 | sealed)*, or answer u8 (no-box)
-//! mail-take  = box [16] | slot [8] | collect secret [32] | count u32 -> answer u8
+//!              -> count u16 | upto u64 | (len u32 | sealed)*, or answer u8 (no-box)
+//! mail-take  = box [16] | slot [8] | collect secret [32] | upto u64 -> answer u8
 //! ```
 //!
 //! A claim names the hash of a secret only the reader's device can make; a
 //! renewal is the same claim with a later expiry. The seal's associated data
 //! starts with the box and slot (e2ee D8), so an envelope moved to another
-//! box doesn't open. A get hands back the slot's oldest envelopes, as many as
-//! fit one frame; a take of `count` then deletes those, once the reader has
-//! stored them. Envelopes put meanwhile go after them, so they stay.
+//! box doesn't open. Each envelope is numbered as it's put, higher than any
+//! before it. A get hands back the slot's oldest envelopes, as many as fit
+//! one frame, and the highest number among them (`upto`, 0 for none); a take
+//! then deletes those up to `upto`, once the reader has stored them.
+//! Envelopes put meanwhile have higher numbers, so they stay, even if a
+//! sweep took some of the get's first.
 
 //! On disk (seed D9 as changed): `<data>/mail/claims` and
 //! `<data>/mail/envelopes`, append-only logs (`maillog`). Claims are held in
@@ -106,8 +109,17 @@ const CLAIM_RECORD: usize = HEAD + 32 + 8;
 /// An envelope log's records: a put, or a take.
 const PUT: u8 = 1;
 const TAKE: u8 = 2;
-/// A put's record before its sealed bytes: the op and the put time.
-const PUT_HEAD: usize = 1 + 8;
+/// A put's record before its sealed bytes: the op, the put time and the
+/// envelope's number.
+const PUT_HEAD: usize = 1 + 8 + 8;
+/// A take's record: the op, the slot, and the number it takes up to.
+const TAKE_RECORD: usize = 1 + HEAD + 8;
+/// Numbers start from the clock at each start, this many to a second, so a
+/// store emptied and restarted still numbers above what came before.
+// ponytail: unless the seed's clock goes back; a take then may delete mail
+// put after a restart into an emptied store. Store the last number if that
+// ever matters.
+const NUMBERS_PER_SECOND: u64 = 1_000_000;
 
 /// An answer to a claim, put or take (and to a get that may not collect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,10 +176,11 @@ struct Record {
     at: At,
 }
 
-/// Where an envelope sits in its log, and when it was put.
+/// Where an envelope sits in its log, when it was put, and its number.
 struct Held {
     at: At,
     put: u64,
+    number: u64,
 }
 
 pub struct Store {
@@ -176,6 +189,8 @@ pub struct Store {
     /// Each box's bytes and envelopes, across its slots.
     boxes: HashMap<[u8; BOX], (u64, u32)>,
     records: HashMap<[u8; 16], Vec<Record>>,
+    /// The next envelope's number.
+    next: u64,
     claims_log: Log,
     envelopes_log: Log,
     records_log: Log,
@@ -238,18 +253,21 @@ impl Store {
             true
         })?;
         let mut slots: HashMap<Key, VecDeque<Held>> = HashMap::new();
+        let mut next = now.saturating_mul(NUMBERS_PER_SECOND);
         let (envelopes_log, lost) = open_log(&dir.join("envelopes"), |at, p| match p.first() {
             Some(&PUT) if p.len() > PUT_HEAD + HEAD => {
-                let put = u64::from_be_bytes(p[1..PUT_HEAD].try_into().expect("8 bytes"));
+                let put = u64::from_be_bytes(p[1..9].try_into().expect("8 bytes"));
+                let number = u64::from_be_bytes(p[9..PUT_HEAD].try_into().expect("8 bytes"));
                 let (key, _) = key(&p[PUT_HEAD..]).expect("long enough");
-                slots.entry(key).or_default().push_back(Held { at, put });
+                next = next.max(number + 1);
+                (slots.entry(key).or_default()).push_back(Held { at, put, number });
                 true
             }
-            Some(&TAKE) if p.len() == 1 + HEAD + 4 => {
-                let (key, count) = key(&p[1..]).expect("long enough");
-                let count = u32::from_be_bytes(count.try_into().expect("4 bytes")) as usize;
+            Some(&TAKE) if p.len() == TAKE_RECORD => {
+                let (key, upto) = key(&p[1..]).expect("long enough");
+                let upto = u64::from_be_bytes(upto.try_into().expect("8 bytes"));
                 if let Some(held) = slots.get_mut(&key) {
-                    held.drain(..count.min(held.len()));
+                    take_upto(held, upto);
                 }
                 true
             }
@@ -282,6 +300,7 @@ impl Store {
             slots,
             boxes: HashMap::new(),
             records,
+            next,
             claims_log,
             envelopes_log,
             records_log,
@@ -461,7 +480,14 @@ impl Store {
         if !self.claimed(&key, now) {
             return Answer::NoBox;
         }
-        let payload = [&[PUT][..], &now.to_be_bytes(), request].concat();
+        let number = self.next;
+        let payload = [
+            &[PUT][..],
+            &now.to_be_bytes(),
+            &number.to_be_bytes(),
+            request,
+        ]
+        .concat();
         let (bytes, count) = self.boxes.get(&key.0).copied().unwrap_or_default();
         let len = payload.len() as u64;
         if bytes + len > BOX_MAX_BYTES
@@ -473,10 +499,15 @@ impl Store {
         match self.envelopes_log.append(&payload, true) {
             Ok(at) => {
                 self.envelopes_log.live += record(at.len);
+                self.next += 1;
                 let counted = self.boxes.entry(key.0).or_default();
                 counted.0 += u64::from(at.len);
                 counted.1 += 1;
-                let held = Held { at, put: now };
+                let held = Held {
+                    at,
+                    put: now,
+                    number,
+                };
                 self.slots.entry(key).or_default().push_back(held);
                 Answer::Ok
             }
@@ -497,13 +528,13 @@ impl Store {
         let Some((key, [])) = self.collecting(request, now) else {
             return vec![Answer::NoBox as u8];
         };
-        let mut out = vec![0, 0];
-        let mut count = 0u16;
-        let places: Vec<At> = (self.slots.get(&key).into_iter().flatten())
+        let mut out = vec![0; 2 + 8];
+        let (mut count, mut upto) = (0u16, 0u64);
+        let places: Vec<(At, u64)> = (self.slots.get(&key).into_iter().flatten())
             .filter(|h| h.put + MAIL_LIFE > now)
-            .map(|h| h.at)
+            .map(|h| (h.at, h.number))
             .collect();
-        for at in places {
+        for (at, number) in places {
             let sealed_len = at.len as usize - PUT_HEAD;
             if out.len() + 4 + sealed_len > MAX_GET_BYTES || count == u16::MAX {
                 break;
@@ -515,23 +546,24 @@ impl Store {
             out.extend_from_slice(&(sealed_len as u32).to_be_bytes());
             out.extend_from_slice(&payload[PUT_HEAD..]);
             count += 1;
+            upto = number;
         }
         out[..2].copy_from_slice(&count.to_be_bytes());
+        out[2..10].copy_from_slice(&upto.to_be_bytes());
         out
     }
 
     pub fn take(&mut self, request: &[u8], now: u64) -> Answer {
-        let Some((key, count)) = self.collecting(request, now) else {
+        let Some((key, upto)) = self.collecting(request, now) else {
             return Answer::NoBox;
         };
-        let Ok(count) = <[u8; 4]>::try_from(count) else {
+        let Ok(upto) = <[u8; 8]>::try_from(upto).map(u64::from_be_bytes) else {
             return Answer::Bad;
         };
         let Some(held) = self.slots.get_mut(&key) else {
             return Answer::Ok;
         };
-        let count = (u32::from_be_bytes(count) as usize).min(held.len());
-        let gone: Vec<u32> = held.drain(..count).map(|h| h.at.len).collect();
+        let gone = take_upto(held, upto);
         if held.is_empty() {
             self.slots.remove(&key);
         }
@@ -540,7 +572,7 @@ impl Store {
             counted.1 -= gone.len() as u32;
         }
         let gone: u64 = gone.into_iter().map(record).sum();
-        let payload = [&[TAKE][..], &key.0, &key.1, &(count as u32).to_be_bytes()].concat();
+        let payload = [&[TAKE][..], &key.0, &key.1, &upto.to_be_bytes()].concat();
         if let Err(e) = self.envelopes_log.append(&payload, false) {
             eprintln!("mesh-node seed: couldn't write a mail take: {e}");
         }
@@ -640,10 +672,17 @@ impl Store {
     }
 }
 
-/// A get's answer: the envelopes, oldest first. `None` if it doesn't read,
-/// or is a no-box.
-pub fn read_got(answer: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let (count, mut rest) = answer.split_first_chunk::<2>()?;
+/// Deletes a slot's envelopes numbered up to `upto`; their lengths.
+fn take_upto(held: &mut VecDeque<Held>, upto: u64) -> Vec<u32> {
+    let count = held.iter().take_while(|h| h.number <= upto).count();
+    held.drain(..count).map(|h| h.at.len).collect()
+}
+
+/// A get's answer: the highest number handed over, and the envelopes,
+/// oldest first. `None` if it doesn't read, or is a no-box.
+pub fn read_got(answer: &[u8]) -> Option<(u64, Vec<Vec<u8>>)> {
+    let (count, rest) = answer.split_first_chunk::<2>()?;
+    let (upto, mut rest) = rest.split_first_chunk::<8>()?;
     let mut out = Vec::new();
     for _ in 0..u16::from_be_bytes(*count) {
         let (len, after) = rest.split_first_chunk::<4>()?;
@@ -651,7 +690,7 @@ pub fn read_got(answer: &[u8]) -> Option<Vec<Vec<u8>>> {
         out.push(sealed.to_vec());
         rest = after;
     }
-    rest.is_empty().then_some(out)
+    rest.is_empty().then_some((u64::from_be_bytes(*upto), out))
 }
 
 #[cfg(test)]
@@ -704,15 +743,56 @@ mod tests {
         assert_eq!(store.put(&C, &admit(&whole(b"one")), NOW), Answer::Ok);
         assert_eq!(store.put(&C, &admit(&whole(b"two")), NOW), Answer::Ok);
         let got = store.get(&C, &with(&at, &SECRET, &[]), NOW);
-        assert_eq!(read_got(&got), Some(vec![whole(b"one"), whole(b"two")]));
-        // One more comes after the get: a take of two leaves it.
+        assert_eq!(read_got(&got).unwrap().1, [whole(b"one"), whole(b"two")]);
+        // One more comes after the get: the get's take leaves it.
         store.put(&C, &admit(&whole(b"three")), NOW);
-        let take = |n: u32| with(&at, &SECRET, &n.to_be_bytes());
-        assert_eq!(store.take(&take(2), NOW), Answer::Ok);
+        assert_eq!(store.take(&take_got(&at, &got), NOW), Answer::Ok);
         let got = store.get(&C, &with(&at, &SECRET, &[]), NOW);
-        assert_eq!(read_got(&got), Some(vec![whole(b"three")]));
-        store.take(&take(9), NOW);
+        assert_eq!(read_got(&got).unwrap().1, [whole(b"three")]);
+        store.take(&take_got(&at, &got), NOW);
         assert_eq!(store.len(), 0);
+    }
+
+    /// The take for what `got` handed over.
+    fn take_got(at: &[u8], got: &[u8]) -> Vec<u8> {
+        let (upto, _) = read_got(got).expect("a get");
+        with(at, &SECRET, &upto.to_be_bytes())
+    }
+
+    /// A sweep between a get and its take, and a put after it: the take
+    /// deletes only what the get handed over (numbered in the slot).
+    #[test]
+    fn a_take_deletes_only_what_its_get_handed_over() {
+        let dir = crate::maillog::temp("numbered");
+        let at = head(2, 7);
+        let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
+        store.claim(&C, &admit(&claim(&at, &SECRET, NOW + CLAIM_LIFE)), NOW);
+        let whole = |s: &[u8]| [at.clone(), s.to_vec()].concat();
+        store.put(&C, &admit(&whole(b"old")), NOW);
+        let late = NOW + MAIL_LIFE;
+        let got = store.get(&C, &with(&at, &SECRET, &[]), late - 1);
+        assert_eq!(read_got(&got).unwrap().1, [whole(b"old")]);
+        store.sweep(late);
+        assert_eq!(store.put(&C, &admit(&whole(b"new")), late), Answer::Ok);
+        assert_eq!(store.take(&take_got(&at, &got), late), Answer::Ok);
+        let now = store.get(&C, &with(&at, &SECRET, &[]), late);
+        assert_eq!(
+            read_got(&now).unwrap().1,
+            [whole(b"new")],
+            "never handed over"
+        );
+        // Numbers and takes hold over a restart, and keep going up.
+        drop(store);
+        let mut store = Store::open(&dir, late, Settings::default()).unwrap();
+        store.put(&C, &admit(&whole(b"after")), late);
+        let got = store.get(&C, &with(&at, &SECRET, &[]), late);
+        assert_eq!(read_got(&got).unwrap().1, [whole(b"new"), whole(b"after")]);
+        store.put(&C, &admit(&whole(b"last")), late);
+        store.take(&take_got(&at, &got), late);
+        drop(store);
+        let mut store = Store::open(&dir, late, Settings::default()).unwrap();
+        let got = store.get(&C, &with(&at, &SECRET, &[]), late);
+        assert_eq!(read_got(&got).unwrap().1, [whole(b"last")]);
     }
 
     #[test]
@@ -731,7 +811,7 @@ mod tests {
             store.get(&C, &with(&at, &wrong, &[]), NOW),
             [Answer::NoBox as u8]
         );
-        let take = with(&at, &wrong, &1u32.to_be_bytes());
+        let take = with(&at, &wrong, &u64::MAX.to_be_bytes());
         assert_eq!(store.take(&take, NOW), Answer::NoBox);
         assert_eq!(store.len(), 1, "nothing deleted");
         // A claim on a held slot under another tag is refused; a renewal
@@ -768,7 +848,7 @@ mod tests {
         assert_eq!(
             store.take(&with(&at, &SECRET, &[]), NOW),
             Answer::Bad,
-            "no count"
+            "no number"
         );
         assert_eq!(store.claim(&C, &admit(&at), NOW), Answer::Bad, "no tag");
         assert_eq!(
@@ -789,7 +869,11 @@ mod tests {
             "too far ahead"
         );
         assert_eq!(read_got(&[Answer::NoBox as u8]), None);
-        assert_eq!(read_got(&[0, 1, 0, 0, 0, 9]), None, "cut short");
+        assert_eq!(
+            read_got(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 9]),
+            None,
+            "cut short"
+        );
     }
 
     #[test]
@@ -801,7 +885,7 @@ mod tests {
         }
         let got = store.get(&C, &with(&at, &SECRET, &[]), NOW);
         assert!(got.len() <= mesh_transport::frame::MAX_FRAME);
-        assert!(read_got(&got).unwrap().len() < 40);
+        assert!(read_got(&got).unwrap().1.len() < 40);
     }
 
     #[test]
@@ -813,15 +897,16 @@ mod tests {
         store.claim(&C, &admit(&claim(&b, &SECRET, NOW + CLAIM_LIFE)), NOW);
         let whole = |at: &[u8], s: &[u8]| [at.to_vec(), s.to_vec()].concat();
         store.put(&C, &admit(&whole(&a, b"one")), NOW);
+        let got = store.get(&C, &with(&a, &SECRET, &[]), NOW);
         store.put(&C, &admit(&whole(&a, b"two")), NOW);
         store.put(&C, &admit(&whole(&b, b"old")), NOW);
-        store.take(&with(&a, &SECRET, &1u32.to_be_bytes()), NOW);
+        store.take(&take_got(&a, &got), NOW);
         drop(store);
         let mut store = Store::open(&dir, NOW + 10, Settings::default()).unwrap();
         let got = store.get(&C, &with(&a, &SECRET, &[]), NOW + 10);
         assert_eq!(
-            read_got(&got),
-            Some(vec![whole(&a, b"two")]),
+            read_got(&got).unwrap().1,
+            [whole(&a, b"two")],
             "the take held too"
         );
         // A day later the first claim has lapsed; a month on, the mail too.
@@ -835,8 +920,8 @@ mod tests {
         assert_eq!(store.len(), 0);
         let got = store.get(&C, &with(&b, &SECRET, &[]), later);
         assert_eq!(
-            read_got(&got),
-            Some(vec![]),
+            read_got(&got).unwrap().1,
+            Vec::<Vec<u8>>::new(),
             "the claim stands, the mail is gone"
         );
         drop(store);
@@ -1004,8 +1089,8 @@ mod tests {
         }
         assert_eq!(store.put(&caller(5_000, 251), &tiny, NOW), Answer::Full);
         // A take makes room again.
-        let take = with(&at, &SECRET, &1u32.to_be_bytes());
-        assert_eq!(store.take(&take, NOW), Answer::Ok);
+        let got = store.get(&caller(5_000, 251), &with(&at, &SECRET, &[]), NOW);
+        assert_eq!(store.take(&take_got(&at, &got), NOW), Answer::Ok);
         assert_eq!(store.put(&caller(5_001, 252), &tiny, NOW), Answer::Ok);
     }
 

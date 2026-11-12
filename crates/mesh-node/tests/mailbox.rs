@@ -471,19 +471,20 @@ fn test_6_junk_unclaimed_and_secrets() {
             ask_seed(&node, &addr, "mail-get", &get([8; 32])).await,
             [NO_BOX]
         );
-        let take = |s: [u8; 32]| [get(s), 1u32.to_be_bytes().to_vec()].concat();
+        // mail-take = slot | secret | the highest number the get gave.
+        let take = |s: [u8; 32], upto: &[u8]| [get(s), upto.to_vec()].concat();
         assert_eq!(
-            ask_seed(&node, &addr, "mail-take", &take([8; 32])).await,
+            ask_seed(&node, &addr, "mail-take", &take([8; 32], &[0xff; 8])).await,
             [NO_BOX]
         );
         let got = ask_seed(&node, &addr, "mail-get", &get(secret)).await;
         assert_eq!(got[..2], [0, 1], "one envelope");
         assert_eq!(
-            ask_seed(&node, &addr, "mail-take", &take(secret)).await,
+            ask_seed(&node, &addr, "mail-take", &take(secret, &got[2..10])).await,
             [OK]
         );
         let got = ask_seed(&node, &addr, "mail-get", &get(secret)).await;
-        assert_eq!(got, [0, 0], "taken");
+        assert_eq!(got, [0; 10], "taken");
         node.close().await;
     });
     seed.stop();

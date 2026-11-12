@@ -56,6 +56,8 @@ pub(super) struct Found {
     pub address: [u8; ADDRESS],
     /// What collects and deletes it.
     pub secret: Zeroizing<[u8; 32]>,
+    /// The highest number the get handed over: the take deletes up to it.
+    pub upto: u64,
     pub sealed: Vec<Vec<u8>>,
 }
 
@@ -258,11 +260,12 @@ impl Helper {
             let found = match answers {
                 Ok(Ok(answers)) => (asked.into_iter().zip(answers))
                     .filter_map(|((id, address, secret), answer)| {
-                        let sealed = mailstore::read_got(&answer)?;
+                        let (upto, sealed) = mailstore::read_got(&answer)?;
                         (!sealed.is_empty()).then_some(Found {
                             id,
                             address,
                             secret,
+                            upto,
                             sealed,
                         })
                     })
@@ -286,6 +289,7 @@ impl Helper {
             id,
             address,
             secret,
+            upto,
             sealed,
         } in found
         {
@@ -303,8 +307,7 @@ impl Helper {
             for (head, body) in got_receipts {
                 acked |= self.mail_receipt(&head, &body);
             }
-            let count = (sealed.len() as u32).to_be_bytes();
-            takes.push([&address[..], &secret[..], &count].concat());
+            takes.push([&address[..], &secret[..], &upto.to_be_bytes()].concat());
             // Olm needs each sender device's mail in its order (M8).
             mail.sort_by_key(|(head, _)| (head.sender, head.mseq));
             let keys = self.store.as_ref().and_then(|s| s.pair_keys(&id));
