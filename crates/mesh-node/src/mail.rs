@@ -224,7 +224,7 @@ impl Helper {
         }
         let (anon, seed) = (net.anon.clone(), seed.clone());
         tokio::spawn(async move {
-            let _ = seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims).await;
+            refused(seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims).await);
         });
     }
 
@@ -251,7 +251,10 @@ impl Helper {
             let both = async { tokio::join!(claiming, collecting) };
             let answers = tokio::time::timeout(HOLDER_WAIT, both)
                 .await
-                .map(|(_, got)| got);
+                .map(|(claimed, got)| {
+                    refused(claimed);
+                    got
+                });
             let found = match answers {
                 Ok(Ok(answers)) => (asked.into_iter().zip(answers))
                     .filter_map(|((id, address, secret), answer)| {
@@ -386,6 +389,16 @@ impl Helper {
             }
         }
         moved
+    }
+}
+
+/// Counts in our log the claims a seed answered with anything but `ok`.
+fn refused<E>(answers: Result<Vec<Vec<u8>>, E>) {
+    let Ok(answers) = answers else { return };
+    let ok = [mailstore::Answer::Ok as u8];
+    let refused = answers.iter().filter(|a| **a != ok).count();
+    if refused > 0 {
+        eprintln!("mesh-node: {refused} mail claims refused");
     }
 }
 

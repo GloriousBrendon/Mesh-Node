@@ -15,9 +15,24 @@ const PASSWORD: &str = "correct horse battery staple";
 const TTL: &str = "8";
 /// Test 1: "one" shows within this long of the reader's helper coming online.
 const SHOWS_WITHIN: Duration = Duration::from_secs(5);
+/// With clocks 30 s apart, records of a minute, so refreshes every 15 s.
+const SKEWED_TTL: &str = "60";
+const SKEWED_REFRESH: Duration = Duration::from_secs(16);
 
-fn helper(dir: &std::path::Path, relay: &Relay, seed: &str, name: &str) -> (Helper, String) {
-    let mut h = Helper::start_with(dir, relay, &["--seed", seed, "--record-ttl", TTL]);
+fn helper(
+    dir: &std::path::Path,
+    relay: &Relay,
+    seed: &str,
+    name: &str,
+    more: &[&str],
+) -> (Helper, String) {
+    let ttl = if more.contains(&"--record-ttl") {
+        &[][..]
+    } else {
+        &["--record-ttl", TTL][..]
+    };
+    let args = [&["--seed", seed][..], ttl, more].concat();
+    let mut h = Helper::start_with(dir, relay, &args);
     assert_eq!(h.event().0, "meshIdentity");
     let id = h.expect("idCreate", &[name, PASSWORD], "meshIdentity")["id"]
         .as_str()
@@ -117,16 +132,51 @@ fn mailed(stderr: &str) -> u64 {
 /// again.
 #[test]
 fn test_1_one_to_one() {
-    let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("mail1-{n}")));
+    one_to_one("mail1", "0");
+}
+
+/// Test 1 with both helpers' clocks 30 s ahead of the seed's: their claims
+/// still stand.
+#[test]
+fn test_1_clocks_ahead() {
+    one_to_one("mail1-ahead", "30");
+}
+
+/// And 30 s behind.
+#[test]
+fn test_1_clocks_behind() {
+    one_to_one("mail1-behind", "-30");
+}
+
+/// Claims the seed refused, by the helper's own count lines.
+fn refused(stderr: &str) -> u64 {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("mesh-node: "))
+        .filter_map(|l| l.strip_suffix(" mail claims refused"))
+        .filter_map(|n| n.parse::<u64>().ok())
+        .sum()
+}
+
+fn one_to_one(name: &str, clock: &str) {
+    let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("{name}-{n}")));
     let relay = Relay::start();
     let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
     let ticket = seed.ticket();
-    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
-    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob");
+    // Records long enough to outlast the clocks' gap (routing D4's are 2 h).
+    let skewed = ["--clock-offset", clock, "--record-ttl", SKEWED_TTL];
+    let clock = if clock == "0" { &[][..] } else { &skewed[..] };
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice", clock);
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", clock);
     alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
     bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
     alice.social_until(|s| has(s, "friends", &id_b));
     bob.social_until(|s| has(s, "friends", &id_a));
+    if !clock.is_empty() {
+        // ponytail: Bob claims for a new contact at his next refresh; Tasks 6
+        // and 7 claim at once and this wait goes.
+        std::thread::sleep(SKEWED_REFRESH);
+    }
     // They've written once, live, so a session is open (PLAN-mailbox Task
     // 1; without one it takes the mail record, test 17).
     ask(&mut alice, "dmSend", &[&id_b, "hi"], "meshDmMessages");
@@ -179,6 +229,11 @@ fn test_1_one_to_one() {
         mailed(&alice_log),
         1,
         "Alice mailed \"one\" once, and only it"
+    );
+    assert_eq!(
+        refused(&alice_log) + refused(&bob_log),
+        0,
+        "no claim was refused"
     );
     let seed_log = seed.stop().concat();
     for secret in ["one", "hi"] {
@@ -484,7 +539,8 @@ fn test_7_expiry() {
 }
 
 /// Mail records on the seed (PLAN-mailbox Task 5; routing D3, D5, D6 as
-/// changed): one 7 days ahead is taken and one a minute more refused, and
+/// changed): one 7 days ahead is taken and one past that and the seed's
+/// hour of room for clocks refused, and
 /// `mrec-get` finds it; a seed without `--mail` has no such services.
 #[test]
 fn mail_records_on_the_seed() {
@@ -500,7 +556,7 @@ fn mail_records_on_the_seed() {
         let node = client(&relay).await;
         let week = record(now() + WEEK - 5);
         assert_eq!(ask_seed(&node, &addr, "mrec-put", &week).await, [0]);
-        let past = record(now() + WEEK + 60);
+        let past = record(now() + WEEK + 3600 + 60);
         assert_eq!(ask_seed(&node, &addr, "mrec-put", &past).await, [5], "bad");
         let got = ask_seed(&node, &addr, "mrec-get", &[6; 16]).await;
         assert_eq!(got, [&[0u8, 0, week.len() as u8][..], &week].concat());

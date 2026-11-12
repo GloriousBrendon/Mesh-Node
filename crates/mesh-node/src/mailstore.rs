@@ -94,6 +94,10 @@ pub const MAIL_STORE_MAX: u64 = 2 * 1024 * 1024 * 1024;
 /// The longest `--mail-token`.
 pub const MAX_TOKEN: usize = 64;
 const HOUR: u64 = 3600;
+/// How far a caller's clock may be ahead of ours: a claim or mail record
+/// may expire this much later than it asks for, as address records have
+/// an hour over their 2 (routing D4).
+pub const CLOCK_ROOM: u64 = HOUR;
 /// A claim's record in its log: box, slot, tag, expiry.
 const CLAIM_RECORD: usize = HEAD + 32 + 8;
 /// An envelope log's records: a put, or a take.
@@ -381,7 +385,7 @@ impl Store {
         let Ok(expiry) = <[u8; 8]>::try_from(expiry).map(u64::from_be_bytes) else {
             return Answer::Bad;
         };
-        if expiry <= now || expiry > now + CLAIM_LIFE {
+        if expiry <= now || expiry > now + CLAIM_LIFE + CLOCK_ROOM {
             return Answer::Bad;
         }
         if !self
@@ -542,7 +546,7 @@ impl Store {
         let Some((lookup, slot, expiry)) = addr_outer(bytes) else {
             return RecordPut::Bad;
         };
-        if expiry <= now || expiry > now + RECORD_AHEAD {
+        if expiry <= now || expiry > now + RECORD_AHEAD + CLOCK_ROOM {
             return RecordPut::Bad;
         }
         if !self
@@ -754,7 +758,13 @@ mod tests {
             Answer::Bad,
             "expired"
         );
-        let far = claim(&at, &SECRET, NOW + CLAIM_LIFE + 1);
+        let ahead = claim(&head(9, 9), &SECRET, NOW + 30 + CLAIM_LIFE);
+        assert_eq!(
+            store.claim(&C, &admit(&ahead), NOW),
+            Answer::Ok,
+            "a clock 30 s ahead"
+        );
+        let far = claim(&at, &SECRET, NOW + CLAIM_LIFE + CLOCK_ROOM + 1);
         assert_eq!(
             store.claim(&C, &admit(&far), NOW),
             Answer::Bad,
@@ -1018,12 +1028,15 @@ mod tests {
             RecordPut::Ok,
             "7 days ahead"
         );
-        let past = mail_record(1, 2, NOW + RECORD_AHEAD + 60, 1);
+        let past = mail_record(1, 2, NOW + RECORD_AHEAD + CLOCK_ROOM + 1, 1);
         assert_eq!(
             store.put_record(&C, &past, NOW),
             RecordPut::Bad,
-            "a minute more"
+            "past the clock's room"
         );
+        // A caller whose clock is 30 s ahead still asks for a week.
+        let ahead = mail_record(9, 3, NOW + 30 + RECORD_AHEAD, 1);
+        assert_eq!(store.put_record(&C, &ahead, NOW), RecordPut::Ok);
         assert_eq!(store.put_record(&C, &b"short"[..], NOW), RecordPut::Bad);
         // A newer record replaces its slot; an older one changes nothing.
         let newer = mail_record(1, 1, NOW + RECORD_AHEAD, 2);
@@ -1046,7 +1059,7 @@ mod tests {
         drop(store);
         let mut store = Store::open(&dir, NOW + 10, Settings::default()).unwrap();
         assert_eq!(found(store.get_records(&C, &[1; 16], NOW + 10))[0], newer);
-        let later = NOW + RECORD_AHEAD;
+        let later = NOW + 30 + RECORD_AHEAD;
         store.sweep(later);
         assert!(found(store.get_records(&C, &[1; 16], later)).is_empty());
         assert_eq!(store.total(), 0);
