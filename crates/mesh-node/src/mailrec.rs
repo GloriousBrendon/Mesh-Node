@@ -140,6 +140,13 @@ pub(super) fn ticket_of(seed: &MeshAddr) -> Option<String> {
     seed.ticket_with_direct().ok()
 }
 
+/// Whether a put at `at` (our clock) may be lost to a holder whose claims
+/// are good only since `since` (the reader's clock) (M12). The clocks may
+/// be `CLOCK_ROOM` apart, as for claims; a put mailed twice is shown once.
+fn lost(since: u64, at: u64) -> bool {
+    since + crate::mailstore::CLOCK_ROOM >= at
+}
+
 impl Helper {
     fn remembered_path(&self) -> PathBuf {
         self.path
@@ -307,6 +314,9 @@ impl Helper {
         let now = unix_now();
         let mut changed = false;
         let mut to_mail = Vec::new();
+        // Holders whose `since` moved in what we just read: only those can
+        // have lost what we put (M12).
+        let mut moved: HashSet<([u8; 32], String)> = HashSet::new();
         for (id, sealed) in found {
             self.mail.reading.remove(&id);
             let Some(keys) = self.store.as_ref().and_then(|s| s.pair_keys(&id)) else {
@@ -326,7 +336,10 @@ impl Helper {
                     );
                 }
                 let device = record.device.to_bytes();
-                let holders = record
+                let before = (self.mail.remembered.known.get(&device))
+                    .map(|k| k.holders.clone())
+                    .unwrap_or_default();
+                let holders: Vec<(String, u64)> = record
                     .holders
                     .into_iter()
                     .map(|h| (h.ticket, h.since))
@@ -337,9 +350,14 @@ impl Helper {
                     created: record.created_at,
                     expires: record.expires_at,
                 };
+                let news: Vec<(String, u64)> = (known.holders.iter())
+                    .filter(|h| !before.contains(h))
+                    .cloned()
+                    .collect();
                 if !self.mail.remembered.take(device, known) {
                     continue;
                 }
+                moved.extend(news.into_iter().map(|(ticket, _)| (device, ticket)));
                 changed = true;
                 to_mail.push(id);
             }
@@ -351,8 +369,12 @@ impl Helper {
         let again: Vec<([u8; 32], u64)> = (self.mail.marked.iter())
             .filter(|((device, _), (holder, at))| {
                 remembered.known.get(device).is_some_and(|k| {
-                    let listed = k.holders.iter().find(|(ticket, _)| ticket == holder);
-                    listed.is_none_or(|(_, since)| since >= at)
+                    match k.holders.iter().find(|(ticket, _)| ticket == holder) {
+                        None => true,
+                        Some((ticket, since)) => {
+                            moved.contains(&(*device, ticket.clone())) && lost(*since, *at)
+                        }
+                    }
                 })
             })
             .map(|(mark, _)| *mark)
@@ -445,6 +467,19 @@ mod tests {
 
     /// A remembered-records file from a newer mesh-node is refused, left on
     /// disk as it was, and never written over.
+    /// The reader's clock against ours: a `since` up to `CLOCK_ROOM` before
+    /// a put still mails it again (M12).
+    #[test]
+    fn since_has_an_hours_room() {
+        assert!(lost(NOW, NOW - 1));
+        assert!(
+            lost(NOW - 30 * 60, NOW),
+            "the reader's clock half an hour behind"
+        );
+        assert!(lost(NOW - crate::mailstore::CLOCK_ROOM, NOW));
+        assert!(!lost(NOW - crate::mailstore::CLOCK_ROOM - 1, NOW));
+    }
+
     #[test]
     fn a_newer_file_is_refused_and_left() {
         let path = path("newer");
