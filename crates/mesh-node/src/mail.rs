@@ -717,7 +717,7 @@ impl Helper {
 
     /// A receipt from `id`'s reader device: its `ok`s move our counter; its
     /// `failed`s are mailed again (pushed on `again`), at once the first
-    /// time, then on `FAILED_BACKOFF`; its couldn't-opens are counted. True
+    /// time, then on `FAILED_BACKOFF`; its couldn't-opens go again (M16). True
     /// if a counter moved.
     fn mail_receipt(
         &mut self,
@@ -755,7 +755,8 @@ impl Helper {
             );
         }
         // Couldn't open (M16): what has an `ok` is left be; the rest goes
-        // again at once on a fresh session, if the limits allow one.
+        // again: at once on a fresh session if the limits allow one, else
+        // on the newest session with `failed`'s backoff.
         if !receipt.cant_open.is_empty() {
             eprintln!(
                 "mesh-node: {} mailed events couldn't be opened",
@@ -770,18 +771,34 @@ impl Helper {
             (Ok(key), Some(e2ee)) if !lost.is_empty() => e2ee.fresh_session(id, &key, now),
             _ => Ok(false),
         };
-        match fresh {
-            Ok(true) => {
-                eprintln!("mesh-node: a fresh mail session for {} events", lost.len());
-                for (mseq, number) in lost {
-                    self.mail.sent.remove(&(reader, mseq));
-                    self.mail.marked.remove(&(reader, number));
-                }
-                again.push(*id);
+        let fresh = match fresh {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                eprintln!("mesh-node: couldn't start a fresh mail session: {e}");
+                false
             }
-            Ok(false) => {}
-            Err(e) => eprintln!("mesh-node: couldn't start a fresh mail session: {e}"),
+        };
+        if lost.is_empty() {
+            return moved;
         }
+        if fresh {
+            eprintln!("mesh-node: a fresh mail session for {} events", lost.len());
+        } else {
+            eprintln!(
+                "mesh-node: {} mailed events go again on the newest session",
+                lost.len()
+            );
+        }
+        for (mseq, number) in lost {
+            self.mail.sent.remove(&(reader, mseq));
+            self.mail.marked.remove(&(reader, number));
+            if !fresh {
+                let (tries, at) = self.mail.retry.entry((reader, number)).or_insert((0, 0));
+                *tries += 1;
+                *at = now + failed_wait(*tries);
+            }
+        }
+        again.push(*id);
         moved
     }
 }
