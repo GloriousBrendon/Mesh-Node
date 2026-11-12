@@ -67,6 +67,10 @@ pub type Signer = Box<dyn Fn(&[u8]) -> [u8; 64] + Send>;
 /// chat's index, the counters. A higher one is from a newer Mesh.
 pub const SAVED_FORMAT: u8 = 1;
 
+/// The counters' own format: 2 adds the helper's mail state (SPEC-mailbox
+/// M15); 1, the counters alone, still opens.
+pub const COUNTERS_FORMAT: u8 = 2;
+
 /// `bytes` as saved: the format number first.
 fn framed(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.insert(0, SAVED_FORMAT);
@@ -119,6 +123,8 @@ pub struct History {
     /// Who each group change goes to (group.rs `audience`).
     audience: HashMap<Conversation, BTreeMap<EventId, BTreeSet<Person>>>,
     counters: Counters,
+    /// The helper's mail state, saved with the counters (SPEC-mailbox M15).
+    mail: Vec<u8>,
     chats: HashMap<Conversation, Open>,
     signer: Option<Signer>,
 }
@@ -272,6 +278,7 @@ impl History {
             members: HashMap::new(),
             audience: HashMap::new(),
             counters: Counters::new(me.person),
+            mail: Vec::new(),
             signer: None,
             chats: HashMap::new(),
             log_files: store.open_log()?,
@@ -285,8 +292,20 @@ impl History {
             }
         }
         if let Some(bytes) = history.log_files.index()? {
-            let bytes = unframe("the delivery counters", &bytes)?;
-            history.counters = postcard::from_bytes(bytes).map_err(|_| StoreError::Damaged)?;
+            let damaged = |_| StoreError::Damaged;
+            match bytes.split_first() {
+                Some((1, rest)) => {
+                    history.counters = postcard::from_bytes(rest).map_err(damaged)?
+                }
+                Some((&COUNTERS_FORMAT, rest)) => {
+                    (history.counters, history.mail) =
+                        postcard::from_bytes(rest).map_err(damaged)?
+                }
+                Some((&v, _)) if v > COUNTERS_FORMAT => {
+                    return Err(HistoryError::Newer("the delivery counters"));
+                }
+                _ => return Err(StoreError::Damaged.into()),
+            }
         }
         history.number_the_missed()?;
         history.load_members()?;
@@ -808,8 +827,19 @@ impl History {
 
     /// Writes the counters (after a batch of acks).
     pub fn save_counters(&self) -> Result<(), HistoryError> {
-        let bytes = framed(postcard::to_stdvec(&self.counters).expect("to memory"));
+        let mut bytes = vec![COUNTERS_FORMAT];
+        bytes.extend(postcard::to_stdvec(&(&self.counters, &self.mail)).expect("to memory"));
         Ok(self.log_files.write_index(&bytes)?)
+    }
+
+    /// The helper's mail state, as last set or saved.
+    pub fn mail_state(&self) -> &[u8] {
+        &self.mail
+    }
+
+    /// Sets the mail state, written at the next `save_counters`.
+    pub fn set_mail_state(&mut self, state: Vec<u8>) {
+        self.mail = state;
     }
 
     pub fn counter(&self, device: &Device) -> Option<u64> {
@@ -1857,7 +1887,7 @@ mod tests {
                 log.rewrite(0, |_| Some(first.clone())).unwrap();
             } else {
                 let mut counters = log.index().unwrap().unwrap();
-                newer(&mut counters);
+                counters[0] = COUNTERS_FORMAT + 1;
                 log.write_index(&counters).unwrap();
             }
             let err = History::open(&root, &KEY, ME).err().unwrap();
@@ -1939,6 +1969,65 @@ mod tests {
         let later = NOW + crate::sync::FRIEND_WAIT + 1;
         assert!(h.outgoing(&BOB.device, later).unwrap().is_empty());
         assert!(!h.is_sent(&old.id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A format 1 counters file, as the code before SPEC-mailbox M15 wrote
+    /// it: three events; the laptop acknowledged 1 and 3, Bob refused 2.
+    const COUNTERS_1: &str = "010101010101010101010101010101010101010101010101010101010101010101020b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b010101010101010101010101010101010101010101010101010101010101010101010300001414141414141414141414141414141414141414141414141414141414141414020202020202020202020202020202020202020202020202020202020202020200000000";
+
+    /// It opens with every counter as it was, and no mail state (M15).
+    #[test]
+    fn a_format_1_counters_file_opens_as_it_was() {
+        let laptop: Device = [11; 32];
+        let build = |root: &Path| {
+            let mut h = History::open(root, &KEY, ME).unwrap();
+            h.add_device(laptop, ME.person);
+            h.add_device(BOB.device, BOB.person);
+            for i in 0..3 {
+                h.send(&CHAT, text(&format!("m{i}")), NOW).unwrap();
+            }
+            h
+        };
+        let (old, now) = (dir("counters-1"), dir("counters-now"));
+        drop(build(&old));
+        let bytes: Vec<u8> = (0..COUNTERS_1.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&COUNTERS_1[i..i + 2], 16).unwrap())
+            .collect();
+        Store::new(&old, &KEY)
+            .open_log()
+            .unwrap()
+            .write_index(&bytes)
+            .unwrap();
+        let from_old = History::open(&old, &KEY, ME).unwrap();
+        let mut today = build(&now);
+        today.acked(&laptop, 1, true);
+        today.acked(&laptop, 3, true);
+        today.acked(&BOB.device, 2, false);
+        for device in [laptop, BOB.device] {
+            assert_eq!(from_old.counter(&device), today.counter(&device));
+            for n in 1..=3 {
+                assert_eq!(from_old.has_ok(&device, n), today.has_ok(&device, n));
+            }
+        }
+        assert!(from_old.mail_state().is_empty());
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(now);
+    }
+
+    /// The helper's mail state is saved with the counters (M15).
+    #[test]
+    fn mail_state_is_saved_with_the_counters() {
+        let root = dir("mail-state");
+        let mut h = History::open(&root, &KEY, ME).unwrap();
+        h.set_mail_state(b"marks".to_vec());
+        h.save_counters().unwrap();
+        drop(h);
+        assert_eq!(
+            History::open(&root, &KEY, ME).unwrap().mail_state(),
+            b"marks"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

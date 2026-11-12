@@ -161,6 +161,7 @@ impl Helper {
         let Some(store) = &self.store else { return };
         let path = self.remembered_path();
         (self.mail.remembered, self.mail.newer) = load(&path, store.data_key(), unix_now());
+        self.mail_state_load();
     }
 
     /// Writes what's remembered, unless the file is from a newer mesh-node.
@@ -389,6 +390,7 @@ impl Helper {
             self.mail.marked.remove(&mark);
         }
         self.mail_save();
+        self.mail_state_save();
         to_mail.sort_unstable_by_key(|id| id.to_bytes());
         to_mail.dedup();
         for id in to_mail {

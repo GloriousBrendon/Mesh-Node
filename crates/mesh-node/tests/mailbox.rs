@@ -1052,6 +1052,34 @@ fn a_round_the_seed_missed_goes_again() {
     p.done(logs, &["x"]);
 }
 
+/// Test 15. Alice mails Bob 20 messages and locks; she unlocks again before
+/// Bob is back, and then restarts: nothing is mailed again (M15).
+#[test]
+fn test_15_no_re_mail_on_unlock() {
+    let (p, mut alice, _, mut bob, id_b) = friends("mail15", true);
+    locks(&mut bob);
+    for i in 1..=20 {
+        ask(
+            &mut alice,
+            "dmSend",
+            &[&id_b, &format!("t{i}")],
+            "meshDmMessages",
+        );
+    }
+    locks(&mut alice);
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    let first = alice.quit();
+    assert_eq!(mailed(&first), 20, "mailed once");
+    let mut alice = again(&p.dirs[1], &p.relay, &p.alice_seeds(), "alice", 0);
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    let restarted = alice.quit();
+    assert_eq!(mailed(&restarted), 0, "nothing again after a restart");
+    p.done(vec![first, restarted, bob.quit()], &["t1", "t20"]);
+}
+
 /// Test 16. A group of Alice, Bob and Dave, made by Alice. Bob locks. Over
 /// five days Dave sends "d1" to "d5", mailed to Bob, and locks; Alice sees
 /// each. Alice removes Dave and locks. Bob collects all six in one

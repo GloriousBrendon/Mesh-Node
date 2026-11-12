@@ -14,9 +14,8 @@
 
 // ponytail: our only holder is the first `--seed`, and mail goes to the
 // first holder a reader's record names (Task 12: the next on failure, and
-// `--holder`); marks, `mseq`s and `failed` backoffs live in memory (Task 11
-// saves them); friends' devices only (Task 13 adds our own). When we last
-// renewed lives in memory too, so a restart renews at its first unlock.
+// `--holder`); friends' devices only (Task 13 adds our own). When we last
+// renewed lives in memory, so a restart renews at its first unlock.
 
 use super::*;
 use crate::mailstore;
@@ -25,6 +24,17 @@ use mesh_identity::{PairKeys, VerifyingKey, mail_collect_tag, week_of};
 use std::collections::BTreeMap;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
+
+/// The format of the mail state saved with dm's counters (M15).
+const MAIL_STATE_FORMAT: u8 = 1;
+
+/// What's saved with dm's counters (M15): `seq`, `sent`, `marked`, `retry`.
+type State = (
+    HashMap<[u8; 32], u64>,
+    HashMap<([u8; 32], u64), u64>,
+    HashMap<([u8; 32], u64), (String, u64)>,
+    HashMap<([u8; 32], u64), (u32, u64)>,
+);
 
 /// Lock and quit wait this long for puts under way (mailbox *Limits*).
 pub(super) const MAIL_FLUSH: Duration = Duration::from_secs(3);
@@ -56,8 +66,11 @@ pub(super) struct Mail {
     /// Events already mailed to a device, so they aren't put again (M15):
     /// by device and event number, the holder and time of the put.
     pub(super) marked: HashMap<([u8; 32], u64), (String, u64)>,
-    /// Puts under way, which lock and quit wait for.
-    pending: Vec<JoinHandle<()>>,
+    /// Puts under way, which lock and quit wait for: whether the seed took
+    /// them, and what they put.
+    pending: Vec<(JoinHandle<bool>, Vec<Put>)>,
+    /// The saved state is from a newer mesh-node: never write it.
+    state_newer: bool,
     /// The unlock's collect hasn't come back: live sending waits for it.
     pub(super) collecting: bool,
     /// When we last claimed every box and the seed answered (0: not since
@@ -108,6 +121,30 @@ pub(super) struct Found {
 }
 
 impl Mail {
+    /// What's saved with dm's counters (M15).
+    fn state(&self) -> Vec<u8> {
+        let state = (&self.seq, &self.sent, &self.marked, &self.retry);
+        let mut bytes = vec![MAIL_STATE_FORMAT];
+        bytes.extend(postcard::to_allocvec(&state).expect("to memory"));
+        bytes
+    }
+
+    /// Reads a saved state back: false if it was damaged (nothing read),
+    /// `Err` if it's from a newer mesh-node. Nothing saved is nothing to read.
+    fn read_state(&mut self, bytes: &[u8]) -> Result<bool, ()> {
+        let state = match bytes.split_first() {
+            None => return Ok(true),
+            Some((&MAIL_STATE_FORMAT, rest)) => postcard::from_bytes::<State>(rest).ok(),
+            Some((&v, _)) if v > MAIL_STATE_FORMAT => return Err(()),
+            Some(_) => None,
+        };
+        let Some((seq, sent, marked, retry)) = state else {
+            return Ok(false);
+        };
+        (self.seq, self.sent, self.marked, self.retry) = (seq, sent, marked, retry);
+        Ok(true)
+    }
+
     /// The next `mseq` for a reader device: always higher than the last,
     /// and than any before a restart, since it starts from the clock.
     fn next_seq(&mut self, reader: [u8; 32]) -> u64 {
@@ -307,20 +344,21 @@ impl Helper {
         }
         let count: usize = puts.values().map(|(p, _)| p.len()).sum();
         eprintln!("mesh-node: mailed {count} events");
-        self.mail.pending.retain(|h| !h.is_finished());
+        self.mail.pending.retain(|(h, _)| !h.is_finished());
         for (holder, (sealed, numbers_put)) in puts {
-            let (anon, back) = (anon.clone(), self.back.clone());
-            self.mail.pending.push(tokio::spawn(async move {
+            let (anon, back, put) = (anon.clone(), self.back.clone(), numbers_put.clone());
+            let handle = tokio::spawn(async move {
                 let taken = match MeshAddr::from_ticket(&holder) {
                     Ok(seed) => seed::ask_many(&anon, &seed, seed::MAIL_PUT, &sealed)
                         .await
                         .is_ok_and(|a| a.iter().all(|a| a == &[mailstore::Answer::Ok as u8])),
                     Err(_) => false,
                 };
-                if !taken {
-                    let _ = back.send(Back::MailUnput(numbers_put));
-                }
-            }));
+                // Answered: the marks are saved, less what wasn't taken.
+                let _ = back.send(Back::MailUnput(if taken { Vec::new() } else { put }));
+                taken
+            });
+            self.mail.pending.push((handle, numbers_put));
         }
     }
 
@@ -334,9 +372,17 @@ impl Helper {
         }
     }
 
-    /// A put didn't go through: those events may be mailed again.
-    pub(super) fn mail_unput(&mut self, puts: Vec<([u8; 32], u64, u64)>) {
-        eprintln!("mesh-node: {} mailed events weren't taken", puts.len());
+    /// A put was answered: what it didn't take may be mailed again; the
+    /// marks are saved.
+    pub(super) fn mail_unput(&mut self, puts: Vec<Put>) {
+        if !puts.is_empty() {
+            eprintln!("mesh-node: {} mailed events weren't taken", puts.len());
+        }
+        self.unmark(puts);
+        self.mail_state_save();
+    }
+
+    fn unmark(&mut self, puts: Vec<Put>) {
         for (device, mseq, number) in puts {
             self.mail.sent.remove(&(device, mseq));
             self.mail.marked.remove(&(device, number));
@@ -344,12 +390,44 @@ impl Helper {
     }
 
     /// At lock and quit: mail what waits, then let the puts finish, up to
-    /// `MAIL_FLUSH`.
+    /// `MAIL_FLUSH`, and save the marks: a put not answered by then isn't
+    /// marked, so it's mailed again rather than lost (the reader shows it
+    /// once).
     pub(super) async fn mail_flush(&mut self) {
         self.mail_out_all();
         let deadline = tokio::time::Instant::now() + MAIL_FLUSH;
-        for put in std::mem::take(&mut self.mail.pending) {
-            let _ = tokio::time::timeout_at(deadline, put).await;
+        for (put, numbers) in std::mem::take(&mut self.mail.pending) {
+            if !matches!(tokio::time::timeout_at(deadline, put).await, Ok(Ok(true))) {
+                self.unmark(numbers);
+            }
+        }
+        self.mail_state_save();
+    }
+
+    /// At unlock: the mail state saved with dm's counters (M15).
+    pub(super) fn mail_state_load(&mut self) {
+        let Some(history) = &self.dm else { return };
+        let read = self.mail.read_state(history.mail_state());
+        match read {
+            Ok(true) => {}
+            Ok(false) => eprintln!("mesh-node: the mail state was damaged; it starts empty"),
+            Err(()) => {
+                eprintln!(
+                    "mesh-node: the mail state is from a newer mesh-node; it's left as it is"
+                );
+                self.mail.state_newer = true;
+            }
+        }
+    }
+
+    /// Saves the mail state with dm's counters, once per batch (M15).
+    pub(super) fn mail_state_save(&mut self) {
+        let Some(history) = self.dm.as_mut().filter(|_| !self.mail.state_newer) else {
+            return;
+        };
+        history.set_mail_state(self.mail.state());
+        if let Err(e) = history.save_counters() {
+            eprintln!("mesh-node: couldn't save the delivery counters: {e}");
         }
     }
 
@@ -651,29 +729,26 @@ impl Helper {
         if opened_count > 0 {
             eprintln!("mesh-node: {opened_count} mailed events collected");
         }
-        if acked {
-            if let Some(history) = &self.dm
-                && let Err(e) = history.save_counters()
-            {
-                eprintln!("mesh-node: couldn't save the delivery counters: {e}");
-            }
-            if let Some(open) = self.dm_open {
-                let _ = self.emit_page(&open, None);
-            }
+        // Receipts moved counters, marks and backoffs: one save for them.
+        self.mail_state_save();
+        if acked && let Some(open) = self.dm_open {
+            let _ = self.emit_page(&open, None);
         }
         if let (Some(net), Some(seed)) = (&self.net, self.seeds.first())
             && !(receipts.is_empty() && takes.is_empty())
         {
             let (anon, seed) = (net.anon.clone(), seed.clone());
-            self.mail.pending.retain(|h| !h.is_finished());
-            self.mail.pending.push(tokio::spawn(async move {
+            self.mail.pending.retain(|(h, _)| !h.is_finished());
+            let handle = tokio::spawn(async move {
                 for (holder, receipts) in receipts {
                     if let Ok(holder) = MeshAddr::from_ticket(&holder) {
                         let _ = seed::ask_many(&anon, &holder, seed::MAIL_PUT, &receipts).await;
                     }
                 }
                 let _ = seed::ask_many(&anon, &seed, seed::MAIL_TAKE, &takes).await;
-            }));
+                true
+            });
+            self.mail.pending.push((handle, Vec::new()));
         }
         // Now what waited for the collect goes live.
         let ids: Vec<MeshId> = (self.store.iter())
@@ -856,6 +931,52 @@ type Unsealed = (MailHead, Vec<u8>);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Marks, `mseq`s and backoffs read back after a restart (M15), so a
+    /// couldn't-open's wait (fix 1) holds across it.
+    #[test]
+    fn the_mail_state_reads_back() {
+        let mut mail = Mail::default();
+        let seq = mail.next_seq([1; 32]);
+        mail.sent.insert(([1; 32], seq), 7);
+        mail.marked.insert(([1; 32], 7), ("holder".into(), 100));
+        mail.retry.insert(([1; 32], 8), (2, 1900));
+        let mut back = Mail::default();
+        assert_eq!(back.read_state(&mail.state()), Ok(true));
+        assert_eq!(back.seq, mail.seq);
+        assert_eq!(back.sent, mail.sent);
+        assert_eq!(back.marked, mail.marked);
+        assert_eq!(back.retry, mail.retry);
+        let mut newer = mail.state();
+        newer[0] = MAIL_STATE_FORMAT + 1;
+        assert_eq!(back.read_state(&newer), Err(()));
+        assert_eq!(
+            Mail::default().read_state(&[MAIL_STATE_FORMAT, 9]),
+            Ok(false)
+        );
+    }
+
+    /// A crash between a put and the save: the state saved before has no
+    /// mark, so the event is mailed once more; once that put is answered
+    /// and saved, it's marked, so never a third time (M15).
+    #[test]
+    fn a_crash_before_the_save_mails_once_more_at_most() {
+        let mut mail = Mail::default();
+        let before = mail.state();
+        mail.marked.insert(([1; 32], 7), ("holder".into(), 100));
+        // Crash: what's read back is `before`.
+        let mut again = Mail::default();
+        again.read_state(&before).unwrap();
+        assert!(
+            !again.marked.contains_key(&([1; 32], 7)),
+            "mailed once more"
+        );
+        again.marked.insert(([1; 32], 7), ("holder".into(), 200));
+        let saved = again.state();
+        let mut after = Mail::default();
+        after.read_state(&saved).unwrap();
+        assert!(after.marked.contains_key(&([1; 32], 7)), "and not again");
+    }
 
     #[test]
     fn mseq_only_goes_up() {
