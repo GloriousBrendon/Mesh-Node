@@ -28,6 +28,7 @@ pub use code::{
 };
 pub use contacts::{Contact, LastAddr, MAX_CONTACT_NAME, MAX_CONTACTS};
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
+pub use ed25519_dalek::VerifyingKey;
 pub use id::{DeviceKey, IdError, Link, MeshId, RootKey, verify_device};
 pub use keystore::{KdfParams, Keystore, KeystoreError, unix_now, write_atomically};
 pub use knock::{
@@ -38,7 +39,7 @@ pub use link::{
     LINK_CODE_LIFETIME, LinkError, LinkInitiator, LinkRendezvous, LinkResponder, LinkedIdentity,
     PendingDevice,
 };
-pub use pair::{PairKeys, day_of};
+pub use pair::{PairKeys, day_of, week_of};
 pub use password::{
     MAX_USERNAME_LEN, MIN_PASSWORD_LEN, PasswordVerdict, check_password, normalize_username,
     valid_username,

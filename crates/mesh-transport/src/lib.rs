@@ -37,6 +37,16 @@ impl MeshAddr {
         })
     }
 
+    /// A device key alone, with no relay or address: who sent something
+    /// that came another way (mail). `None` if it isn't a valid key.
+    pub fn from_device(device: &[u8; 32]) -> Option<Self> {
+        Some(Self {
+            device: iroh::PublicKey::from_bytes(device).ok()?,
+            relay: None,
+            direct: Vec::new(),
+        })
+    }
+
     fn endpoint_addr(&self) -> iroh::EndpointAddr {
         let mut addr = iroh::EndpointAddr::new(self.device);
         if let Some(relay) = &self.relay {

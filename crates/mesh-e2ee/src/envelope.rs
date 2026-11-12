@@ -200,6 +200,66 @@ pub(crate) fn seal_with(
     Ok(out)
 }
 
+/// The mail wrapper's format (SPEC-mailbox M7, *Formats*).
+pub const MAIL_FORMAT: u8 = 1;
+/// A mail wrapper's kind: mail, or a receipt (mailbox M9).
+pub const MAIL: u8 = 1;
+pub const RECEIPT: u8 = 2;
+const MAIL_HEAD: usize = 1 + 32 + 1 + 8;
+
+/// What the mail wrapper says, inside the seal, before Olm opens anything:
+/// the sender's device, the kind and the mail sequence number (M7).
+// ponytail: no pair tag yet; PLAN-mailbox Task 8 adds it before anything ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailHead {
+    pub sender: [u8; 32],
+    pub kind: u8,
+    pub mseq: u64,
+}
+
+/// Seals `body` (an envelope, or a receipt's lists) as mail for `reader`,
+/// behind the holder's `address` (box and slot).
+///
+/// ```text
+/// inside = format u8 | sender device [32] | kind u8 | mseq u64 | body
+/// ```
+pub fn seal_mail(
+    reader: &VerifyingKey,
+    address: &[u8],
+    head: &MailHead,
+    body: &[u8],
+) -> Result<Vec<u8>, E2eeError> {
+    let mut inside = Vec::with_capacity(MAIL_HEAD + body.len());
+    inside.push(MAIL_FORMAT);
+    inside.extend_from_slice(&head.sender);
+    inside.push(head.kind);
+    inside.extend_from_slice(&head.mseq.to_be_bytes());
+    inside.extend_from_slice(body);
+    seal_for(reader, address, &inside)
+}
+
+/// Opens mail sealed to this device: its head and body. A newer format, or
+/// a kind we don't know, is `Malformed`.
+pub fn open_mail(
+    device: &DeviceKey,
+    address_len: usize,
+    bytes: &[u8],
+) -> Result<(MailHead, Vec<u8>), E2eeError> {
+    let inside = open_sealed(device, address_len, bytes)?;
+    if inside.len() < MAIL_HEAD || inside[0] != MAIL_FORMAT {
+        return Err(E2eeError::Malformed);
+    }
+    let head = MailHead {
+        sender: inside[1..33].try_into().expect("32 bytes"),
+        kind: inside[33],
+        mseq: u64::from_be_bytes(inside[34..42].try_into().expect("8 bytes")),
+    };
+    if ![MAIL, RECEIPT].contains(&head.kind) {
+        return Err(E2eeError::Malformed);
+    }
+    Ok((head, inside[MAIL_HEAD..].to_vec()))
+}
+
 /// Opens a sealed envelope with this device's key. The first `address_len`
 /// bytes are the carrier's address.
 pub fn open_sealed(
@@ -296,6 +356,32 @@ mod tests {
         }
         assert!(Envelope::from_bytes(&[1, 4, 0]).is_err());
         assert!(Envelope::from_bytes(&[2, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn mail_round_trip_and_formats() {
+        let reader = DeviceKey::generate().unwrap();
+        let head = MailHead {
+            sender: [5; 32],
+            kind: MAIL,
+            mseq: 12,
+        };
+        let address = [9u8; 24];
+        let sealed = seal_mail(&reader.public(), &address, &head, b"olm").unwrap();
+        assert!(sealed.starts_with(&address));
+        assert_eq!(open_mail(&reader, 24, &sealed), Ok((head, b"olm".to_vec())));
+        // Someone else's device can't open it; a moved address breaks it.
+        let other = DeviceKey::generate().unwrap();
+        assert_eq!(open_mail(&other, 24, &sealed), Err(E2eeError::NotForUs));
+        let mut moved = sealed.clone();
+        moved[0] ^= 1;
+        assert_eq!(open_mail(&reader, 24, &moved), Err(E2eeError::NotForUs));
+        // A newer format, or an unknown kind, is refused.
+        let newer = seal_for(&reader.public(), &address, &[MAIL_FORMAT + 1; 50]).unwrap();
+        assert_eq!(open_mail(&reader, 24, &newer), Err(E2eeError::Malformed));
+        let odd = MailHead { kind: 9, ..head };
+        let odd = seal_mail(&reader.public(), &address, &odd, b"").unwrap();
+        assert_eq!(open_mail(&reader, 24, &odd), Err(E2eeError::Malformed));
     }
 
     #[test]

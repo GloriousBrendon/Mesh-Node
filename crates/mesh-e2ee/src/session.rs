@@ -626,6 +626,13 @@ impl E2ee {
         !self.reachable_of(id).is_empty()
     }
 
+    /// The device keys of `id`'s devices we can encrypt to.
+    pub fn device_keys(&self, id: &MeshId) -> Vec<[u8; 32]> {
+        (self.reachable_of(id).iter())
+            .map(|(_, device)| device.to_bytes())
+            .collect()
+    }
+
     /// How many of `id`'s devices we can encrypt to.
     pub fn devices_known(&self, id: &MeshId) -> usize {
         self.reachable_of(id).len()

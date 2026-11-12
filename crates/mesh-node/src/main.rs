@@ -12,13 +12,14 @@
 //! machine with a public address, `--port <udp>` fixes its port and
 //! `--public <ip:port>` puts that address in its ticket, so callers reach it
 //! direct (D8c). `--report-every <secs>` shortens the hourly counts, for
-//! tests.
+//! tests. `--mail` turns on the mail services (SPEC-mailbox; off by default).
 
 mod addrs;
 mod codes;
 mod e2ee;
 mod helper;
 mod knocks;
+mod mailstore;
 mod routing;
 mod saved;
 mod seed;
@@ -156,6 +157,7 @@ fn seed_options(args: &[String]) -> Result<seed::Options, String> {
         port,
         public,
         report,
+        mail: args.iter().any(|a| a == "--mail"),
     })
 }
 

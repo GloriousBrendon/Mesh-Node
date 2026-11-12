@@ -11,7 +11,8 @@ mod store;
 
 pub use bundle::{Bundle, MAX_BUNDLE_LEN};
 pub use envelope::{
-    Envelope, EnvelopeType, Inside, Kind, MAX_BODY, MAX_INSIDE, open_sealed, seal_for,
+    Envelope, EnvelopeType, Inside, Kind, MAIL, MAIL_FORMAT, MAX_BODY, MAX_INSIDE, MailHead,
+    RECEIPT, open_mail, open_sealed, seal_for, seal_mail,
 };
 pub use group::{Deliveries, MAX_MEMBERS, ROTATE_AFTER, ROTATE_MESSAGES, WAIT_FOR_KEY};
 pub use session::{

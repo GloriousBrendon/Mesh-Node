@@ -174,38 +174,14 @@ impl Helper {
     /// One device's next batch, if none is in flight to it.
     pub(super) fn dm_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
         let device = *addr.device.as_bytes();
-        let own = self.store.as_ref().is_some_and(|s| s.id() == *id);
-        let (Some(history), Some(e2ee), Some(net)) = (&mut self.dm, &mut self.e2ee, &self.net)
-        else {
-            return;
-        };
-        if self.dm_flight.contains(&device) {
+        // Mail is collected first at unlock (mailbox *Opening mail* 1).
+        if self.dm_flight.contains(&device) || self.net.is_none() || self.mail.collecting {
             return;
         }
-        history.add_device(device, id.to_bytes());
-        let mut out = match history.outgoing(&device, unix_now() * 1000) {
-            Ok(out) => out,
-            Err(e) => return eprintln!("mesh-node: couldn't read the chat history: {e}"),
-        };
-        out.truncate(e2ee::MAX_FRAMES);
-        if out.is_empty() {
+        let Some((numbers, envelopes)) = self.dm_batch(id, device, |_| false) else {
             return;
-        }
-        // Our own devices get each event with its chat and author (D8); a
-        // friend's, with its group if it's in one (e2ee D6).
-        let bodies: Vec<Vec<u8>> = if own {
-            out.iter().map(mesh_dm::history::forward).collect()
-        } else {
-            out.iter()
-                .map(|t| mesh_dm::history::to_friend(&t.at, &t.event))
-                .collect()
         };
-        let sealed = e2ee.encrypt_device_batch(id, &device, NoteKind::Message, &bodies);
-        let envelopes = match sealed {
-            Ok(envelopes) => envelopes,
-            Err(e) => return eprintln!("mesh-node: couldn't encrypt for a device: {e}"),
-        };
-        let numbers: Vec<u64> = out.iter().map(|t| t.number).collect();
+        let Some(net) = &self.net else { return };
         self.dm_flight.insert(device);
         let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
         tokio::spawn(async move {
@@ -219,6 +195,51 @@ impl Helper {
             };
             let _ = back.send(Back::DmAnswered(Box::new((id, addr, numbers, answers))));
         });
+    }
+
+    /// What `device` of `id`'s hasn't acknowledged, but for what `skip`
+    /// names, encrypted for it: the events' numbers and envelopes.
+    pub(super) fn dm_batch(
+        &mut self,
+        id: &MeshId,
+        device: [u8; 32],
+        skip: impl Fn(u64) -> bool,
+    ) -> Option<(Vec<u64>, Vec<Vec<u8>>)> {
+        let own = self.store.as_ref().is_some_and(|s| s.id() == *id);
+        let (Some(history), Some(e2ee)) = (&mut self.dm, &mut self.e2ee) else {
+            return None;
+        };
+        history.add_device(device, id.to_bytes());
+        let mut out = match history.outgoing(&device, unix_now() * 1000) {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("mesh-node: couldn't read the chat history: {e}");
+                return None;
+            }
+        };
+        out.retain(|t| !skip(t.number));
+        out.truncate(e2ee::MAX_FRAMES);
+        if out.is_empty() {
+            return None;
+        }
+        // Our own devices get each event with its chat and author (D8); a
+        // friend's, with its group if it's in one (e2ee D6).
+        let bodies: Vec<Vec<u8>> = if own {
+            out.iter().map(mesh_dm::history::forward).collect()
+        } else {
+            out.iter()
+                .map(|t| mesh_dm::history::to_friend(&t.at, &t.event))
+                .collect()
+        };
+        let sealed = e2ee.encrypt_device_batch(id, &device, NoteKind::Message, &bodies);
+        let envelopes = match sealed {
+            Ok(envelopes) => envelopes,
+            Err(e) => {
+                eprintln!("mesh-node: couldn't encrypt for a device: {e}");
+                return None;
+            }
+        };
+        Some((out.iter().map(|t| t.number).collect(), envelopes))
     }
 
     /// A device answered a batch (or didn't): move its counter, and send
@@ -377,7 +398,7 @@ impl Helper {
 
     /// `meshDmMessages` for one chat: its newest page, or the page before
     /// `before`.
-    fn emit_page(&mut self, at: &Where, before: Option<EventId>) -> Result<(), Fail> {
+    pub(super) fn emit_page(&mut self, at: &Where, before: Option<EventId>) -> Result<(), Fail> {
         let me = self.unlocked()?.id().to_bytes();
         let history = self.dm.as_mut().ok_or_else(|| dm_fail("not open"))?;
         let (page, more) = history
@@ -507,6 +528,7 @@ impl Helper {
         }
         for person in self.dm_recipients(at) {
             self.dm_deliver(&person);
+            self.mail_out(&person);
         }
         if let Some(me) = self.store.as_ref().map(Keystore::id) {
             self.dm_deliver(&me);

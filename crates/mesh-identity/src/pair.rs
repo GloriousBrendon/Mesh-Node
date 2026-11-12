@@ -16,6 +16,15 @@ const SLOT_CONTEXT: &str = "mesh/v1/pair-slot";
 const RECORD_KEY_CONTEXT: &str = "mesh/v1/pair-record-key";
 const KNOCK_SLOT_CONTEXT: &str = "mesh/v1/knock-slot";
 const CONVERSATION_CONTEXT: &str = "mesh/v1/dm-conversation";
+const MAIL_BOX_CONTEXT: &str = "mesh/v1/mail-box";
+const MAIL_SLOT_CONTEXT: &str = "mesh/v1/mail-slot";
+/// A mail week (SPEC-mailbox M5): unix days / 7.
+const WEEK: u64 = 7 * DAY;
+
+/// The mail week a unix time falls in.
+pub fn week_of(unix: u64) -> u64 {
+    unix / WEEK
+}
 const DAY: u64 = 86_400;
 
 /// The UTC day a unix time falls in.
@@ -69,6 +78,26 @@ impl PairKeys {
         hash.as_bytes()[..16].try_into().expect("16 bytes")
     }
 
+    /// The box `reader`'s mail from this pair sits in, in `week`
+    /// (SPEC-mailbox M5).
+    pub fn mail_box(&self, reader: &MeshId, week: u64) -> [u8; 16] {
+        let hash = self
+            .hasher(MAIL_BOX_CONTEXT)
+            .update(&reader.to_bytes())
+            .update(&week.to_be_bytes())
+            .finalize();
+        hash.as_bytes()[..16].try_into().expect("16 bytes")
+    }
+
+    /// `device`'s slot in this pair's boxes.
+    pub fn mail_slot(&self, device: &VerifyingKey) -> [u8; 8] {
+        let hash = self
+            .hasher(MAIL_SLOT_CONTEXT)
+            .update(device.as_bytes())
+            .finalize();
+        hash.as_bytes()[..8].try_into().expect("8 bytes")
+    }
+
     pub(crate) fn record_key(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(*self.hasher(RECORD_KEY_CONTEXT).finalize().as_bytes())
     }
@@ -117,6 +146,35 @@ mod tests {
         assert_ne!(
             keys.lookup(&alice.id(), day),
             keys.lookup(&alice.id(), day + 1)
+        );
+    }
+
+    #[test]
+    fn mail_boxes_are_the_pairs_alone_and_change_weekly() {
+        let (alice, bob, eve) = (
+            RootKey::generate().unwrap(),
+            RootKey::generate().unwrap(),
+            RootKey::generate().unwrap(),
+        );
+        let ab = PairKeys::new(&alice, &bob.id()).unwrap();
+        let ba = PairKeys::new(&bob, &alice.id()).unwrap();
+        let eb = PairKeys::new(&eve, &bob.id()).unwrap();
+        let device = DeviceKey::generate().unwrap().public();
+        let week = week_of(1_800_000_000);
+        assert_eq!(week_of(7 * 86_400 - 1), 0);
+        assert_eq!(week_of(7 * 86_400), 1);
+        assert_eq!(ab.mail_box(&bob.id(), week), ba.mail_box(&bob.id(), week));
+        assert_eq!(ab.mail_slot(&device), ba.mail_slot(&device));
+        assert_ne!(ab.mail_box(&bob.id(), week), ab.mail_box(&alice.id(), week));
+        assert_ne!(
+            ab.mail_box(&bob.id(), week),
+            ab.mail_box(&bob.id(), week + 1)
+        );
+        assert_ne!(ab.mail_box(&bob.id(), week), eb.mail_box(&bob.id(), week));
+        assert_ne!(
+            ab.mail_slot(&device),
+            ab.slot(&device),
+            "not the record slot"
         );
     }
 }

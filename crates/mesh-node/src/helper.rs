@@ -56,6 +56,8 @@ mod dm;
 mod files;
 #[path = "link.rs"]
 mod link;
+#[path = "mail.rs"]
+mod mail;
 #[path = "social.rs"]
 mod social;
 use social::{
@@ -213,6 +215,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             }
             _ = refresh.tick() => {
                 helper.dm_retry_all();
+                helper.mail_out_all();
                 helper.publish();
                 helper.dial_contacts();
                 helper.sync_own();
@@ -245,6 +248,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
         }
         line.zeroize();
     }
+    helper.mail_flush().await;
     helper.stop_net().await;
 }
 
@@ -304,6 +308,8 @@ struct Helper {
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
+    /// Mail's marks and puts under way (SPEC-mailbox).
+    mail: mail::Mail,
 }
 
 struct Net {
@@ -379,6 +385,10 @@ enum Back {
     Requested(MeshId),
     /// What the seeds hold for our codes.
     Collected(Vec<Collected>),
+    /// What the unlock's mail collect found (mailbox).
+    MailFound(Vec<mail::Found>),
+    /// Mail a seed didn't take: reader device, `mseq`, event number.
+    MailUnput(Vec<([u8; 32], u64, u64)>),
     /// Another of our devices sent its account state.
     Synced(Box<(Account, MeshAddr)>),
     /// A device of someone's said what it shows, or went quiet.
@@ -421,6 +431,7 @@ impl Helper {
             dm_retry: HashMap::new(),
             dm_open: None,
             typing_last: HashMap::new(),
+            mail: mail::Mail::default(),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -455,6 +466,7 @@ impl Helper {
                 self.start_net().await;
             }
             "idLock" => {
+                self.mail_flush().await;
                 self.store = None;
                 self.link = None;
                 self.stop_net().await;
@@ -973,6 +985,8 @@ impl Helper {
                 }
                 return self.emit_social(None);
             }
+            Back::MailFound(found) => return self.mail_found(found),
+            Back::MailUnput(puts) => return self.mail_unput(puts),
             Back::Connected(id) => {
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
@@ -1513,6 +1527,7 @@ impl Helper {
                 self.update_shown();
                 self.hold_codes(false);
                 self.collect();
+                self.mail_collect();
             }
             Err(e) => eprintln!("mesh-node: networking didn't start: {e}"),
         }
