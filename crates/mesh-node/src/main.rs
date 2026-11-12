@@ -12,7 +12,9 @@
 //! machine with a public address, `--port <udp>` fixes its port and
 //! `--public <ip:port>` puts that address in its ticket, so callers reach it
 //! direct (D8c). `--report-every <secs>` shortens the hourly counts, for
-//! tests. `--mail` turns on the mail services (SPEC-mailbox; off by default).
+//! tests. `--mail` turns on the mail services (SPEC-mailbox; off by default);
+//! `--mail-token <secret>` closes them to anyone without it, and
+//! `--mail-max <bytes>` caps what they hold (2 GiB by default).
 //!
 //! `--clock-offset <secs>`, on either, moves the process's clock, for tests
 //! only (SPEC-mailbox), as `--record-ttl` is.
@@ -175,7 +177,31 @@ fn seed_options(args: &[String]) -> Result<seed::Options, String> {
         public,
         report,
         mail: args.iter().any(|a| a == "--mail"),
+        mail_settings: mail_settings(value("--mail-token"), value("--mail-max"))?,
     })
+}
+
+/// `--mail-token` (letters, digits, `-` and `_`, 16 to 64 of them, so it
+/// fits a ticket) and `--mail-max` (bytes).
+fn mail_settings(token: Option<&str>, max: Option<&str>) -> Result<mailstore::Settings, String> {
+    let token = token
+        .map(|t| {
+            let fits = (16..=mailstore::MAX_TOKEN).contains(&t.len())
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            fits.then(|| t.as_bytes().to_vec())
+                .ok_or("--mail-token takes 16 to 64 letters, digits, - or _")
+        })
+        .transpose()?;
+    let max = match max {
+        None => mailstore::MAIL_STORE_MAX,
+        Some(m) => m
+            .parse::<u64>()
+            .ok()
+            .filter(|&m| m > 0)
+            .ok_or("--mail-max takes bytes")?,
+    };
+    Ok(mailstore::Settings { token, max })
 }
 
 /// Our relay (on the homelab, SPEC-seed D5), then n0's. iroh makes whichever

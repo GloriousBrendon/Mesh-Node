@@ -25,6 +25,9 @@ use zeroize::Zeroizing;
 pub(super) const MAIL_FLUSH: Duration = Duration::from_secs(3);
 /// A holder silent this long is skipped (mailbox M10).
 pub(super) const HOLDER_WAIT: Duration = Duration::from_secs(10);
+/// The token a claim or put to an open seed carries: none.
+// ponytail: closed seeds' tokens from their tickets come with Task 12.
+const OPEN: [u8; 1] = [0];
 /// A box and slot, as the seed names a slot.
 const ADDRESS: usize = mailstore::BOX + mailstore::SLOT;
 
@@ -141,7 +144,7 @@ impl Helper {
                 self.mail.sent.insert((device, mseq), number);
                 self.mail.marked.insert((device, number));
                 numbers_put.push((device, mseq, number));
-                puts.push(sealed);
+                puts.push([&OPEN[..], &sealed].concat());
             }
         }
         if puts.is_empty() {
@@ -203,7 +206,7 @@ impl Helper {
                 let at = mail_address(&keys, &me, &device);
                 let mail_box = at[..mailstore::BOX].try_into().expect("16 bytes");
                 let secret = store.device_key().mail_collect_secret(&mail_box);
-                let claim = [&at[..], &mail_collect_tag(&secret), &expiry].concat();
+                let claim = [&OPEN[..], &at, &mail_collect_tag(&secret), &expiry].concat();
                 out.push((contact.id(), at, secret, claim));
             }
         }
@@ -330,7 +333,7 @@ impl Helper {
                     mseq: 0,
                 };
                 if let Ok(receipt) = seal_mail(&from_key, &at, &head, &receipt_body(&oks)) {
-                    receipts.push(receipt);
+                    receipts.push([&OPEN[..], &receipt].concat());
                 }
             }
         }

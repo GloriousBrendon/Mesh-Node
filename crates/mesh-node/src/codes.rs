@@ -226,18 +226,34 @@ impl Window {
     /// Counts one for every key if each is still under its limit; otherwise
     /// counts nothing.
     pub(crate) fn allow(&mut self, now: u64, length: u64, keys: &[(Vec<u8>, u32)]) -> bool {
+        self.allow_by(now, length, keys, 1)
+    }
+
+    /// As `allow`, counting `amount` (bytes in KiB, say) instead of one.
+    pub(crate) fn allow_by(
+        &mut self,
+        now: u64,
+        length: u64,
+        keys: &[(Vec<u8>, u32)],
+        amount: u32,
+    ) -> bool {
         if now >= self.started + length {
             self.started = now;
             self.counts.clear();
         }
-        if keys
-            .iter()
-            .any(|(key, limit)| self.counts.get(key).copied().unwrap_or(0) >= *limit)
-        {
+        if keys.iter().any(|(key, limit)| {
+            self.counts
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(amount)
+                > *limit
+        }) {
             return false;
         }
         for (key, _) in keys {
-            *self.counts.entry(key.clone()).or_default() += 1;
+            let count = self.counts.entry(key.clone()).or_default();
+            *count = count.saturating_add(amount);
         }
         true
     }

@@ -62,6 +62,8 @@ pub struct Options {
     pub report: Duration,
     /// The mail services are on (`--mail`; off by default).
     pub mail: bool,
+    /// `--mail-token` and `--mail-max` (mailbox M14, *Limits*).
+    pub mail_settings: mailstore::Settings,
 }
 
 /// What the hourly log line reports.
@@ -175,9 +177,17 @@ pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), Str
         addrs: Arc::new(Mutex::new(addrs)),
         knocks: Arc::new(Mutex::new(knocks)),
         mail: if options.mail {
-            let mail = mailstore::Store::open(&dir.join(MAIL_DIR), unix_now())
-                .map_err(|e| format!("the mail store didn't open: {e}"))?;
+            let closed = options.mail_settings.token.is_some();
+            let mail =
+                mailstore::Store::open(&dir.join(MAIL_DIR), unix_now(), options.mail_settings)
+                    .map_err(|e| format!("the mail store didn't open: {e}"))?;
             eprintln!("mesh-node seed: holding {} envelopes of mail", mail.len());
+            if closed {
+                // The token is a secret: it never goes in the log.
+                eprintln!(
+                    "mesh-node seed: mail is closed; friends need the ticket with &mail=<your token> added"
+                );
+            }
             Some(Arc::new(Mutex::new(mail)))
         } else {
             None
@@ -321,20 +331,20 @@ async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
             MAIL_CLAIM | MAIL_PUT | MAIL_GET | MAIL_TAKE if stores.mail.is_some() => {
                 let mail = stores.mail.clone().expect("checked");
                 let service = stream.service.clone();
-                tokio::spawn(answer_batch(stream, move |_, request, now| {
+                tokio::spawn(answer_batch(stream, move |caller, request, now| {
                     let mut mail = lock(&mail);
                     match service.as_str() {
                         MAIL_CLAIM => {
                             count(&counts.mail_claims);
-                            vec![mail.claim(request, now) as u8]
+                            vec![mail.claim(caller, request, now) as u8]
                         }
                         MAIL_PUT => {
                             count(&counts.mail_puts);
-                            vec![mail.put(request, now) as u8]
+                            vec![mail.put(caller, request, now) as u8]
                         }
                         MAIL_GET => {
                             count(&counts.mail_gets);
-                            mail.get(request, now)
+                            mail.get(caller, request, now)
                         }
                         _ => {
                             count(&counts.mail_takes);

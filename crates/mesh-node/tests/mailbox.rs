@@ -227,6 +227,130 @@ fn now() -> u64 {
 const OK: u8 = 0;
 const NO_BOX: u8 = 2;
 const TAKEN: u8 = 3;
+const FULL: u8 = 4;
+const SLOW_DOWN: u8 = 5;
+const CLOSED: u8 = 6;
+
+/// Many requests on one batched stream, every answer back in order.
+async fn ask_seed_many(
+    node: &Node,
+    seed: &MeshAddr,
+    service: &str,
+    requests: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    let (_, mut send, mut recv) = node.open(seed, service).await.expect("open");
+    let sending = async {
+        for request in requests {
+            frame::write_frame(&mut send, request).await.unwrap();
+        }
+        send.finish().unwrap();
+    };
+    let reading = async {
+        let mut answers = Vec::new();
+        while answers.len() < requests.len() {
+            answers.push(
+                frame::read_frame(&mut recv)
+                    .await
+                    .unwrap()
+                    .expect("an answer"),
+            );
+        }
+        answers
+    };
+    tokio::join!(sending, reading).1
+}
+
+/// A claim of `at` for a day, with `token` (empty for an open seed).
+fn claim_with(token: &[u8], at: &[u8], secret: &[u8; 32]) -> Vec<u8> {
+    let expiry = (now() + 86_400).to_be_bytes();
+    [
+        &[token.len() as u8][..],
+        token,
+        at,
+        &mail_collect_tag(secret),
+        &expiry,
+    ]
+    .concat()
+}
+
+/// Test 6, the rest (PLAN-mailbox Task 4): a friend can't put past a box's
+/// quota; a closed seed refuses a claim or put without its token; a key
+/// over its hour's limits gets `slow-down`.
+#[test]
+fn test_6_junk_quotas_tokens_and_rates() {
+    const TOKEN: &[u8] = b"friends-of-the-operator";
+    let dirs = ["open", "closed"].map(|n| temp_dir(&format!("mail6b-{n}")));
+    let relay = Relay::start();
+    let mut open = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let open_addr = MeshAddr::from_ticket(&open.ticket()).unwrap();
+    let token = std::str::from_utf8(TOKEN).unwrap();
+    let mut closed = Seed::start_with(&dirs[1], &relay, &["--mail", "--mail-token", token]);
+    let closed_addr = MeshAddr::from_ticket(&closed.ticket()).unwrap();
+    relay.runtime.block_on(async {
+        let node = client(&relay).await;
+        let at = [[4u8; 16].as_slice(), &[1u8; 8]].concat();
+        let claim = claim_with(&[], &at, &[7; 32]);
+        assert_eq!(
+            ask_seed(&node, &open_addr, "mail-claim", &claim).await,
+            [OK]
+        );
+        // A box takes 4 MiB: 60 KiB envelopes fill it before the 70th.
+        let big: Vec<Vec<u8>> = (0..70)
+            .map(|_| [vec![0], at.clone(), vec![5; 60 * 1024]].concat())
+            .collect();
+        let answers = ask_seed_many(&node, &open_addr, "mail-put", &big).await;
+        let full = answers.iter().filter(|a| **a == [FULL]).count();
+        assert!(
+            full > 0 && answers[0] == [OK],
+            "the box never filled: {answers:?}"
+        );
+        // One key's 601st put in an hour is slowed.
+        let other = [[4u8; 16].as_slice(), &[2u8; 8]].concat();
+        assert_eq!(
+            ask_seed(
+                &node,
+                &open_addr,
+                "mail-claim",
+                &claim_with(&[], &other, &[7; 32])
+            )
+            .await,
+            [OK]
+        );
+        let small: Vec<Vec<u8>> = (0..600)
+            .map(|_| [vec![0], other.clone(), vec![5; 10]].concat())
+            .collect();
+        let answers = ask_seed_many(&node, &open_addr, "mail-put", &small).await;
+        assert_eq!(
+            answers.last().unwrap(),
+            &[SLOW_DOWN],
+            "70 + 530 puts, then slowed"
+        );
+        // The closed seed: nothing without its token.
+        assert_eq!(
+            ask_seed(&node, &closed_addr, "mail-claim", &claim).await,
+            [CLOSED]
+        );
+        let with = claim_with(TOKEN, &at, &[7; 32]);
+        assert_eq!(
+            ask_seed(&node, &closed_addr, "mail-claim", &with).await,
+            [OK]
+        );
+        let put = [vec![0], at.clone(), vec![5; 10]].concat();
+        assert_eq!(
+            ask_seed(&node, &closed_addr, "mail-put", &put).await,
+            [CLOSED]
+        );
+        let put = [&[TOKEN.len() as u8][..], TOKEN, &at, &[5; 10]].concat();
+        assert_eq!(ask_seed(&node, &closed_addr, "mail-put", &put).await, [OK]);
+        node.close().await;
+    });
+    let logs = [open.stop(), closed.stop()].concat().concat();
+    assert!(!logs.contains(token), "the token reached a log");
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
 
 /// Test 6, first part (PLAN-mailbox Task 2): nothing is held for a slot
 /// nobody claimed, and only the claimer's collect secret collects.
@@ -240,11 +364,12 @@ fn test_6_junk_unclaimed_and_secrets() {
         let node = client(&relay).await;
         let at = [[1u8; 16].as_slice(), &[2u8; 8]].concat();
         let secret = [7u8; 32];
-        let put = [at.clone(), vec![9; 100]].concat();
+        let put = [vec![0], at.clone(), vec![9; 100]].concat();
         // A stranger's put into a slot nobody claimed: no-box.
         assert_eq!(ask_seed(&node, &addr, "mail-put", &put).await, [NO_BOX]);
         let claim = |tag: [u8; 32]| {
             [
+                vec![0],
                 at.clone(),
                 tag.to_vec(),
                 (now() + 86_400).to_be_bytes().to_vec(),
@@ -316,6 +441,7 @@ fn test_7_expiry() {
         let tag = mail_collect_tag(&[7; 32]);
         for (at, life) in [(&short, DAY), (&long, 35 * DAY)] {
             let claim = [
+                vec![0],
                 at.clone(),
                 tag.to_vec(),
                 (now() + life).to_be_bytes().to_vec(),
@@ -323,7 +449,7 @@ fn test_7_expiry() {
             .concat();
             assert_eq!(ask_seed(&node, &addr, "mail-claim", &claim).await, [OK]);
         }
-        let put = [long.clone(), letter.clone()].concat();
+        let put = [vec![0], long.clone(), letter.clone()].concat();
         assert_eq!(ask_seed(&node, &addr, "mail-put", &put).await, [OK]);
         node.close().await;
     });

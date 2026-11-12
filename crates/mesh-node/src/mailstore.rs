@@ -3,8 +3,9 @@
 //! with its collect secret. Requests on the batched services:
 //!
 //! ```text
-//! mail-claim = box [16] | slot [8] | collect tag [32] | expiry u64  -> answer u8
-//! mail-put   = sealed (its first 24 bytes are box [16] | slot [8])  -> answer u8
+//! mail-claim = token | box [16] | slot [8] | collect tag [32] | expiry u64  -> answer u8
+//! mail-put   = token | sealed (its first 24 bytes are box [16] | slot [8])  -> answer u8
+//! token      = len u8 | the seed's `--mail-token` [len] (len 0 for an open seed)
 //! mail-get   = box [16] | slot [8] | collect secret [32]
 //!              -> count u16 | (len u32 | sealed)*, or answer u8 (no-box)
 //! mail-take  = box [16] | slot [8] | collect secret [32] | count u32 -> answer u8
@@ -24,10 +25,14 @@
 //! comes back at the next renewal, and a lost take hands the reader a
 //! duplicate it drops by event ID.
 
-// ponytail: no limits yet (PLAN-mailbox Task 4).
+//! Limits (mailbox *Limits*, M14, M18): rates per throwaway key, per
+//! network and for everyone through a relay; a quota per box; the store's
+//! total (`--mail-max`), past which new claims and puts answer `full`; and,
+//! with `--mail-token`, nothing claimed or put without it.
 
+use crate::codes::{Caller, Window};
 use crate::maillog::{At, Keep, Log, LogError, move_aside};
-use mesh_identity::mail_collect_tag;
+use mesh_identity::{MAX_CONTACTS, mail_collect_tag};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
@@ -46,6 +51,32 @@ pub const CLAIM_LIFE: u64 = 35 * 86_400;
 /// An envelope is held this long after its put (mailbox *Limits*): the
 /// 30-day promise.
 pub const MAIL_LIFE: u64 = 30 * 86_400;
+/// Per throwaway key, an hour: claims or renewals; collect queries; puts,
+/// and their KiB.
+pub const CLAIMS_PER_KEY: u32 = 8_192;
+pub const COLLECTS_PER_KEY: u32 = 16_384;
+pub const PUTS_PER_KEY: u32 = 600;
+pub const PUT_KIB_PER_KEY: u32 = 64 * 1024;
+/// A network's limits are this many keys'; everyone through a relay
+/// shares this many.
+const PER_NETWORK: u32 = 2;
+const RELAYED: u32 = 100;
+/// The boxes a device claims at most each week: every contact and the self
+/// pair, padded to 64 (M13).
+const MOST_BOXES: u32 = (MAX_CONTACTS as u32 + 1).div_ceil(64) * 64;
+// A first unlock claims this week and five ahead; a refresh at unlock
+// collects six weeks and then two, twice in its hour.
+const _: () = assert!(CLAIMS_PER_KEY >= MOST_BOXES * 6);
+const _: () = assert!(COLLECTS_PER_KEY >= MOST_BOXES * (6 + 2 * 2));
+/// Per box (one sender, one reader, one week).
+pub const BOX_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const BOX_MAX_ENVELOPES: u32 = 1_000;
+/// The store's total, for claims and mail together, unless `--mail-max`
+/// says otherwise: the built-in seeds' beta size (decided Q12).
+pub const MAIL_STORE_MAX: u64 = 2 * 1024 * 1024 * 1024;
+/// The longest `--mail-token`.
+pub const MAX_TOKEN: usize = 64;
+const HOUR: u64 = 3600;
 /// A claim's record in its log: box, slot, tag, expiry.
 const CLAIM_RECORD: usize = HEAD + 32 + 8;
 /// An envelope log's records: a put, or a take.
@@ -63,6 +94,36 @@ pub enum Answer {
     NoBox = 2,
     /// Someone else's claim stands on that slot.
     Taken = 3,
+    /// The box's quota or the store's total is reached.
+    Full = 4,
+    /// Over this hour's limits.
+    SlowDown = 5,
+    /// A closed seed, and that isn't its token.
+    Closed = 6,
+}
+
+/// How the operator set the store up.
+pub struct Settings {
+    /// `--mail-token`: claims and puts need it.
+    pub token: Option<Vec<u8>>,
+    /// `--mail-max`, in bytes.
+    pub max: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            token: None,
+            max: MAIL_STORE_MAX,
+        }
+    }
+}
+
+/// The token a claim or put starts with, and the rest.
+fn token(request: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (len, rest) = request.split_first()?;
+    let len = usize::from(*len);
+    (len <= MAX_TOKEN).then(|| rest.split_at_checked(len))?
 }
 
 type Key = ([u8; BOX], [u8; SLOT]);
@@ -81,8 +142,23 @@ struct Held {
 pub struct Store {
     claims: HashMap<Key, Claim>,
     slots: HashMap<Key, VecDeque<Held>>,
+    /// Each box's bytes and envelopes, across its slots.
+    boxes: HashMap<[u8; BOX], (u64, u32)>,
     claims_log: Log,
     envelopes_log: Log,
+    settings: Settings,
+    claim_rate: Window,
+    collect_rate: Window,
+    put_rate: Window,
+    put_kib: Window,
+}
+
+/// A caller's keys for one limit of `per_key` an hour.
+fn limits(caller: &Caller, per_key: u32) -> [(Vec<u8>, u32); 2] {
+    [
+        (caller.device.to_vec(), per_key),
+        caller.network_limit(per_key * PER_NETWORK, per_key * RELAYED),
+    ]
 }
 
 /// A log's size for a record of `len` payload bytes.
@@ -111,7 +187,7 @@ fn key(request: &[u8]) -> Option<(Key, &[u8])> {
 impl Store {
     /// The store in `dir`: its logs read, what has expired by `now`
     /// dropped, and both compacted.
-    pub fn open(dir: &Path, now: u64) -> Result<Store, LogError> {
+    pub fn open(dir: &Path, now: u64, settings: Settings) -> Result<Store, LogError> {
         let mut claims = HashMap::new();
         let claims_log = open_log(&dir.join("claims"), |_, p| {
             let Some(((key, rest), true)) = key(p).map(|k| (k, p.len() == CLAIM_RECORD)) else {
@@ -146,8 +222,14 @@ impl Store {
         let mut store = Store {
             claims,
             slots,
+            boxes: HashMap::new(),
             claims_log,
             envelopes_log,
+            settings,
+            claim_rate: Window::default(),
+            collect_rate: Window::default(),
+            put_rate: Window::default(),
+            put_kib: Window::default(),
         };
         store.sweep(now);
         store
@@ -177,6 +259,26 @@ impl Store {
         self.envelopes_log.live = (self.slots.values().flatten())
             .map(|h| record(h.at.len))
             .sum();
+        self.boxes.clear();
+        for ((b, _), held) in &self.slots {
+            let counted = self.boxes.entry(*b).or_default();
+            counted.0 += held.iter().map(|h| u64::from(h.at.len)).sum::<u64>();
+            counted.1 += held.len() as u32;
+        }
+    }
+
+    /// Bytes held, claims and mail together, against `--mail-max`.
+    pub fn total(&self) -> u64 {
+        self.claims_log.live + self.envelopes_log.live
+    }
+
+    /// Whether `request` carries this seed's token, if it has one.
+    fn admits<'a>(&self, request: &'a [u8]) -> Option<Result<&'a [u8], Answer>> {
+        let (token, rest) = token(request)?;
+        Some(match &self.settings.token {
+            Some(ours) if ours != token => Err(Answer::Closed),
+            _ => Ok(rest),
+        })
     }
 
     /// Writes both logs anew with only what's live.
@@ -203,7 +305,12 @@ impl Store {
         }
     }
 
-    pub fn claim(&mut self, request: &[u8], now: u64) -> Answer {
+    pub fn claim(&mut self, caller: &Caller, request: &[u8], now: u64) -> Answer {
+        let request = match self.admits(request) {
+            None => return Answer::Bad,
+            Some(Err(answer)) => return answer,
+            Some(Ok(rest)) => rest,
+        };
         let Some((key, rest)) = key(request) else {
             return Answer::Bad;
         };
@@ -216,12 +323,19 @@ impl Store {
         if expiry <= now || expiry > now + CLAIM_LIFE {
             return Answer::Bad;
         }
-        if self
-            .claims
-            .get(&key)
-            .is_some_and(|c| c.expiry > now && c.tag != *tag)
+        if !self
+            .claim_rate
+            .allow(now, HOUR, &limits(caller, CLAIMS_PER_KEY))
         {
+            return Answer::SlowDown;
+        }
+        let standing = self.claims.get(&key).filter(|c| c.expiry > now);
+        if standing.is_some_and(|c| c.tag != *tag) {
             return Answer::Taken;
+        }
+        // A renewal takes no more room; a new claim must fit.
+        if standing.is_none() && self.total() + record(CLAIM_RECORD as u32) > self.settings.max {
+            return Answer::Full;
         }
         let claim = Claim { tag: *tag, expiry };
         self.log_claim(&key, &claim);
@@ -243,30 +357,65 @@ impl Store {
         (claim.tag == mail_collect_tag(secret)).then_some((key, rest))
     }
 
-    pub fn put(&mut self, request: &[u8], now: u64) -> Answer {
-        match key(request) {
-            Some((_, sealed)) if sealed.is_empty() || sealed.len() > MAX_SEALED => Answer::Bad,
-            Some((key, _)) if self.claimed(&key, now) => {
-                let payload = [&[PUT][..], &now.to_be_bytes(), request].concat();
-                match self.envelopes_log.append(&payload, true) {
-                    Ok(at) => {
-                        self.envelopes_log.live += record(at.len);
-                        let held = Held { at, put: now };
-                        self.slots.entry(key).or_default().push_back(held);
-                        Answer::Ok
-                    }
-                    Err(e) => {
-                        eprintln!("mesh-node seed: couldn't write mail: {e}");
-                        Answer::Bad
-                    }
-                }
+    pub fn put(&mut self, caller: &Caller, request: &[u8], now: u64) -> Answer {
+        let request = match self.admits(request) {
+            None => return Answer::Bad,
+            Some(Err(answer)) => return answer,
+            Some(Ok(rest)) => rest,
+        };
+        let key = match key(request) {
+            Some((_, sealed)) if sealed.is_empty() || sealed.len() > MAX_SEALED => {
+                return Answer::Bad;
             }
-            Some(_) => Answer::NoBox,
-            None => Answer::Bad,
+            Some((key, _)) => key,
+            None => return Answer::Bad,
+        };
+        let kib = request.len().div_ceil(1024) as u32;
+        let rates = self
+            .put_rate
+            .allow(now, HOUR, &limits(caller, PUTS_PER_KEY))
+            && self
+                .put_kib
+                .allow_by(now, HOUR, &limits(caller, PUT_KIB_PER_KEY), kib);
+        if !rates {
+            return Answer::SlowDown;
+        }
+        if !self.claimed(&key, now) {
+            return Answer::NoBox;
+        }
+        let payload = [&[PUT][..], &now.to_be_bytes(), request].concat();
+        let (bytes, count) = self.boxes.get(&key.0).copied().unwrap_or_default();
+        let len = payload.len() as u64;
+        if bytes + len > BOX_MAX_BYTES
+            || count >= BOX_MAX_ENVELOPES
+            || self.total() + 4 + len > self.settings.max
+        {
+            return Answer::Full;
+        }
+        match self.envelopes_log.append(&payload, true) {
+            Ok(at) => {
+                self.envelopes_log.live += record(at.len);
+                let counted = self.boxes.entry(key.0).or_default();
+                counted.0 += u64::from(at.len);
+                counted.1 += 1;
+                let held = Held { at, put: now };
+                self.slots.entry(key).or_default().push_back(held);
+                Answer::Ok
+            }
+            Err(e) => {
+                eprintln!("mesh-node seed: couldn't write mail: {e}");
+                Answer::Bad
+            }
         }
     }
 
-    pub fn get(&mut self, request: &[u8], now: u64) -> Vec<u8> {
+    pub fn get(&mut self, caller: &Caller, request: &[u8], now: u64) -> Vec<u8> {
+        if !self
+            .collect_rate
+            .allow(now, HOUR, &limits(caller, COLLECTS_PER_KEY))
+        {
+            return vec![Answer::SlowDown as u8];
+        }
         let Some((key, [])) = self.collecting(request, now) else {
             return vec![Answer::NoBox as u8];
         };
@@ -304,10 +453,15 @@ impl Store {
             return Answer::Ok;
         };
         let count = (u32::from_be_bytes(count) as usize).min(held.len());
-        let gone: u64 = held.drain(..count).map(|h| record(h.at.len)).sum();
+        let gone: Vec<u32> = held.drain(..count).map(|h| h.at.len).collect();
         if held.is_empty() {
             self.slots.remove(&key);
         }
+        if let Some(counted) = self.boxes.get_mut(&key.0) {
+            counted.0 -= gone.iter().map(|l| u64::from(*l)).sum::<u64>();
+            counted.1 -= gone.len() as u32;
+        }
+        let gone: u64 = gone.into_iter().map(record).sum();
         let payload = [&[TAKE][..], &key.0, &key.1, &(count as u32).to_be_bytes()].concat();
         if let Err(e) = self.envelopes_log.append(&payload, false) {
             eprintln!("mesh-node seed: couldn't write a mail take: {e}");
@@ -346,6 +500,15 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+    const C: Caller = Caller {
+        device: [1; 32],
+        network: Some([10, 0, 0, 0, 0, 0]),
+    };
+
+    /// A claim or put for an open seed: no token.
+    fn admit(request: &[u8]) -> Vec<u8> {
+        [&[0u8][..], request].concat()
+    }
     const SECRET: [u8; 32] = [7; 32];
 
     fn head(b: u8, s: u8) -> Vec<u8> {
@@ -362,13 +525,13 @@ mod tests {
     }
 
     fn empty(name: &str) -> Store {
-        Store::open(&crate::maillog::temp(name), NOW).unwrap()
+        Store::open(&crate::maillog::temp(name), NOW, Settings::default()).unwrap()
     }
 
     fn claimed(at: &[u8]) -> Store {
         let mut store = empty(&format!("claimed-{}", at[0]));
         assert_eq!(
-            store.claim(&claim(at, &SECRET, NOW + 86_400), NOW),
+            store.claim(&C, &admit(&claim(at, &SECRET, NOW + 86_400)), NOW),
             Answer::Ok
         );
         store
@@ -379,15 +542,15 @@ mod tests {
         let at = head(1, 2);
         let mut store = claimed(&at);
         let whole = |s: &[u8]| [at.clone(), s.to_vec()].concat();
-        assert_eq!(store.put(&whole(b"one"), NOW), Answer::Ok);
-        assert_eq!(store.put(&whole(b"two"), NOW), Answer::Ok);
-        let got = store.get(&with(&at, &SECRET, &[]), NOW);
+        assert_eq!(store.put(&C, &admit(&whole(b"one")), NOW), Answer::Ok);
+        assert_eq!(store.put(&C, &admit(&whole(b"two")), NOW), Answer::Ok);
+        let got = store.get(&C, &with(&at, &SECRET, &[]), NOW);
         assert_eq!(read_got(&got), Some(vec![whole(b"one"), whole(b"two")]));
         // One more comes after the get: a take of two leaves it.
-        store.put(&whole(b"three"), NOW);
+        store.put(&C, &admit(&whole(b"three")), NOW);
         let take = |n: u32| with(&at, &SECRET, &n.to_be_bytes());
         assert_eq!(store.take(&take(2), NOW), Answer::Ok);
-        let got = store.get(&with(&at, &SECRET, &[]), NOW);
+        let got = store.get(&C, &with(&at, &SECRET, &[]), NOW);
         assert_eq!(read_got(&got), Some(vec![whole(b"three")]));
         store.take(&take(9), NOW);
         assert_eq!(store.len(), 0);
@@ -398,15 +561,15 @@ mod tests {
         let at = head(3, 2);
         let mut store = empty("only-claimed");
         let put = [at.clone(), b"x".to_vec()].concat();
-        assert_eq!(store.put(&put, NOW), Answer::NoBox);
+        assert_eq!(store.put(&C, &admit(&put), NOW), Answer::NoBox);
         store = claimed(&at);
         // Another slot of the same box is its own.
         let other = [head(3, 3), b"x".to_vec()].concat();
-        assert_eq!(store.put(&other, NOW), Answer::NoBox);
-        assert_eq!(store.put(&put, NOW), Answer::Ok);
+        assert_eq!(store.put(&C, &admit(&other), NOW), Answer::NoBox);
+        assert_eq!(store.put(&C, &admit(&put), NOW), Answer::Ok);
         let wrong = [8; 32];
         assert_eq!(
-            store.get(&with(&at, &wrong, &[]), NOW),
+            store.get(&C, &with(&at, &wrong, &[]), NOW),
             [Answer::NoBox as u8]
         );
         let take = with(&at, &wrong, &1u32.to_be_bytes());
@@ -415,18 +578,18 @@ mod tests {
         // A claim on a held slot under another tag is refused; a renewal
         // by the same tag moves it on.
         let theirs = claim(&at, &wrong, NOW + 86_400);
-        assert_eq!(store.claim(&theirs, NOW), Answer::Taken);
+        assert_eq!(store.claim(&C, &admit(&theirs), NOW), Answer::Taken);
         let renewed = claim(&at, &SECRET, NOW + CLAIM_LIFE);
-        assert_eq!(store.claim(&renewed, NOW), Answer::Ok);
+        assert_eq!(store.claim(&C, &admit(&renewed), NOW), Answer::Ok);
         // Past its expiry a claim holds nothing new, and someone may claim.
         let later = NOW + CLAIM_LIFE + 1;
-        assert_eq!(store.put(&put, later), Answer::NoBox);
+        assert_eq!(store.put(&C, &admit(&put), later), Answer::NoBox);
         assert_eq!(
-            store.get(&with(&at, &SECRET, &[]), later),
+            store.get(&C, &with(&at, &SECRET, &[]), later),
             [Answer::NoBox as u8]
         );
         assert_eq!(
-            store.claim(&claim(&at, &wrong, later + 1), later),
+            store.claim(&C, &admit(&claim(&at, &wrong, later + 1)), later),
             Answer::Ok
         );
     }
@@ -435,23 +598,31 @@ mod tests {
     fn bad_requests() {
         let at = head(4, 2);
         let mut store = claimed(&at);
-        assert_eq!(store.put(&at, NOW), Answer::Bad, "nothing to hold");
-        assert_eq!(store.put(&[0; 10], NOW), Answer::Bad);
+        assert_eq!(
+            store.put(&C, &admit(&at), NOW),
+            Answer::Bad,
+            "nothing to hold"
+        );
+        assert_eq!(store.put(&C, &admit(&[0; 10]), NOW), Answer::Bad);
         let big = [at.clone(), vec![0; MAX_SEALED + 1]].concat();
-        assert_eq!(store.put(&big, NOW), Answer::Bad);
+        assert_eq!(store.put(&C, &admit(&big), NOW), Answer::Bad);
         assert_eq!(
             store.take(&with(&at, &SECRET, &[]), NOW),
             Answer::Bad,
             "no count"
         );
-        assert_eq!(store.claim(&at, NOW), Answer::Bad, "no tag");
+        assert_eq!(store.claim(&C, &admit(&at), NOW), Answer::Bad, "no tag");
         assert_eq!(
-            store.claim(&claim(&at, &SECRET, NOW), NOW),
+            store.claim(&C, &admit(&claim(&at, &SECRET, NOW)), NOW),
             Answer::Bad,
             "expired"
         );
         let far = claim(&at, &SECRET, NOW + CLAIM_LIFE + 1);
-        assert_eq!(store.claim(&far, NOW), Answer::Bad, "too far ahead");
+        assert_eq!(
+            store.claim(&C, &admit(&far), NOW),
+            Answer::Bad,
+            "too far ahead"
+        );
         assert_eq!(read_got(&[Answer::NoBox as u8]), None);
         assert_eq!(read_got(&[0, 1, 0, 0, 0, 9]), None, "cut short");
     }
@@ -461,9 +632,9 @@ mod tests {
         let at = head(5, 2);
         let mut store = claimed(&at);
         for _ in 0..40 {
-            store.put(&[at.clone(), vec![7; 60 * 1024]].concat(), NOW);
+            store.put(&C, &admit(&[at.clone(), vec![7; 60 * 1024]].concat()), NOW);
         }
-        let got = store.get(&with(&at, &SECRET, &[]), NOW);
+        let got = store.get(&C, &with(&at, &SECRET, &[]), NOW);
         assert!(got.len() <= mesh_transport::frame::MAX_FRAME);
         assert!(read_got(&got).unwrap().len() < 40);
     }
@@ -472,17 +643,17 @@ mod tests {
     fn a_restart_keeps_claims_and_mail_and_drops_the_expired() {
         let dir = crate::maillog::temp("restart");
         let (a, b) = (head(6, 1), head(6, 2));
-        let mut store = Store::open(&dir, NOW).unwrap();
-        store.claim(&claim(&a, &SECRET, NOW + 86_400), NOW);
-        store.claim(&claim(&b, &SECRET, NOW + CLAIM_LIFE), NOW);
+        let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
+        store.claim(&C, &admit(&claim(&a, &SECRET, NOW + 86_400)), NOW);
+        store.claim(&C, &admit(&claim(&b, &SECRET, NOW + CLAIM_LIFE)), NOW);
         let whole = |at: &[u8], s: &[u8]| [at.to_vec(), s.to_vec()].concat();
-        store.put(&whole(&a, b"one"), NOW);
-        store.put(&whole(&a, b"two"), NOW);
-        store.put(&whole(&b, b"old"), NOW);
+        store.put(&C, &admit(&whole(&a, b"one")), NOW);
+        store.put(&C, &admit(&whole(&a, b"two")), NOW);
+        store.put(&C, &admit(&whole(&b, b"old")), NOW);
         store.take(&with(&a, &SECRET, &1u32.to_be_bytes()), NOW);
         drop(store);
-        let mut store = Store::open(&dir, NOW + 10).unwrap();
-        let got = store.get(&with(&a, &SECRET, &[]), NOW + 10);
+        let mut store = Store::open(&dir, NOW + 10, Settings::default()).unwrap();
+        let got = store.get(&C, &with(&a, &SECRET, &[]), NOW + 10);
         assert_eq!(
             read_got(&got),
             Some(vec![whole(&a, b"two")]),
@@ -491,10 +662,13 @@ mod tests {
         // A day later the first claim has lapsed; a month on, the mail too.
         let later = NOW + MAIL_LIFE;
         drop(store);
-        let mut store = Store::open(&dir, later).unwrap();
-        assert_eq!(store.put(&whole(&a, b"x"), later), Answer::NoBox);
+        let mut store = Store::open(&dir, later, Settings::default()).unwrap();
+        assert_eq!(
+            store.put(&C, &admit(&whole(&a, b"x")), later),
+            Answer::NoBox
+        );
         assert_eq!(store.len(), 0);
-        let got = store.get(&with(&b, &SECRET, &[]), later);
+        let got = store.get(&C, &with(&b, &SECRET, &[]), later);
         assert_eq!(
             read_got(&got),
             Some(vec![]),
@@ -516,19 +690,165 @@ mod tests {
     fn a_damaged_log_starts_empty_and_a_newer_one_stops() {
         let dir = crate::maillog::temp("damaged");
         let at = head(7, 1);
-        let mut store = Store::open(&dir, NOW).unwrap();
-        store.claim(&claim(&at, &SECRET, NOW + 86_400), NOW);
+        let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
+        store.claim(&C, &admit(&claim(&at, &SECRET, NOW + 86_400)), NOW);
         drop(store);
         std::fs::write(dir.join("envelopes"), b"MLOG\x01\x00\x00\x00\x02??").unwrap();
-        let mut store = Store::open(&dir, NOW).unwrap();
+        let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
         assert!(dir.join("envelopes.damaged").exists());
         assert_eq!(
-            store.put(&[at.clone(), b"x".to_vec()].concat(), NOW),
+            store.put(&C, &admit(&[at.clone(), b"x".to_vec()].concat()), NOW),
             Answer::Ok,
             "claims kept"
         );
         drop(store);
         std::fs::write(dir.join("claims"), b"MLOG\x02").unwrap();
-        assert!(matches!(Store::open(&dir, NOW), Err(LogError::Newer(_))));
+        assert!(matches!(
+            Store::open(&dir, NOW, Settings::default()),
+            Err(LogError::Newer(_))
+        ));
+    }
+
+    fn caller(i: u32, network: u8) -> Caller {
+        let mut device = [0; 32];
+        device[..4].copy_from_slice(&i.to_be_bytes());
+        Caller {
+            device,
+            network: Some([network, 0, 0, 0, 0, 0]),
+        }
+    }
+
+    #[test]
+    fn rates_per_key_and_network() {
+        let at = head(8, 1);
+        let mut store = claimed(&at);
+        let put = admit(&[at.clone(), b"x".to_vec()].concat());
+        for _ in 0..PUTS_PER_KEY {
+            assert_eq!(store.put(&C, &put, NOW), Answer::Ok);
+        }
+        assert_eq!(store.put(&C, &put, NOW), Answer::SlowDown);
+        assert_eq!(store.put(&C, &put, NOW + HOUR), Answer::Ok, "a new hour");
+        // Claims: per key, then per network (two keys' worth).
+        let mut store = empty("claim-rates");
+        let claim_of = |i: u32| admit(&claim(&head(9, (i % 200) as u8), &SECRET, NOW + 86_400));
+        for i in 0..CLAIMS_PER_KEY {
+            assert_eq!(store.claim(&caller(1, 9), &claim_of(i), NOW), Answer::Ok);
+        }
+        assert_eq!(
+            store.claim(&caller(1, 9), &claim_of(0), NOW),
+            Answer::SlowDown
+        );
+        for i in 0..CLAIMS_PER_KEY {
+            assert_eq!(store.claim(&caller(2, 9), &claim_of(i), NOW), Answer::Ok);
+        }
+        assert_eq!(
+            store.claim(&caller(3, 9), &claim_of(0), NOW),
+            Answer::SlowDown,
+            "the network's"
+        );
+        assert_eq!(
+            store.claim(&caller(3, 8), &claim_of(0), NOW),
+            Answer::Ok,
+            "another network"
+        );
+        // Collects.
+        let get = with(&head(9, 0), &SECRET, &[]);
+        for _ in 0..COLLECTS_PER_KEY {
+            assert_ne!(
+                store.get(&caller(4, 7), &get, NOW),
+                [Answer::SlowDown as u8]
+            );
+        }
+        assert_eq!(
+            store.get(&caller(4, 7), &get, NOW),
+            [Answer::SlowDown as u8]
+        );
+    }
+
+    #[test]
+    fn a_relayed_caller_shares_the_relayed_bucket() {
+        let mut store = empty("relayed");
+        let claim_of = |i: u32| admit(&claim(&head(10, (i % 200) as u8), &SECRET, NOW + 86_400));
+        let relayed = |i| Caller {
+            device: caller(i, 0).device,
+            network: None,
+        };
+        for i in 0..RELAYED {
+            for _ in 0..CLAIMS_PER_KEY {
+                assert_eq!(store.claim(&relayed(i), &claim_of(i), NOW), Answer::Ok);
+            }
+        }
+        assert_eq!(
+            store.claim(&relayed(RELAYED), &claim_of(0), NOW),
+            Answer::SlowDown
+        );
+    }
+
+    #[test]
+    fn a_box_has_a_quota() {
+        let at = head(11, 1);
+        let mut store = claimed(&at);
+        let big = admit(&[at.clone(), vec![7; 60 * 1024]].concat());
+        let fit = (BOX_MAX_BYTES / (60 * 1024 + 1024)) as u32;
+        for i in 0..fit {
+            assert_eq!(store.put(&caller(i, i as u8), &big, NOW), Answer::Ok);
+        }
+        let mut full = 0;
+        for i in fit..fit + 3 {
+            full += u32::from(store.put(&caller(i, i as u8), &big, NOW) == Answer::Full);
+        }
+        assert!(full >= 2, "past 4 MiB a box is full");
+        // Another box of the same seed still takes mail.
+        let other = head(12, 1);
+        store.claim(&C, &admit(&claim(&other, &SECRET, NOW + 86_400)), NOW);
+        let small = admit(&[other.clone(), b"x".to_vec()].concat());
+        assert_eq!(store.put(&C, &small, NOW), Answer::Ok);
+        // And at 1,000 envelopes, however small.
+        let at = head(13, 1);
+        store.claim(&C, &admit(&claim(&at, &SECRET, NOW + 86_400)), NOW);
+        let tiny = admit(&[at.clone(), b"x".to_vec()].concat());
+        for i in 0..BOX_MAX_ENVELOPES {
+            assert_eq!(
+                store.put(&caller(i + 100, (i % 250) as u8), &tiny, NOW),
+                Answer::Ok
+            );
+        }
+        assert_eq!(store.put(&caller(5_000, 251), &tiny, NOW), Answer::Full);
+        // A take makes room again.
+        let take = with(&at, &SECRET, &1u32.to_be_bytes());
+        assert_eq!(store.take(&take, NOW), Answer::Ok);
+        assert_eq!(store.put(&caller(5_001, 252), &tiny, NOW), Answer::Ok);
+    }
+
+    #[test]
+    fn the_store_has_a_total_and_a_token() {
+        let settings = Settings {
+            token: Some(b"a-token-for-friends".to_vec()),
+            max: 4096,
+        };
+        let mut store = Store::open(&crate::maillog::temp("total"), NOW, settings).unwrap();
+        let at = head(14, 1);
+        let with_token = |r: &[u8]| [&[19u8][..], b"a-token-for-friends", r].concat();
+        let c = claim(&at, &SECRET, NOW + 86_400);
+        assert_eq!(store.claim(&C, &admit(&c), NOW), Answer::Closed, "no token");
+        let wrong = [&[19u8][..], b"not-the-token-at-al", &c].concat();
+        assert_eq!(store.claim(&C, &wrong, NOW), Answer::Closed);
+        assert_eq!(store.claim(&C, &with_token(&c), NOW), Answer::Ok);
+        let put = |n: usize| with_token(&[at.clone(), vec![1; n]].concat());
+        assert_eq!(
+            store.put(&C, &admit(&[at.clone(), vec![1]].concat()), NOW),
+            Answer::Closed
+        );
+        assert_eq!(store.put(&C, &put(3950), NOW), Answer::Ok);
+        assert_eq!(
+            store.put(&C, &put(1000), NOW),
+            Answer::Full,
+            "past --mail-max"
+        );
+        // A renewal still goes; a new claim doesn't fit.
+        assert_eq!(store.claim(&C, &with_token(&c), NOW), Answer::Ok);
+        let other = claim(&head(14, 2), &SECRET, NOW + 86_400);
+        assert_eq!(store.claim(&C, &with_token(&other), NOW), Answer::Full);
+        assert!(store.total() <= 4096);
     }
 }
