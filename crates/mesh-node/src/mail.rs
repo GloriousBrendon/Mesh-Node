@@ -148,6 +148,18 @@ fn one_week(real: Vec<Ours>, mut dummies: Vec<Ours>) -> Vec<Ours> {
     dummies
 }
 
+/// Opened mail events in D2's order across senders (M8): each chat's by
+/// (`seq`, event ID), whoever sent them. Each is its batch's index and the
+/// event; `directs` is each batch's direct chat (the sender's ID), for
+/// events with no group.
+fn in_d2_order(events: &mut [(usize, dm::Taking)], directs: &[[u8; 32]]) {
+    let chat =
+        |b: usize, group: &Option<[u8; 16]>| group.map_or(directs[b].to_vec(), |g| g.to_vec());
+    events.sort_by(|(x, a), (y, b)| {
+        (chat(*x, &a.1), a.2.seq, a.2.id).cmp(&(chat(*y, &b.1), b.2.seq, b.2.id))
+    });
+}
+
 /// The box an address is in.
 fn mail_box(address: &[u8; ADDRESS]) -> [u8; mailstore::BOX] {
     address[..mailstore::BOX].try_into().expect("16 bytes")
@@ -690,16 +702,8 @@ impl Helper {
                     .map(|t| (b, t)),
             );
         }
-        let chat = |b: &Batch, group: &Option<[u8; 16]>| {
-            group.map_or(b.id.to_bytes().to_vec(), |g| g.to_vec())
-        };
-        all.sort_by(|(x, a), (y, b)| {
-            (chat(&batches[*x], &a.1), a.2.seq, a.2.id).cmp(&(
-                chat(&batches[*y], &b.1),
-                b.2.seq,
-                b.2.id,
-            ))
-        });
+        let directs: Vec<[u8; 32]> = batches.iter().map(|b| b.id.to_bytes()).collect();
+        in_d2_order(&mut all, &directs);
         let again: Vec<(usize, dm::Taking)> = self.mail_take_runs(batches, all);
         if !again.is_empty() {
             self.mail_take_runs(batches, again);
@@ -892,6 +896,44 @@ mod tests {
         };
         assert_eq!(order(&[0, 1]), order(&[6, 7]));
         assert_eq!(order(&[]), order(&[2, 3, 5]));
+    }
+
+    /// A removal from one sender and the removed member's earlier messages
+    /// from another, in one collect: the messages first (M8, test 16).
+    #[test]
+    fn a_removal_goes_after_the_messages_it_saw() {
+        use mesh_dm::event::{Body, Change, Event, GroupChange};
+        let event = |seq: u64, body: Body| Event {
+            version: 1,
+            id: [seq as u8; 16],
+            time: seq,
+            seq,
+            n: 1,
+            body,
+        };
+        let text = |t: &str| Body::Text {
+            text: t.into(),
+            reply_to: None,
+            attachments: Vec::new(),
+        };
+        let group = Some([9; 16]);
+        let removal = Body::Group(GroupChange {
+            after: None,
+            change: Change::Remove([4; 32]),
+            signed: None,
+        });
+        // Alice's batch (the removal) comes first, as a collect may give it.
+        let mut events = vec![(0, (0, group, event(106, removal)))];
+        events.extend((1..=5).map(|i| (1, (i - 1, group, event(100 + i as u64, text("d"))))));
+        // A direct message from Dave, its own chat, wherever it sorts.
+        events.push((1, (5, None, event(1, text("dm")))));
+        in_d2_order(&mut events, &[[1; 32], [2; 32]]);
+        let group_seqs: Vec<u64> = (events.iter())
+            .filter(|(_, t)| t.1 == group)
+            .map(|(_, t)| t.2.seq)
+            .collect();
+        assert_eq!(group_seqs, [101, 102, 103, 104, 105, 106]);
+        assert_eq!(events.len(), 7);
     }
 
     #[test]
