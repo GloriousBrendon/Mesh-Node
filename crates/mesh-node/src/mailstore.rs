@@ -25,14 +25,22 @@
 //! comes back at the next renewal, and a lost take hands the reader a
 //! duplicate it drops by event ID.
 
+//! Mail records (routing D3, D5, D6 as changed) are the third log,
+//! `<data>/mail/records`: sealed as address records are, and read by the
+//! seed the same way (`addr_outer`), but kept up to 7 days ahead, under
+//! their own rates, and counted in the store's total. `mrec-put` is a
+//! record, answered as `addr-put` is; `mrec-get` is a lookup ID [16],
+//! answered as `addr-get` is.
+//!
 //! Limits (mailbox *Limits*, M14, M18): rates per throwaway key, per
 //! network and for everyone through a relay; a quota per box; the store's
 //! total (`--mail-max`), past which new claims and puts answer `full`; and,
 //! with `--mail-token`, nothing claimed or put without it.
 
+use crate::addrs::{Get as RecordGet, Put as RecordPut, SLOTS_PER_LOOKUP};
 use crate::codes::{Caller, Window};
 use crate::maillog::{At, Keep, Log, LogError, move_aside};
-use mesh_identity::{MAX_CONTACTS, mail_collect_tag};
+use mesh_identity::{MAX_CONTACTS, addr_outer, mail_collect_tag};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
@@ -68,6 +76,15 @@ const MOST_BOXES: u32 = (MAX_CONTACTS as u32 + 1).div_ceil(64) * 64;
 // collects six weeks and then two, twice in its hour.
 const _: () = assert!(CLAIMS_PER_KEY >= MOST_BOXES * 6);
 const _: () = assert!(COLLECTS_PER_KEY >= MOST_BOXES * (6 + 2 * 2));
+/// Per throwaway key, an hour: mail records put, and lookups (routing D6
+/// as changed): every contact's at unlock, and last week's for misses.
+pub const RECORD_PUTS_PER_KEY: u32 = 2_048;
+pub const RECORD_GETS_PER_KEY: u32 = 4_096;
+const _: () = assert!(RECORD_PUTS_PER_KEY as usize >= 2 * (MAX_CONTACTS + 1));
+const _: () = assert!(RECORD_GETS_PER_KEY as usize >= 4 * (MAX_CONTACTS + 1));
+/// How far ahead a mail record may expire: the fallback key's week
+/// (`MAIL_RECORD_LIFE`).
+pub const RECORD_AHEAD: u64 = 7 * 86_400;
 /// Per box (one sender, one reader, one week).
 pub const BOX_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub const BOX_MAX_ENVELOPES: u32 = 1_000;
@@ -133,6 +150,13 @@ struct Claim {
     expiry: u64,
 }
 
+/// A mail record's slot under its lookup ID, its expiry, and where it sits.
+struct Record {
+    slot: [u8; SLOT],
+    expiry: u64,
+    at: At,
+}
+
 /// Where an envelope sits in its log, and when it was put.
 struct Held {
     at: At,
@@ -144,9 +168,13 @@ pub struct Store {
     slots: HashMap<Key, VecDeque<Held>>,
     /// Each box's bytes and envelopes, across its slots.
     boxes: HashMap<[u8; BOX], (u64, u32)>,
+    records: HashMap<[u8; 16], Vec<Record>>,
     claims_log: Log,
     envelopes_log: Log,
+    records_log: Log,
     settings: Settings,
+    record_puts: Window,
+    record_gets: Window,
     claim_rate: Window,
     collect_rate: Window,
     put_rate: Window,
@@ -219,13 +247,30 @@ impl Store {
             }
             _ => false,
         })?;
+        let mut records: HashMap<[u8; 16], Vec<Record>> = HashMap::new();
+        let records_log = open_log(&dir.join("records"), |at, p| {
+            let Some((lookup, slot, expiry)) = addr_outer(p) else {
+                return false;
+            };
+            let slots = records.entry(lookup).or_default();
+            match slots.iter_mut().find(|r| r.slot == slot) {
+                Some(r) if r.expiry <= expiry => *r = Record { slot, expiry, at },
+                Some(_) => {}
+                None => slots.push(Record { slot, expiry, at }),
+            }
+            true
+        })?;
         let mut store = Store {
             claims,
             slots,
             boxes: HashMap::new(),
+            records,
             claims_log,
             envelopes_log,
+            records_log,
             settings,
+            record_puts: Window::default(),
+            record_gets: Window::default(),
             claim_rate: Window::default(),
             collect_rate: Window::default(),
             put_rate: Window::default(),
@@ -246,8 +291,14 @@ impl Store {
             held.retain(|h| h.put + MAIL_LIFE > now);
         }
         self.slots.retain(|_, held| !held.is_empty());
+        for slots in self.records.values_mut() {
+            slots.retain(|r| r.expiry > now);
+        }
+        self.records.retain(|_, slots| !slots.is_empty());
         self.count_live();
-        if (self.claims_log.wants_compacting() || self.envelopes_log.wants_compacting())
+        if (self.claims_log.wants_compacting()
+            || self.envelopes_log.wants_compacting()
+            || self.records_log.wants_compacting())
             && let Err(e) = self.compact()
         {
             eprintln!("mesh-node seed: couldn't compact the mail logs: {e}");
@@ -259,6 +310,9 @@ impl Store {
         self.envelopes_log.live = (self.slots.values().flatten())
             .map(|h| record(h.at.len))
             .sum();
+        self.records_log.live = (self.records.values().flatten())
+            .map(|r| record(r.at.len))
+            .sum();
         self.boxes.clear();
         for ((b, _), held) in &self.slots {
             let counted = self.boxes.entry(*b).or_default();
@@ -267,9 +321,9 @@ impl Store {
         }
     }
 
-    /// Bytes held, claims and mail together, against `--mail-max`.
+    /// Bytes held, claims, records and mail together, against `--mail-max`.
     pub fn total(&self) -> u64 {
-        self.claims_log.live + self.envelopes_log.live
+        self.claims_log.live + self.envelopes_log.live + self.records_log.live
     }
 
     /// Whether `request` carries this seed's token, if it has one.
@@ -293,6 +347,13 @@ impl Store {
         let places = self.envelopes_log.compact(&keep)?;
         for (held, at) in self.slots.values_mut().flatten().zip(places) {
             held.at = at;
+        }
+        let keep: Vec<Keep> = (self.records.values().flatten())
+            .map(|r| Keep::At(r.at))
+            .collect();
+        let places = self.records_log.compact(&keep)?;
+        for (r, at) in self.records.values_mut().flatten().zip(places) {
+            r.at = at;
         }
         self.count_live();
         Ok(())
@@ -473,6 +534,82 @@ impl Store {
             eprintln!("mesh-node seed: couldn't compact the mail logs: {e}");
         }
         Answer::Ok
+    }
+
+    /// Stores a mail record in its slot, replacing an older one there (a
+    /// later expiry is newer), as `addr-put` does.
+    pub fn put_record(&mut self, caller: &Caller, bytes: &[u8], now: u64) -> RecordPut {
+        let Some((lookup, slot, expiry)) = addr_outer(bytes) else {
+            return RecordPut::Bad;
+        };
+        if expiry <= now || expiry > now + RECORD_AHEAD {
+            return RecordPut::Bad;
+        }
+        if !self
+            .record_puts
+            .allow(now, HOUR, &limits(caller, RECORD_PUTS_PER_KEY))
+        {
+            return RecordPut::SlowDown;
+        }
+        let slots = self.records.entry(lookup).or_default();
+        slots.retain(|r| r.expiry > now);
+        let existing = slots.iter().position(|r| r.slot == slot);
+        if existing.is_some_and(|i| slots[i].expiry > expiry) {
+            // An older record changes nothing, and that's fine to say.
+            return RecordPut::Ok;
+        }
+        if existing.is_none() && slots.len() >= SLOTS_PER_LOOKUP {
+            return RecordPut::Full;
+        }
+        let old = existing.map_or(0, |i| u64::from(slots[i].at.len));
+        if self.total() + 4 + bytes.len() as u64 > self.settings.max + old {
+            return RecordPut::Full;
+        }
+        let at = match self.records_log.append(bytes, false) {
+            Ok(at) => at,
+            Err(e) => {
+                eprintln!("mesh-node seed: couldn't write a mail record: {e}");
+                return RecordPut::Bad;
+            }
+        };
+        let slots = self.records.entry(lookup).or_default();
+        let new = Record { slot, expiry, at };
+        match existing {
+            Some(i) => {
+                self.records_log.live -= record(slots[i].at.len);
+                slots[i] = new;
+            }
+            None => slots.push(new),
+        }
+        self.records_log.live += record(at.len);
+        if self.records_log.wants_compacting()
+            && let Err(e) = self.compact()
+        {
+            eprintln!("mesh-node seed: couldn't compact the mail logs: {e}");
+        }
+        RecordPut::Ok
+    }
+
+    /// The live mail records under `lookup`, as `addr-get` answers.
+    pub fn get_records(&mut self, caller: &Caller, request: &[u8], now: u64) -> RecordGet {
+        if !self
+            .record_gets
+            .allow(now, HOUR, &limits(caller, RECORD_GETS_PER_KEY))
+        {
+            return RecordGet::SlowDown;
+        }
+        let Ok(lookup) = <[u8; 16]>::try_from(request) else {
+            return RecordGet::Found(Vec::new());
+        };
+        let places: Vec<At> = (self.records.get(&lookup).into_iter().flatten())
+            .filter(|r| r.expiry > now)
+            .map(|r| r.at)
+            .collect();
+        let found = places
+            .into_iter()
+            .filter_map(|at| self.records_log.read(at).ok())
+            .collect();
+        RecordGet::Found(found)
     }
 
     /// Envelopes held.
@@ -850,5 +987,83 @@ mod tests {
         let other = claim(&head(14, 2), &SECRET, NOW + 86_400);
         assert_eq!(store.claim(&C, &with_token(&other), NOW), Answer::Full);
         assert!(store.total() <= 4096);
+    }
+
+    /// A sealed record as the seed sees it: lookup, slot, expiry, then
+    /// what only the pair can read.
+    fn mail_record(lookup: u8, slot: u8, expiry: u64, fill: u8) -> Vec<u8> {
+        [
+            &[lookup; 16][..],
+            &[slot; 8],
+            &expiry.to_be_bytes(),
+            &[fill; 80],
+        ]
+        .concat()
+    }
+
+    fn found(get: RecordGet) -> Vec<Vec<u8>> {
+        match get {
+            RecordGet::Found(records) => records,
+            RecordGet::SlowDown => panic!("slowed"),
+        }
+    }
+
+    #[test]
+    fn mail_records_keep_a_week_and_replace_by_slot() {
+        let dir = crate::maillog::temp("records");
+        let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
+        let week = mail_record(1, 1, NOW + RECORD_AHEAD, 1);
+        assert_eq!(
+            store.put_record(&C, &week, NOW),
+            RecordPut::Ok,
+            "7 days ahead"
+        );
+        let past = mail_record(1, 2, NOW + RECORD_AHEAD + 60, 1);
+        assert_eq!(
+            store.put_record(&C, &past, NOW),
+            RecordPut::Bad,
+            "a minute more"
+        );
+        assert_eq!(store.put_record(&C, &b"short"[..], NOW), RecordPut::Bad);
+        // A newer record replaces its slot; an older one changes nothing.
+        let newer = mail_record(1, 1, NOW + RECORD_AHEAD, 2);
+        let older = mail_record(1, 1, NOW + 60, 3);
+        assert_eq!(store.put_record(&C, &newer, NOW), RecordPut::Ok);
+        assert_eq!(store.put_record(&C, &older, NOW), RecordPut::Ok);
+        assert_eq!(
+            found(store.get_records(&C, &[1; 16], NOW)),
+            [newer.as_slice()]
+        );
+        let total = store.total();
+        assert!(total > 0, "records count in the total");
+        // Eight slots a lookup, as address records.
+        for slot in 2..=8 {
+            store.put_record(&C, &mail_record(1, slot, NOW + 60, 0), NOW);
+        }
+        let ninth = mail_record(1, 9, NOW + 60, 0);
+        assert_eq!(store.put_record(&C, &ninth, NOW), RecordPut::Full);
+        // A restart keeps them; a week later they've swept.
+        drop(store);
+        let mut store = Store::open(&dir, NOW + 10, Settings::default()).unwrap();
+        assert_eq!(found(store.get_records(&C, &[1; 16], NOW + 10))[0], newer);
+        let later = NOW + RECORD_AHEAD;
+        store.sweep(later);
+        assert!(found(store.get_records(&C, &[1; 16], later)).is_empty());
+        assert_eq!(store.total(), 0);
+    }
+
+    #[test]
+    fn mail_records_have_their_rates() {
+        let mut store = empty("record-rates");
+        for i in 0..RECORD_PUTS_PER_KEY {
+            let r = mail_record((i % 200) as u8, (i / 200) as u8, NOW + 60, 0);
+            assert_ne!(store.put_record(&C, &r, NOW), RecordPut::SlowDown);
+        }
+        let r = mail_record(0, 0, NOW + 60, 0);
+        assert_eq!(store.put_record(&C, &r, NOW), RecordPut::SlowDown);
+        for _ in 0..RECORD_GETS_PER_KEY {
+            assert_ne!(store.get_records(&C, &[0; 16], NOW), RecordGet::SlowDown);
+        }
+        assert_eq!(store.get_records(&C, &[0; 16], NOW), RecordGet::SlowDown);
     }
 }

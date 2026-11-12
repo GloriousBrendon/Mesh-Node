@@ -482,3 +482,42 @@ fn test_7_expiry() {
     drop(relay.runtime);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Mail records on the seed (PLAN-mailbox Task 5; routing D3, D5, D6 as
+/// changed): one 7 days ahead is taken and one a minute more refused, and
+/// `mrec-get` finds it; a seed without `--mail` has no such services.
+#[test]
+fn mail_records_on_the_seed() {
+    const WEEK: u64 = 7 * 86_400;
+    let dirs = ["mail", "plain"].map(|n| temp_dir(&format!("mrec-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let addr = MeshAddr::from_ticket(&seed.ticket()).unwrap();
+    let mut plain = Seed::start(&dirs[1], &relay);
+    let plain_addr = MeshAddr::from_ticket(&plain.ticket()).unwrap();
+    let record = |expiry: u64| [&[6u8; 16][..], &[1; 8], &expiry.to_be_bytes(), &[9; 80]].concat();
+    relay.runtime.block_on(async {
+        let node = client(&relay).await;
+        let week = record(now() + WEEK - 5);
+        assert_eq!(ask_seed(&node, &addr, "mrec-put", &week).await, [0]);
+        let past = record(now() + WEEK + 60);
+        assert_eq!(ask_seed(&node, &addr, "mrec-put", &past).await, [5], "bad");
+        let got = ask_seed(&node, &addr, "mrec-get", &[6; 16]).await;
+        assert_eq!(got, [&[0u8, 0, week.len() as u8][..], &week].concat());
+        // Without --mail the service isn't there: the stream is refused.
+        let refused = async {
+            let (_, mut send, mut recv) = node.open(&plain_addr, "mrec-put").await.ok()?;
+            frame::write_frame(&mut send, &week).await.ok()?;
+            send.finish().ok()?;
+            frame::read_frame(&mut recv).await.ok()?
+        };
+        assert_eq!(refused.await, None);
+        node.close().await;
+    });
+    seed.stop();
+    plain.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

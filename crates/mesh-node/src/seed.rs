@@ -30,6 +30,9 @@ pub const MAIL_CLAIM: &str = "mail-claim";
 pub const MAIL_PUT: &str = "mail-put";
 pub const MAIL_GET: &str = "mail-get";
 pub const MAIL_TAKE: &str = "mail-take";
+/// Mail records (routing D5 as changed), with the mail services.
+pub const MREC_PUT: &str = "mrec-put";
+pub const MREC_GET: &str = "mrec-get";
 
 const KEY_FILE: &str = "seed.key";
 const STORE_FILE: &str = "codes.bin";
@@ -79,6 +82,8 @@ struct Counts {
     knock_puts: AtomicU64,
     knock_gets: AtomicU64,
     mail_claims: AtomicU64,
+    record_puts: AtomicU64,
+    record_gets: AtomicU64,
     mail_puts: AtomicU64,
     mail_gets: AtomicU64,
     mail_takes: AtomicU64,
@@ -195,7 +200,9 @@ pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), Str
     };
     let mut services = vec![HOLD, GET, REVOKE, ADDR_PUT, ADDR_GET, KNOCK_PUT, KNOCK_GET];
     if options.mail {
-        services.extend([MAIL_CLAIM, MAIL_PUT, MAIL_GET, MAIL_TAKE]);
+        services.extend([
+            MAIL_CLAIM, MAIL_PUT, MAIL_GET, MAIL_TAKE, MREC_PUT, MREC_GET,
+        ]);
     }
     let config = Config {
         relays,
@@ -328,7 +335,9 @@ async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
                     .get(caller, request, &codes, now)
                     .to_bytes()
             })),
-            MAIL_CLAIM | MAIL_PUT | MAIL_GET | MAIL_TAKE if stores.mail.is_some() => {
+            MAIL_CLAIM | MAIL_PUT | MAIL_GET | MAIL_TAKE | MREC_PUT | MREC_GET
+                if stores.mail.is_some() =>
+            {
                 let mail = stores.mail.clone().expect("checked");
                 let service = stream.service.clone();
                 tokio::spawn(answer_batch(stream, move |caller, request, now| {
@@ -345,6 +354,14 @@ async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
                         MAIL_GET => {
                             count(&counts.mail_gets);
                             mail.get(caller, request, now)
+                        }
+                        MREC_PUT => {
+                            count(&counts.record_puts);
+                            vec![mail.put_record(caller, request, now).byte()]
+                        }
+                        MREC_GET => {
+                            count(&counts.record_gets);
+                            mail.get_records(caller, request, now).to_bytes()
                         }
                         _ => {
                             count(&counts.mail_takes);
@@ -540,14 +557,16 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
             take(&counts.knock_gets),
         );
         if let Some(mail) = &stores.mail {
-            let held = {
+            let (held, total) = {
                 let mut mail = lock(mail);
                 mail.sweep(now);
-                mail.len()
+                (mail.len(), mail.total())
             };
             eprintln!(
-                "mesh-node seed: last hour mail {} claims, {} puts, {} collects, {} takes; {held} envelopes held",
+                "mesh-node seed: last hour mail {} claims, {} mail record puts, {} mail record gets, {} puts, {} collects, {} takes; {held} envelopes held, {total} bytes in all",
                 take(&counts.mail_claims),
+                take(&counts.record_puts),
+                take(&counts.record_gets),
                 take(&counts.mail_puts),
                 take(&counts.mail_gets),
                 take(&counts.mail_takes),
