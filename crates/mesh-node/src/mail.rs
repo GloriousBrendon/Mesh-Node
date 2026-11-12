@@ -137,6 +137,15 @@ fn padded(real: usize) -> usize {
     real.div_ceil(CLAIM_BUCKET).max(1) * CLAIM_BUCKET
 }
 
+/// One week's slots, real and dummy, as the seed sees them: in address
+/// order, so neither where a slot sits nor which get puts says how many
+/// are real (M13).
+fn one_week(real: Vec<Ours>, mut dummies: Vec<Ours>) -> Vec<Ours> {
+    dummies.extend(real);
+    dummies.sort_unstable_by_key(|s| s.address);
+    dummies
+}
+
 /// The box an address is in.
 fn mail_box(address: &[u8; ADDRESS]) -> [u8; mailstore::BOX] {
     address[..mailstore::BOX].try_into().expect("16 bytes")
@@ -331,7 +340,8 @@ impl Helper {
     }
 
     /// Our slot in each box for `weeks`: every contact's and the self
-    /// pair's, padded with dummies to a whole `CLAIM_BUCKET` a week (M13).
+    /// pair's, padded with dummies to a whole `CLAIM_BUCKET` a week, each
+    /// week in address order (M13).
     /// With `only`, that contact's alone, unpadded.
     fn our_slots(&self, weeks: std::ops::RangeInclusive<u64>, only: Option<&MeshId>) -> Vec<Ours> {
         let Some(store) = &self.store else {
@@ -361,16 +371,16 @@ impl Helper {
             } else {
                 padded(real.len())
             };
-            for i in real.len()..padded {
+            let dummies = (real.len()..padded).map(|i| {
                 let address = store.device_key().mail_dummy(i as u32, week);
                 let secret = store.device_key().mail_collect_secret(&mail_box(&address));
-                out.push(Ours {
+                Ours {
                     id: None,
                     address,
                     secret,
-                });
-            }
-            out.extend(real);
+                }
+            });
+            out.extend(one_week(real, dummies.collect()));
         }
         out
     }
@@ -854,6 +864,27 @@ mod tests {
         assert_eq!(padded(128), 2 * CLAIM_BUCKET);
         assert_eq!(padded(129), 3 * CLAIM_BUCKET);
         assert_eq!(padded(1), CLAIM_BUCKET, "the self pair alone");
+    }
+
+    /// Where a real box sits says nothing: the same addresses, whichever
+    /// are real, go in the same order (M13).
+    #[test]
+    fn a_weeks_slots_dont_say_which_are_real() {
+        let slot = |n: u8, real: bool| Ours {
+            id: real.then(|| mesh_identity::RootKey::from_secret_bytes([n; 32]).id()),
+            address: [n.wrapping_mul(37); ADDRESS],
+            secret: Zeroizing::new([0; 32]),
+        };
+        let order = |real: &[u8]| {
+            let (r, d): (Vec<u8>, Vec<u8>) = (0..8).partition(|n| real.contains(n));
+            let slots = one_week(
+                r.iter().map(|n| slot(*n, true)).collect(),
+                d.iter().map(|n| slot(*n, false)).collect(),
+            );
+            slots.iter().map(|s| s.address).collect::<Vec<_>>()
+        };
+        assert_eq!(order(&[0, 1]), order(&[6, 7]));
+        assert_eq!(order(&[]), order(&[2, 3, 5]));
     }
 
     #[test]
