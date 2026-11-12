@@ -4,16 +4,18 @@
 //! on a seed (M1, M2, M5, M7). At unlock the helper collects its own boxes
 //! before any live delivery, opens what it finds as if it had come live,
 //! stores it, deletes it from the seed, and puts a receipt into the sender's
-//! box; a sender that collects the receipt moves its counters (M9).
+//! box at its holder: `ok`, `failed` and couldn't-open (M9). A sender that
+//! collects it moves its counters on the `ok`s and mails the `failed`s
+//! again. Every wrapper carries the pair's tag; one that fails it, or whose
+//! sender isn't a current device of the contact, is dropped (M7).
 //!
 //! A child of `helper`, as `dm` is.
 
 // ponytail: our only holder is the first `--seed`, and mail goes to the
 // first holder a reader's record names (Task 12: the next on failure, and
-// `--holder`); marks and `mseq`s live in memory (Task 11 saves them);
-// receipts carry `ok` only (Task 8); friends' devices only (Task 13 adds
-// our own). When we last renewed lives in memory too, so a restart renews
-// at its first unlock.
+// `--holder`); marks, `mseq`s and `failed` backoffs live in memory (Task 11
+// saves them); friends' devices only (Task 13 adds our own). When we last
+// renewed lives in memory too, so a restart renews at its first unlock.
 
 use super::*;
 use crate::mailstore;
@@ -66,6 +68,9 @@ pub(super) struct Mail {
     pub(super) reading: HashSet<MeshId>,
     /// When every record was last put and read.
     pub(super) round: u64,
+    /// Events a reader device answered `failed` by receipt: how many times,
+    /// and not to be mailed again before when (M9).
+    retry: HashMap<([u8; 32], u64), (u32, u64)>,
 }
 
 /// One of our slots: whose box it is (`None`, a dummy), the box and slot,
@@ -135,15 +140,71 @@ fn mail_box(address: &[u8; ADDRESS]) -> [u8; mailstore::BOX] {
     address[..mailstore::BOX].try_into().expect("16 bytes")
 }
 
-/// A receipt's body: the `mseq`s answered `ok`.
-fn receipt_body(oks: &[u64]) -> Vec<u8> {
-    oks.iter().flat_map(|m| m.to_be_bytes()).collect()
+/// What a receipt says (M9): the `mseq`s answered `ok`, `failed`, and
+/// those that couldn't be opened (M16).
+///
+/// ```text
+/// receipt = (count u16 | mseq u64 [count]) for ok, failed, couldn't open
+/// ```
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Receipt {
+    ok: Vec<u64>,
+    failed: Vec<u64>,
+    cant_open: Vec<u64>,
 }
 
-fn read_receipt(body: &[u8]) -> Option<Vec<u64>> {
-    let (chunks, rest) = body.as_chunks::<8>();
-    rest.is_empty()
-        .then(|| chunks.iter().map(|c| u64::from_be_bytes(*c)).collect())
+impl Receipt {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for list in [&self.ok, &self.failed, &self.cant_open] {
+            out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+            out.extend(list.iter().flat_map(|m| m.to_be_bytes()));
+        }
+        out
+    }
+
+    fn from_bytes(mut body: &[u8]) -> Option<Self> {
+        let mut lists: [Vec<u64>; 3] = Default::default();
+        for list in &mut lists {
+            let (count, rest) = body.split_first_chunk::<2>()?;
+            let (seqs, rest) =
+                rest.split_at_checked(usize::from(u16::from_be_bytes(*count)) * 8)?;
+            list.extend(
+                seqs.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_be_bytes(*c)),
+            );
+            body = rest;
+        }
+        let [ok, failed, cant_open] = lists;
+        body.is_empty().then_some(Receipt {
+            ok,
+            failed,
+            cant_open,
+        })
+    }
+}
+
+/// A `failed` is mailed again at once, then after 30 minutes, doubling to
+/// a day (mailbox `FAILED_BACKOFF`); D5's 30 days bound it.
+fn failed_wait(tries: u32) -> u64 {
+    const FIRST: u64 = 30 * 60;
+    const MOST: u64 = 86_400;
+    match tries {
+        0 | 1 => 0,
+        n => FIRST.saturating_mul(1 << (n - 2).min(16)).min(MOST),
+    }
+}
+
+/// Whether a wrapper's sender is a current device of the contact whose box
+/// it was in (M7): their newest list we hold, or our own for the self pair.
+fn current(list: Option<&mesh_identity::DeviceList>, sender: &[u8; 32]) -> bool {
+    list.is_some_and(|list| {
+        list.devices()
+            .iter()
+            .any(|c| c.device().as_bytes() == sender)
+    })
 }
 
 impl Helper {
@@ -154,7 +215,7 @@ impl Helper {
         let (Some(store), Some(net), Some(e2ee)) = (&self.store, &self.net, &self.e2ee) else {
             return;
         };
-        if store.id() == *id {
+        if store.id() == *id || self.cut.is_some() {
             return;
         }
         let (Some(keys), anon) = (store.pair_keys(id), net.anon.clone()) else {
@@ -179,6 +240,11 @@ impl Helper {
             let marked: HashSet<u64> = (self.mail.marked.keys())
                 .filter(|(d, _)| *d == device)
                 .map(|(_, n)| *n)
+                .chain(
+                    (self.mail.retry.iter())
+                        .filter(|((d, _), (_, at))| *d == device && *at > now)
+                        .map(|((_, n), _)| *n),
+                )
                 .collect();
             let Some((numbers, envelopes)) = self.dm_batch(id, device, |n| marked.contains(&n))
             else {
@@ -188,6 +254,7 @@ impl Helper {
                 continue;
             };
             let at = mail_address(&keys, id, &reader);
+            let tag_key = keys.mail_tag_key();
             for (number, envelope) in numbers.into_iter().zip(envelopes) {
                 let mseq = self.mail.next_seq(device);
                 let head = MailHead {
@@ -195,7 +262,7 @@ impl Helper {
                     kind: MAIL,
                     mseq,
                 };
-                let Ok(sealed) = seal_mail(&reader, &at, &head, &envelope) else {
+                let Ok(sealed) = seal_mail(&reader, &at, &head, &tag_key, &envelope) else {
                     continue;
                 };
                 self.mail.sent.insert((device, mseq), number);
@@ -406,10 +473,12 @@ impl Helper {
         }
         self.mail_renew();
         self.mail_records_round(true);
-        let mut receipts = Vec::new();
+        // Receipts by the holder they go to; takes go to ours.
+        let mut receipts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut takes = Vec::new();
-        let mut opened_count = 0;
+        let (mut opened_count, mut dropped) = (0, 0);
         let mut acked = false;
+        let mut again = Vec::new();
         for Found {
             id,
             address,
@@ -418,24 +487,46 @@ impl Helper {
             sealed,
         } in found
         {
+            takes.push([&address[..], &secret[..], &upto.to_be_bytes()].concat());
             let Some(store) = &self.store else { return };
-            let device_key = store.device_key();
+            let Some(keys) = store.pair_keys(&id) else {
+                continue;
+            };
+            let tag_key = keys.mail_tag_key();
+            let list = if id == store.id() {
+                Some(store.devices().clone())
+            } else {
+                store.contact(&id).and_then(|c| c.devices())
+            };
+            // Without their list, the devices e2ee holds keys for.
+            let known: HashSet<[u8; 32]> = match (&list, &self.e2ee) {
+                (None, Some(e2ee)) => e2ee.device_keys(&id).into_iter().collect(),
+                _ => HashSet::new(),
+            };
+            let me = store.device_key().public().to_bytes();
             let mut mail: Vec<(MailHead, Vec<u8>)> = Vec::new();
             let mut got_receipts = Vec::new();
             for bytes in &sealed {
-                match open_mail(device_key, ADDRESS, bytes) {
+                match open_mail(store.device_key(), ADDRESS, bytes, &tag_key) {
+                    // Not a current device of theirs, or not their tag:
+                    // dropped, and listed nowhere (M7).
+                    Ok((head, _))
+                        if !(current(list.as_ref(), &head.sender)
+                            || known.contains(&head.sender))
+                            || head.sender == me =>
+                    {
+                        dropped += 1
+                    }
                     Ok((head, body)) if head.kind == MAIL => mail.push((head, body)),
                     Ok(receipt) => got_receipts.push(receipt),
-                    Err(_) => {}
+                    Err(_) => dropped += 1,
                 }
             }
             for (head, body) in got_receipts {
-                acked |= self.mail_receipt(&head, &body);
+                acked |= self.mail_receipt(&id, &head, &body, &mut again);
             }
-            takes.push([&address[..], &secret[..], &upto.to_be_bytes()].concat());
             // Olm needs each sender device's mail in its order (M8).
             mail.sort_by_key(|(head, _)| (head.sender, head.mseq));
-            let keys = self.store.as_ref().and_then(|s| s.pair_keys(&id));
             for (sender, group) in group_by_sender(mail) {
                 let Ok(from_key) = VerifyingKey::from_bytes(&sender) else {
                     continue;
@@ -449,24 +540,36 @@ impl Helper {
                 let (tx, mut rx) = tokio::sync::oneshot::channel();
                 self.envelopes(id, from, frames, Some(tx));
                 let answers = rx.try_recv().unwrap_or_default();
-                let oks: Vec<u64> = (seqs.iter().zip(&answers))
-                    .filter(|(_, a)| **a == 0)
-                    .map(|(m, _)| *m)
-                    .collect();
-                opened_count += oks.len();
-                let (Some(keys), Some(store)) = (&keys, &self.store) else {
+                let mut receipt = Receipt::default();
+                for (mseq, answer) in seqs.iter().zip(&answers) {
+                    match *answer {
+                        dm::OK => receipt.ok.push(*mseq),
+                        dm::CANT_OPEN => receipt.cant_open.push(*mseq),
+                        _ => receipt.failed.push(*mseq),
+                    }
+                }
+                opened_count += receipt.ok.len();
+                // To the sender's holder, as its newest record names it.
+                let Some(holder) = self.mail.remembered.holder(&sender).map(str::to_owned) else {
                     continue;
                 };
-                let at = mail_address(keys, &id, &from_key);
+                let at = mail_address(&keys, &id, &from_key);
                 let head = MailHead {
-                    sender: store.device_key().public().to_bytes(),
+                    sender: me,
                     kind: RECEIPT,
                     mseq: 0,
                 };
-                if let Ok(receipt) = seal_mail(&from_key, &at, &head, &receipt_body(&oks)) {
-                    receipts.push([&OPEN[..], &receipt].concat());
+                if let Ok(sealed) = seal_mail(&from_key, &at, &head, &tag_key, &receipt.to_bytes())
+                {
+                    receipts
+                        .entry(holder)
+                        .or_default()
+                        .push([&OPEN[..], &sealed].concat());
                 }
             }
+        }
+        if dropped > 0 {
+            eprintln!("mesh-node: {dropped} mail wrappers dropped");
         }
         if opened_count > 0 {
             eprintln!("mesh-node: {opened_count} mailed events collected");
@@ -487,8 +590,10 @@ impl Helper {
             let (anon, seed) = (net.anon.clone(), seed.clone());
             self.mail.pending.retain(|h| !h.is_finished());
             self.mail.pending.push(tokio::spawn(async move {
-                if !receipts.is_empty() {
-                    let _ = seed::ask_many(&anon, &seed, seed::MAIL_PUT, &receipts).await;
+                for (holder, receipts) in receipts {
+                    if let Ok(holder) = MeshAddr::from_ticket(&holder) {
+                        let _ = seed::ask_many(&anon, &holder, seed::MAIL_PUT, &receipts).await;
+                    }
                 }
                 let _ = seed::ask_many(&anon, &seed, seed::MAIL_TAKE, &takes).await;
             }));
@@ -500,21 +605,58 @@ impl Helper {
         for id in ids {
             self.dm_deliver(&id);
         }
+        again.sort_unstable_by_key(|id| id.to_bytes());
+        again.dedup();
+        for id in again {
+            self.mail_out(&id);
+        }
     }
 
-    /// A receipt from a reader device: what it took moves its counter.
-    /// True if anything moved.
-    fn mail_receipt(&mut self, head: &MailHead, body: &[u8]) -> bool {
-        let (Some(oks), Some(history)) = (read_receipt(body), self.dm.as_mut()) else {
+    /// A receipt from `id`'s reader device: its `ok`s move our counter; its
+    /// `failed`s are mailed again (pushed on `again`), at once the first
+    /// time, then on `FAILED_BACKOFF`; its couldn't-opens are counted. True
+    /// if a counter moved.
+    fn mail_receipt(
+        &mut self,
+        id: &MeshId,
+        head: &MailHead,
+        body: &[u8],
+        again: &mut Vec<MeshId>,
+    ) -> bool {
+        let (Some(receipt), Some(history)) = (Receipt::from_bytes(body), self.dm.as_mut()) else {
             return false;
         };
+        let (now, reader) = (unix_now(), head.sender);
         let mut moved = false;
-        for mseq in oks {
-            if let Some(number) = self.mail.sent.remove(&(head.sender, mseq)) {
-                self.mail.marked.remove(&(head.sender, number));
-                history.acked(&head.sender, number, true);
+        for mseq in receipt.ok {
+            if let Some(number) = self.mail.sent.remove(&(reader, mseq)) {
+                self.mail.marked.remove(&(reader, number));
+                self.mail.retry.remove(&(reader, number));
+                history.acked(&reader, number, true);
                 moved = true;
             }
+        }
+        for mseq in &receipt.failed {
+            if let Some(number) = self.mail.sent.remove(&(reader, *mseq)) {
+                self.mail.marked.remove(&(reader, number));
+                let (tries, at) = self.mail.retry.entry((reader, number)).or_insert((0, 0));
+                *tries += 1;
+                *at = now + failed_wait(*tries);
+                again.push(*id);
+            }
+        }
+        if !receipt.failed.is_empty() {
+            eprintln!(
+                "mesh-node: {} mailed events answered failed",
+                receipt.failed.len()
+            );
+        }
+        // ponytail: counted only; PLAN-mailbox Task 10 answers them.
+        if !receipt.cant_open.is_empty() {
+            eprintln!(
+                "mesh-node: {} mailed events couldn't be opened",
+                receipt.cant_open.len()
+            );
         }
         moved
     }
@@ -574,8 +716,43 @@ mod tests {
 
     #[test]
     fn receipts_read_back() {
-        assert_eq!(read_receipt(&receipt_body(&[3, 9])), Some(vec![3, 9]));
-        assert_eq!(read_receipt(&[0; 7]), None);
-        assert_eq!(read_receipt(&[]), Some(vec![]));
+        let receipt = Receipt {
+            ok: vec![3, 9],
+            failed: vec![4],
+            cant_open: vec![],
+        };
+        assert_eq!(Receipt::from_bytes(&receipt.to_bytes()), Some(receipt));
+        assert_eq!(Receipt::from_bytes(&[0; 7]), None);
+        assert_eq!(Receipt::from_bytes(&[0, 1, 0]), None, "cut short");
+        assert_eq!(Receipt::from_bytes(&[0; 6]), Some(Receipt::default()));
+    }
+
+    #[test]
+    fn failed_backs_off() {
+        assert_eq!(failed_wait(1), 0, "at once the first time");
+        assert_eq!(failed_wait(2), 30 * 60);
+        assert_eq!(failed_wait(3), 60 * 60);
+        assert_eq!(failed_wait(7), 16 * 3600);
+        assert_eq!(failed_wait(8), 86_400, "a day at most");
+        assert_eq!(failed_wait(60), 86_400);
+    }
+
+    /// Mail from a device that isn't one of the contact's (M7) is dropped.
+    #[test]
+    fn only_a_contacts_current_device_is_trusted() {
+        use mesh_identity::{DeviceCert, DeviceKey, DeviceList, RootKey};
+        let root = RootKey::generate().unwrap();
+        let (desk, stranger) = (
+            DeviceKey::generate().unwrap(),
+            DeviceKey::generate().unwrap(),
+        );
+        let cert = DeviceCert::issue(&root, &desk.public(), "desk", 1).unwrap();
+        let list = DeviceList::first(&root, cert).unwrap();
+        assert!(current(Some(&list), &desk.public().to_bytes()));
+        assert!(!current(Some(&list), &stranger.public().to_bytes()));
+        assert!(
+            !current(None, &desk.public().to_bytes()),
+            "a contact whose list we don't hold"
+        );
     }
 }

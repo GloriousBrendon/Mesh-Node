@@ -171,10 +171,21 @@ fn emit(binding: &str, payload: Value) {
 const QUEUED_COMMANDS: usize = 16;
 
 /// Reads commands until stdin closes (Mesh quit or restarted us).
-pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u64) {
+/// `cut_seed` (`--cut seed`, test-only): start with the seeds cut off,
+/// until a `cutOff` command (SPEC-mailbox decided Q16).
+pub async fn run(
+    dir: &Path,
+    relays: Relays,
+    seeds: Vec<MeshAddr>,
+    record_ttl: u64,
+    cut_seed: bool,
+) {
     let (back, mut answers) = tokio::sync::mpsc::unbounded_channel();
     let mut helper = Helper::new(dir.join(KEYSTORE_FILE), relays, seeds, back);
     helper.record_ttl = record_ttl;
+    if cut_seed {
+        helper.cut = Some(std::mem::take(&mut helper.seeds));
+    }
     helper.emit_identity();
     // Kept unlocked: the identity is already open.
     helper.start_net().await;
@@ -278,6 +289,8 @@ struct Helper {
     allowed: Arc<RwLock<Allowed>>,
     /// How long address records last (D4).
     record_ttl: u64,
+    /// `--cut seed`: the seeds, held back until `cutOff`.
+    cut: Option<Arc<Vec<MeshAddr>>>,
     /// The wait before the next publish after a failed one.
     publish_retry: Duration,
     /// Each friend's devices and what each last said (D12).
@@ -423,6 +436,7 @@ impl Helper {
             back,
             allowed: Arc::default(),
             record_ttl: routing::RECORD_TTL,
+            cut: None,
             publish_retry: PUBLISH_RETRY,
             presence: HashMap::new(),
             idle: false,
@@ -471,6 +485,16 @@ impl Helper {
                 self.store = Some(Keystore::unlock(&self.path, arg(0)?, arg(1)?)?);
                 self.emit_unlocked();
                 self.start_net().await;
+            }
+            "cutOff" => {
+                // Test-only: the seeds come back (`--cut seed`).
+                if let Some(seeds) = self.cut.take() {
+                    self.seeds = seeds;
+                }
+                self.publish();
+                self.mail_renew();
+                self.mail_out_all();
+                self.emit_net();
             }
             "idLock" => {
                 self.mail_flush().await;
@@ -1262,7 +1286,7 @@ impl Helper {
                 }
                 Err(e) => {
                     eprintln!("mesh-node: couldn't open an envelope: {e}");
-                    answers[i] = 1;
+                    answers[i] = dm::CANT_OPEN;
                 }
             }
         }

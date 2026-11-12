@@ -21,9 +21,12 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 /// The frame flag asking the reader to answer each frame once it's stored.
 pub(super) const ANSWER: u8 = 2;
 /// The answer for a frame that was opened and stored, or refused for good.
-const OK: u8 = 0;
-/// The answer for a frame that couldn't be opened or stored: send it again.
-const FAILED: u8 = 1;
+pub(super) const OK: u8 = 0;
+/// The answer for a frame that couldn't be stored: send it again.
+pub(super) const FAILED: u8 = 1;
+/// The answer for a frame Olm couldn't open. Live senders take it as
+/// `failed`; mail lists it apart (mailbox M16).
+pub(super) const CANT_OPEN: u8 = 2;
 /// Shown text in a notification, at most (as WhatsApp's).
 const NOTIFY_CHARS: usize = 100;
 /// After a `failed` answer, the first try again; later ones go on refresh.

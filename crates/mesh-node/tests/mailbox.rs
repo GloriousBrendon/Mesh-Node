@@ -425,9 +425,21 @@ const SETTLE: Duration = Duration::from_secs(3);
 
 /// Starts a helper again on its data with the clock `days` on, unlocked.
 fn again(dir: &std::path::Path, relay: &Relay, seeds: &[&str], name: &str, days: u64) -> Helper {
+    again_with(dir, relay, seeds, name, days, &[])
+}
+
+fn again_with(
+    dir: &std::path::Path,
+    relay: &Relay,
+    seeds: &[&str],
+    name: &str,
+    days: u64,
+    more: &[&str],
+) -> Helper {
     let offset = (days * DAY).to_string();
     let mut args: Vec<&str> = seeds.iter().flat_map(|s| ["--seed", s]).collect();
     args.extend(["--record-ttl", TTL, "--clock-offset", &offset]);
+    args.extend(more);
     let mut h = Helper::start_with(dir, relay, &args);
     let (binding, first) = h.event();
     assert_eq!(binding, "meshIdentity");
@@ -626,6 +638,104 @@ fn test_5_wiped_holder() {
     let alice_log = alice.quit();
     assert_eq!(mailed(&alice_log), 2, "mailed, and again after the wipe");
     p.done(vec![alice_log, bob.quit()], &["three"]);
+}
+
+/// `x` and `y` become friends.
+fn befriend(x: &mut Helper, id_x: &str, y: &mut Helper, id_y: &str) {
+    x.expect("friendAdd", &[id_y, ""], "meshSocial");
+    y.expect("friendAdd", &[id_x, ""], "meshSocial");
+    x.social_until(|s| has(s, "friends", id_y));
+    y.social_until(|s| has(s, "friends", id_x));
+}
+
+/// The group chat `g` has `n` members.
+fn members(g: &str, n: usize) -> impl Fn(&Value) -> bool {
+    let g = g.to_owned();
+    move |c: &Value| {
+        (c["chats"].as_array().unwrap().iter())
+            .any(|c| c["id"] == g.as_str() && c["members"].as_array().unwrap().len() == n)
+    }
+}
+
+/// Test 11. A group of Alice and Bob; Bob is away. Alice adds Dave with her
+/// seed connection cut, so her add can't be mailed to Bob yet; Dave gets it
+/// live, sends "hi from Dave" (mailed to Bob) and locks. Bob collects
+/// Dave's message with no add and answers `failed` by receipt. Alice's
+/// connection comes back and her add is mailed; Bob collects it. Dave
+/// collects the `failed` and mails his message again at once; Bob shows
+/// it. (Bob comes and goes between steps, so nothing reaches him live.)
+///
+/// Can't happen as written: dm sends every event of a shared chat to each
+/// member's devices but its author's, so Dave's mail carries Alice's add
+/// before his message, and Bob takes both. Waiting on a decision (the
+/// Task 10 report).
+#[test]
+#[ignore = "Dave relays Alice's add (dm D5), so Bob never lacks it"]
+fn test_11_failed_by_mail() {
+    let dirs = ["seed", "alice", "bob", "dave"].map(|n| temp_dir(&format!("mail11-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice", &[]);
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &[]);
+    let (mut dave, id_d) = helper(&dirs[3], &relay, &ticket, "dave", &[]);
+    befriend(&mut alice, &id_a, &mut bob, &id_b);
+    befriend(&mut alice, &id_a, &mut dave, &id_d);
+    befriend(&mut bob, &id_b, &mut dave, &id_d);
+    let made = ask(&mut alice, "dmGroupCreate", &[&id_b, "trip"], "meshDmChats");
+    let g = (made["chats"].as_array().unwrap().iter())
+        .find(|c| c["kind"] == "group")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    until(&mut bob, "meshDmChats", members(&g, 2));
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+
+    // Alice, cut off from the seed, adds Dave; he writes, mailed to Bob.
+    let mut logs = vec![alice.quit()];
+    let mut alice = again_with(&dirs[1], &relay, &[&ticket], "alice", 0, &["--cut", "seed"]);
+    ask(&mut alice, "dmGroupAdd", &[&g, &id_d], "meshDmChats");
+    until(&mut dave, "meshDmChats", members(&g, 3));
+    ask(&mut dave, "dmSend", &[&g, "hi from Dave"], "meshDmMessages");
+    locks(&mut dave);
+    locks(&mut alice);
+
+    // Bob gets Dave's message before the add: refused, `failed` by receipt.
+    unlocks(&mut bob, "bob");
+    std::thread::sleep(SETTLE);
+    let page = ask(&mut bob, "dmOpen", &[&g], "meshDmMessages");
+    assert!(!texts(&page).contains(&"hi from Dave".to_owned()));
+    locks(&mut bob);
+
+    // Alice's connection comes back; her add is mailed, and Bob takes it.
+    unlocks(&mut alice, "alice");
+    ask(&mut alice, "cutOff", &[], "meshNet");
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmChats", members(&g, 3));
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+
+    // Dave collects the `failed` and mails his message again at once.
+    unlocks(&mut dave, "dave");
+    std::thread::sleep(SETTLE);
+    locks(&mut dave);
+    unlocks(&mut bob, "bob");
+    page_until(&mut bob, &g, |p| {
+        texts(p).contains(&"hi from Dave".to_owned())
+    });
+
+    let dave_log = dave.quit();
+    assert_eq!(mailed(&dave_log), 2, "mailed, then again on the `failed`");
+    logs.extend([alice.quit(), bob.quit(), dave_log, seed.stop().concat()]);
+    assert!(logs.iter().all(|l| !l.contains("hi from Dave")));
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Records that outlast the test, so no refresh comes.

@@ -18,6 +18,8 @@
 //!
 //! `--clock-offset <secs>`, on either, moves the process's clock, for tests
 //! only (SPEC-mailbox), as `--record-ttl` is.
+//! `--cut seed`, on the helper and for tests only, starts it cut off from
+//! its seeds until a `cutOff` command.
 
 mod addrs;
 mod codes;
@@ -146,7 +148,16 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        runtime.block_on(helper::run(&dir, relays, seeds, record_ttl));
+        // ponytail: `--cut live` comes with PLAN-mailbox Task 14.
+        let cut_seed = match args.windows(2).find(|w| w[0] == "--cut") {
+            None => false,
+            Some(w) if w[1] == "seed" => true,
+            Some(_) => {
+                eprintln!("mesh-node: --cut takes seed");
+                std::process::exit(2);
+            }
+        };
+        runtime.block_on(helper::run(&dir, relays, seeds, record_ttl, cut_seed));
     }
 }
 

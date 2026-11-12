@@ -19,6 +19,7 @@ const CONVERSATION_CONTEXT: &str = "mesh/v1/dm-conversation";
 const MAIL_BOX_CONTEXT: &str = "mesh/v1/mail-box";
 const MAIL_SLOT_CONTEXT: &str = "mesh/v1/mail-slot";
 const MAIL_LOOKUP_CONTEXT: &str = "mesh/v1/mail-lookup";
+const MAIL_TAG_CONTEXT: &str = "mesh/v1/mail-tag";
 /// A mail week (SPEC-mailbox M5): unix days / 7.
 const WEEK: u64 = 7 * DAY;
 
@@ -108,6 +109,12 @@ impl PairKeys {
             .update(device.as_bytes())
             .finalize();
         hash.as_bytes()[..8].try_into().expect("8 bytes")
+    }
+
+    /// The key of the pair tag on mail (SPEC-mailbox M7): only the pair's
+    /// devices hold it, so a seed can't make a tag.
+    pub fn mail_tag_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(*self.hasher(MAIL_TAG_CONTEXT).finalize().as_bytes())
     }
 
     pub(crate) fn record_key(&self) -> Zeroizing<[u8; 32]> {
