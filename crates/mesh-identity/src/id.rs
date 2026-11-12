@@ -114,6 +114,18 @@ impl DeviceKey {
         Zeroizing::new(*hasher.finalize().as_bytes())
     }
 
+    /// The `i`th dummy box and slot for `week` (SPEC-mailbox M13): claimed,
+    /// renewed and collected as real ones are, so a holder can't tell how
+    /// many are real. Stable across the week; no one else can make it.
+    pub fn mail_dummy(&self, i: u32, week: u64) -> [u8; 24] {
+        let mut hasher = blake3::Hasher::new_derive_key("mesh/v1/mail-dummy");
+        hasher.update(self.secret_bytes().as_ref());
+        hasher.update(&i.to_be_bytes()).update(&week.to_be_bytes());
+        hasher.finalize().as_bytes()[..24]
+            .try_into()
+            .expect("24 bytes")
+    }
+
     /// X25519 between this device key and `their` device key (the e2ee seal,
     /// SPEC-e2ee D8). `None` for a weak key, whose result would be predictable.
     pub fn diffie_hellman(&self, their: &VerifyingKey) -> Option<Zeroizing<[u8; 32]>> {
@@ -398,5 +410,17 @@ mod tests {
         assert_ne!(*one, *a.mail_collect_secret(&[2; 16]));
         assert_ne!(*one, *b.mail_collect_secret(&[1; 16]));
         assert_ne!(mail_collect_tag(&one), *one);
+    }
+
+    #[test]
+    fn mail_dummies_are_stable_for_a_week_and_this_devices_own() {
+        let (a, b) = (
+            DeviceKey::generate().unwrap(),
+            DeviceKey::generate().unwrap(),
+        );
+        assert_eq!(a.mail_dummy(3, 10), a.mail_dummy(3, 10));
+        assert_ne!(a.mail_dummy(3, 10), a.mail_dummy(4, 10));
+        assert_ne!(a.mail_dummy(3, 10), a.mail_dummy(3, 11));
+        assert_ne!(a.mail_dummy(3, 10), b.mail_dummy(3, 10));
     }
 }

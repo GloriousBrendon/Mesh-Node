@@ -215,7 +215,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             }
             _ = refresh.tick() => {
                 helper.dm_retry_all();
-                helper.mail_claim();
+                helper.mail_renew();
                 helper.mail_out_all();
                 helper.publish();
                 helper.dial_contacts();
@@ -807,6 +807,8 @@ impl Helper {
     fn contacts_changed(&mut self, only: Option<&MeshId>) {
         self.allow_contacts();
         self.publish_only(only);
+        // Mail for them must have somewhere to go before the next renewal.
+        self.mail_claim(only);
     }
 
     /// They're no longer let in; their records lapse (routing D4).

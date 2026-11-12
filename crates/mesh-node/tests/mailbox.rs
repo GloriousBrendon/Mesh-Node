@@ -15,9 +15,8 @@ const PASSWORD: &str = "correct horse battery staple";
 const TTL: &str = "8";
 /// Test 1: "one" shows within this long of the reader's helper coming online.
 const SHOWS_WITHIN: Duration = Duration::from_secs(5);
-/// With clocks 30 s apart, records of a minute, so refreshes every 15 s.
+/// With clocks 30 s apart, records of a minute.
 const SKEWED_TTL: &str = "60";
-const SKEWED_REFRESH: Duration = Duration::from_secs(16);
 
 fn helper(
     dir: &std::path::Path,
@@ -172,11 +171,6 @@ fn one_to_one(name: &str, clock: &str) {
     bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
     alice.social_until(|s| has(s, "friends", &id_b));
     bob.social_until(|s| has(s, "friends", &id_a));
-    if !clock.is_empty() {
-        // ponytail: Bob claims for a new contact at his next refresh; Tasks 6
-        // and 7 claim at once and this wait goes.
-        std::thread::sleep(SKEWED_REFRESH);
-    }
     // They've written once, live, so a session is open (PLAN-mailbox Task
     // 1; without one it takes the mail record, test 17).
     ask(&mut alice, "dmSend", &[&id_b, "hi"], "meshDmMessages");
@@ -419,6 +413,42 @@ fn test_6_junk_quotas_tokens_and_rates() {
     });
     let logs = [open.stop(), closed.stop()].concat().concat();
     assert!(!logs.contains(token), "the token reached a log");
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Records that outlast the test, so no refresh comes.
+const NO_REFRESH: &str = "3600";
+
+/// A new contact is claimed for at once (PLAN-mailbox Tasks 6 and 7): Bob
+/// adds Alice and locks, Alice mails him, and he gets it, with no refresh
+/// between.
+#[test]
+fn a_new_contact_is_claimed_at_once() {
+    let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("mail-new-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let ticket = seed.ticket();
+    let once = ["--record-ttl", NO_REFRESH];
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice", &once);
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &once);
+    alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
+    bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
+    alice.social_until(|s| has(s, "friends", &id_b));
+    bob.social_until(|s| has(s, "friends", &id_a));
+    // Alice has Bob's keys from his address record once they've met.
+    std::thread::sleep(Duration::from_secs(2));
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "new"], "meshDmMessages");
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "new");
+    let alice_log = alice.quit();
+    assert_eq!(mailed(&alice_log), 1);
+    bob.quit();
+    seed.stop();
     drop(relay.runtime);
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);

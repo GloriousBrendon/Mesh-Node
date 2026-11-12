@@ -9,10 +9,10 @@
 //! A child of `helper`, as `dm` is.
 
 // ponytail: PLAN-mailbox Task 1, the thin path. The first `--seed` is the
-// only holder, this week's box the only one, claimed at unlock and at each
-// refresh (Task 7 claims ahead, pads and renews daily); marks and `mseq`s
-// live in memory (Task 11 saves them); receipts carry `ok` only (Task 8);
-// friends' devices only (Task 13 adds our own).
+// only holder; marks and `mseq`s live in memory (Task 11 saves them);
+// receipts carry `ok` only (Task 8); friends' devices only (Task 13 adds
+// our own). When we last renewed lives in memory too, so a restart renews
+// at its first unlock.
 
 use super::*;
 use crate::mailstore;
@@ -30,6 +30,16 @@ pub(super) const HOLDER_WAIT: Duration = Duration::from_secs(10);
 const OPEN: [u8; 1] = [0];
 /// A box and slot, as the seed names a slot.
 const ADDRESS: usize = mailstore::BOX + mailstore::SLOT;
+/// Weeks claimed beyond this one (mailbox *Limits*): a box for every day
+/// of 30 away.
+pub(super) const CLAIM_WEEKS_AHEAD: u64 = 5;
+/// Weeks collected before this one at unlock: the 30-day promise.
+pub(super) const COLLECT_WEEKS_BACK: u64 = 5;
+/// Claims, renewals and collects go in buckets of this many boxes a week,
+/// the rest dummies (M13).
+pub(super) const CLAIM_BUCKET: usize = 64;
+/// Claims are renewed this often while unlocked (M6).
+const RENEW_EVERY: u64 = 86_400;
 
 /// What mail knows between locks, in this process.
 #[derive(Default)]
@@ -44,11 +54,28 @@ pub(super) struct Mail {
     pending: Vec<JoinHandle<()>>,
     /// The unlock's collect hasn't come back: live sending waits for it.
     pub(super) collecting: bool,
+    /// When we last claimed every box (0: not since this process started).
+    renewed: u64,
 }
 
-/// One contact's box for us this week: whose, the box and slot, the collect
-/// secret, and a claim of it.
-type Slot = (MeshId, [u8; ADDRESS], Zeroizing<[u8; 32]>, Vec<u8>);
+/// One of our slots: whose box it is (`None`, a dummy), the box and slot,
+/// and the collect secret.
+struct Ours {
+    id: Option<MeshId>,
+    address: [u8; ADDRESS],
+    secret: Zeroizing<[u8; 32]>,
+}
+
+impl Ours {
+    fn claim(&self, expiry: u64) -> Vec<u8> {
+        let tag = mail_collect_tag(&self.secret);
+        [&OPEN[..], &self.address, &tag, &expiry.to_be_bytes()].concat()
+    }
+
+    fn get(&self) -> Vec<u8> {
+        [&self.address[..], &self.secret[..]].concat()
+    }
+}
 
 /// What a collect found in one contact's box for us.
 pub(super) struct Found {
@@ -78,10 +105,24 @@ fn unix_now_ms() -> u64 {
 
 /// The box and slot of `reader`'s `device` for the pair `keys`, this week.
 fn mail_address(keys: &PairKeys, reader: &MeshId, device: &VerifyingKey) -> [u8; ADDRESS] {
+    address_in(keys, reader, device, week_of(unix_now()))
+}
+
+fn address_in(keys: &PairKeys, reader: &MeshId, device: &VerifyingKey, week: u64) -> [u8; ADDRESS] {
     let mut out = [0u8; ADDRESS];
-    out[..mailstore::BOX].copy_from_slice(&keys.mail_box(reader, week_of(unix_now())));
+    out[..mailstore::BOX].copy_from_slice(&keys.mail_box(reader, week));
     out[mailstore::BOX..].copy_from_slice(&keys.mail_slot(device));
     out
+}
+
+/// How many boxes a week `real` ones are claimed and collected as (M13).
+fn padded(real: usize) -> usize {
+    real.div_ceil(CLAIM_BUCKET).max(1) * CLAIM_BUCKET
+}
+
+/// The box an address is in.
+fn mail_box(address: &[u8; ADDRESS]) -> [u8; mailstore::BOX] {
+    address[..mailstore::BOX].try_into().expect("16 bytes")
 }
 
 /// A receipt's body: the `mseq`s answered `ok`.
@@ -194,35 +235,74 @@ impl Helper {
         }
     }
 
-    /// This week's box and slot for each contact, the collect secret, and
-    /// a claim of it.
-    fn mail_slots(&self) -> Vec<Slot> {
+    /// Our slot in each box for `weeks`: every contact's and the self
+    /// pair's, padded with dummies to a whole `CLAIM_BUCKET` a week (M13).
+    /// With `only`, that contact's alone, unpadded.
+    fn our_slots(&self, weeks: std::ops::RangeInclusive<u64>, only: Option<&MeshId>) -> Vec<Ours> {
         let Some(store) = &self.store else {
             return Vec::new();
         };
         let (me, device) = (store.id(), store.device_key().public());
-        let expiry = (unix_now() + mailstore::CLAIM_LIFE).to_be_bytes();
+        let ids: Vec<MeshId> = std::iter::once(me)
+            .chain(store.contacts().iter().map(|c| c.id()))
+            .filter(|id| only.is_none_or(|only| only == id))
+            .collect();
         let mut out = Vec::new();
-        for contact in store.contacts() {
-            if let Some(keys) = store.pair_keys(&contact.id()) {
-                let at = mail_address(&keys, &me, &device);
-                let mail_box = at[..mailstore::BOX].try_into().expect("16 bytes");
-                let secret = store.device_key().mail_collect_secret(&mail_box);
-                let claim = [&OPEN[..], &at, &mail_collect_tag(&secret), &expiry].concat();
-                out.push((contact.id(), at, secret, claim));
+        for week in weeks {
+            let real = (ids.iter()).filter_map(|id| Some((*id, store.pair_keys(id)?)));
+            let real: Vec<Ours> = real
+                .map(|(id, keys)| {
+                    let address = address_in(&keys, &me, &device, week);
+                    let secret = store.device_key().mail_collect_secret(&mail_box(&address));
+                    Ours {
+                        id: Some(id),
+                        address,
+                        secret,
+                    }
+                })
+                .collect();
+            let padded = if only.is_some() {
+                real.len()
+            } else {
+                padded(real.len())
+            };
+            for i in real.len()..padded {
+                let address = store.device_key().mail_dummy(i as u32, week);
+                let secret = store.device_key().mail_collect_secret(&mail_box(&address));
+                out.push(Ours {
+                    id: None,
+                    address,
+                    secret,
+                });
             }
+            out.extend(real);
         }
         out
     }
 
-    /// Claims this week's slot in every contact's box (M6).
-    pub(super) fn mail_claim(&self) {
+    /// Renews our claims if a day has passed since the last time.
+    pub(super) fn mail_renew(&mut self) {
+        if unix_now() >= self.mail.renewed + RENEW_EVERY {
+            self.mail_claim(None);
+        }
+    }
+
+    /// Claims our slot in every box from this week to `CLAIM_WEEKS_AHEAD`
+    /// (M6), or with `only`, in that new contact's boxes alone, at once.
+    pub(super) fn mail_claim(&mut self, only: Option<&MeshId>) {
         let (Some(net), Some(seed)) = (&self.net, self.seeds.first()) else {
             return;
         };
-        let claims: Vec<Vec<u8>> = self.mail_slots().into_iter().map(|s| s.3).collect();
+        let now = unix_now();
+        let week = week_of(now);
+        let expiry = now + mailstore::CLAIM_LIFE;
+        let slots = self.our_slots(week..=week + CLAIM_WEEKS_AHEAD, only);
+        let claims: Vec<Vec<u8>> = slots.iter().map(|s| s.claim(expiry)).collect();
         if claims.is_empty() {
             return;
+        }
+        if only.is_none() {
+            self.mail.renewed = now;
         }
         let (anon, seed) = (net.anon.clone(), seed.clone());
         tokio::spawn(async move {
@@ -230,36 +310,28 @@ impl Helper {
         });
     }
 
-    /// At unlock: claim, and collect this week's mail for this device from
-    /// every contact's box, before any live sending.
+    /// At unlock: collect this device's mail from every box of this week
+    /// and `COLLECT_WEEKS_BACK` before it, dummies too (M13), before any
+    /// live sending. Claims follow, once it's back.
     pub(super) fn mail_collect(&mut self) {
         let (Some(net), Some(seed)) = (&self.net, self.seeds.first()) else {
             return;
         };
-        let (mut asked, mut claims, mut gets) = (Vec::new(), Vec::new(), Vec::new());
-        for (id, at, secret, claim) in self.mail_slots() {
-            claims.push(claim);
-            gets.push([&at[..], &secret[..]].concat());
-            asked.push((id, at, secret));
-        }
+        let week = week_of(unix_now());
+        let asked = self.our_slots(week.saturating_sub(COLLECT_WEEKS_BACK)..=week, None);
+        let gets: Vec<Vec<u8>> = asked.iter().map(Ours::get).collect();
         if asked.is_empty() {
             return;
         }
         self.mail.collecting = true;
         let (anon, seed, back) = (net.anon.clone(), seed.clone(), self.back.clone());
         tokio::spawn(async move {
-            let claiming = seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims);
             let collecting = seed::ask_many(&anon, &seed, seed::MAIL_GET, &gets);
-            let both = async { tokio::join!(claiming, collecting) };
-            let answers = tokio::time::timeout(HOLDER_WAIT, both)
-                .await
-                .map(|(claimed, got)| {
-                    refused(claimed);
-                    got
-                });
+            let answers = tokio::time::timeout(HOLDER_WAIT, collecting).await;
             let found = match answers {
                 Ok(Ok(answers)) => (asked.into_iter().zip(answers))
-                    .filter_map(|((id, address, secret), answer)| {
+                    .filter_map(|(ours, answer)| {
+                        let (id, address, secret) = (ours.id?, ours.address, ours.secret);
                         let (upto, sealed) = mailstore::read_got(&answer)?;
                         (!sealed.is_empty()).then_some(Found {
                             id,
@@ -281,6 +353,7 @@ impl Helper {
     /// live sending starts.
     pub(super) fn mail_found(&mut self, found: Vec<Found>) {
         self.mail.collecting = false;
+        self.mail_renew();
         let mut receipts = Vec::new();
         let mut takes = Vec::new();
         let mut opened_count = 0;
@@ -432,6 +505,16 @@ mod tests {
         assert!(b > a && a >= unix_now_ms());
         // Another reader device has its own count, also from the clock.
         assert!(mail.next_seq([2; 32]) >= unix_now_ms());
+    }
+
+    /// A seed sees the same number of claims, renewals and collects with
+    /// 70 contacts as with 127 (each with the self pair, so 71 and 128).
+    #[test]
+    fn boxes_come_in_buckets() {
+        assert_eq!(padded(71), padded(128));
+        assert_eq!(padded(128), 2 * CLAIM_BUCKET);
+        assert_eq!(padded(129), 3 * CLAIM_BUCKET);
+        assert_eq!(padded(1), CLAIM_BUCKET, "the self pair alone");
     }
 
     #[test]
