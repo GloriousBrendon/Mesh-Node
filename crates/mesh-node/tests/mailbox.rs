@@ -700,87 +700,6 @@ fn members(g: &str, n: usize) -> impl Fn(&Value) -> bool {
     }
 }
 
-/// Test 11. A group of Alice and Bob; Bob is away. Alice adds Dave with her
-/// seed connection cut, so her add can't be mailed to Bob yet; Dave gets it
-/// live, sends "hi from Dave" (mailed to Bob) and locks. Bob collects
-/// Dave's message with no add and answers `failed` by receipt. Alice's
-/// connection comes back and her add is mailed; Bob collects it. Dave
-/// collects the `failed` and mails his message again at once; Bob shows
-/// it. (Bob comes and goes between steps, so nothing reaches him live.)
-///
-/// Can't happen as written: dm sends every event of a shared chat to each
-/// member's devices but its author's, so Dave's mail carries Alice's add
-/// before his message, and Bob takes both. Waiting on a decision (the
-/// Task 10 report).
-#[test]
-#[ignore = "Dave relays Alice's add (dm D5), so Bob never lacks it"]
-fn test_11_failed_by_mail() {
-    let dirs = ["seed", "alice", "bob", "dave"].map(|n| temp_dir(&format!("mail11-{n}")));
-    let relay = Relay::start();
-    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
-    let ticket = seed.ticket();
-    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice", &[]);
-    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &[]);
-    let (mut dave, id_d) = helper(&dirs[3], &relay, &ticket, "dave", &[]);
-    befriend(&mut alice, &id_a, &mut bob, &id_b);
-    befriend(&mut alice, &id_a, &mut dave, &id_d);
-    befriend(&mut bob, &id_b, &mut dave, &id_d);
-    let made = ask(&mut alice, "dmGroupCreate", &[&id_b, "trip"], "meshDmChats");
-    let g = (made["chats"].as_array().unwrap().iter())
-        .find(|c| c["kind"] == "group")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    until(&mut bob, "meshDmChats", members(&g, 2));
-    std::thread::sleep(SETTLE);
-    locks(&mut bob);
-
-    // Alice, cut off from the seed, adds Dave; he writes, mailed to Bob.
-    let mut logs = vec![alice.quit()];
-    let mut alice = again_with(&dirs[1], &relay, &[&ticket], "alice", 0, &["--cut", "seed"]);
-    ask(&mut alice, "dmGroupAdd", &[&g, &id_d], "meshDmChats");
-    until(&mut dave, "meshDmChats", members(&g, 3));
-    ask(&mut dave, "dmSend", &[&g, "hi from Dave"], "meshDmMessages");
-    locks(&mut dave);
-    locks(&mut alice);
-
-    // Bob gets Dave's message before the add: refused, `failed` by receipt.
-    unlocks(&mut bob, "bob");
-    std::thread::sleep(SETTLE);
-    let page = ask(&mut bob, "dmOpen", &[&g], "meshDmMessages");
-    assert!(!texts(&page).contains(&"hi from Dave".to_owned()));
-    locks(&mut bob);
-
-    // Alice's connection comes back; her add is mailed, and Bob takes it.
-    unlocks(&mut alice, "alice");
-    alice.send("cutOff", &[]);
-    std::thread::sleep(SETTLE);
-    locks(&mut alice);
-    unlocks(&mut bob, "bob");
-    until(&mut bob, "meshDmChats", members(&g, 3));
-    std::thread::sleep(SETTLE);
-    locks(&mut bob);
-
-    // Dave collects the `failed` and mails his message again at once.
-    unlocks(&mut dave, "dave");
-    std::thread::sleep(SETTLE);
-    locks(&mut dave);
-    unlocks(&mut bob, "bob");
-    page_until(&mut bob, &g, |p| {
-        texts(p).contains(&"hi from Dave".to_owned())
-    });
-
-    let dave_log = dave.quit();
-    assert_eq!(mailed(&dave_log), 2, "mailed, then again on the `failed`");
-    logs.extend([alice.quit(), bob.quit(), dave_log, seed.stop().concat()]);
-    assert!(logs.iter().all(|l| !l.contains("hi from Dave")));
-    drop(relay.runtime);
-    for dir in dirs {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
-
 /// Alice, Bob and Dave, all friends, on one mail seed; a group `g` of Alice
 /// and Bob (with `dave_too`, Dave as well), made by Alice.
 struct Three {
@@ -852,8 +771,9 @@ impl Three {
     }
 }
 
-/// Test 12. As test 11, but Alice's add is mailed before Bob unlocks, so
-/// Bob collects it and Dave's message in one collect, Dave's put first:
+/// Test 12. A group of Alice and Bob; Bob is away. Alice adds Dave, cut
+/// off from the seed, and her add is mailed before Bob unlocks, so Bob
+/// collects it and Dave's message in one collect, Dave's put first:
 /// he shows Dave's message straight away and refuses nothing.
 #[test]
 fn test_12_an_add_and_a_message_in_one_collect() {
