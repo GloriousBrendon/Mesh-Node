@@ -1,0 +1,451 @@
+//! Mail records in the helper (SPEC-mailbox M11, M12): this device's record
+//! for each contact says where to mail it and with what keys; each contact
+//! device's newest record, read or remembered, says where to mail them.
+//!
+//! Put at unlock, daily and for a new contact, on every seed, as address
+//! records are. Read for every contact at unlock and daily (this week's
+//! lookup, then last week's for contacts with nothing this week), for a new
+//! contact, and for a contact we hold no record for when we meet them or
+//! have mail for them. What's read is remembered, sealed in
+//! `<data>/mail/remembered`, for `REMEMBER_LIFE` after it lapses; a read
+//! that finds nothing leaves it. The e2ee keys a record carries go to e2ee,
+//! which keeps them with its sessions.
+//!
+//! A child of `helper`, as `mail` is.
+
+use super::*;
+use mesh_identity::{
+    Holder, MAIL_RECORD_LIFE, MAX_HOLDERS, PairKeys, SealedError, open_mail_record, read_sealed,
+    seal_mail_record, week_of, write_sealed,
+};
+use serde::Serialize;
+
+/// A lapsed record is remembered this long (mailbox *Limits*): the promise.
+pub(super) const REMEMBER_LIFE: u64 = 30 * 86_400;
+/// Every contact's record is read again this often (`MAIL_RECORD_READ`).
+pub(super) const MAIL_RECORD_READ: u64 = 86_400;
+/// The remembered records' file, under `<data>/mail/`, and its format
+/// (mailbox *Formats*).
+const REMEMBERED: &str = "remembered";
+const REMEMBERED_FORMAT: u8 = 1;
+const REMEMBERED_CONTEXT: &str = "mesh/v1/mail-remembered";
+/// The token a record put to an open seed carries: none.
+// ponytail: closed seeds' tokens from their tickets come with Task 12.
+const OPEN: [u8; 1] = [0];
+
+/// What the newest record read from one contact device said.
+#[derive(Serialize, Deserialize, Clone)]
+pub(super) struct Known {
+    pub id: [u8; 32],
+    /// Its holders, in the order to try, each with its `since`.
+    pub holders: Vec<(String, u64)>,
+    pub created: u64,
+    pub expires: u64,
+}
+
+/// What mail keeps across locks and restarts.
+#[derive(Serialize, Deserialize, Default)]
+pub(super) struct Remembered {
+    /// Per contact device.
+    pub known: HashMap<[u8; 32], Known>,
+    /// Since when our claims at each of our holders are good, by ticket.
+    pub since: HashMap<String, u64>,
+}
+
+impl Remembered {
+    /// The first holder `device`'s newest record names.
+    pub fn holder(&self, device: &[u8; 32]) -> Option<&str> {
+        let known = self.known.get(device)?;
+        known.holders.first().map(|(ticket, _)| ticket.as_str())
+    }
+
+    /// Takes `known` as `device`'s newest record if it's newer than what's
+    /// held. True if it was.
+    fn take(&mut self, device: [u8; 32], known: Known) -> bool {
+        if self
+            .known
+            .get(&device)
+            .is_some_and(|k| k.created >= known.created)
+        {
+            return false;
+        }
+        self.known.insert(device, known);
+        true
+    }
+
+    fn knows(&self, id: &MeshId) -> bool {
+        self.known.values().any(|k| k.id == id.to_bytes())
+    }
+
+    fn forget_lapsed(&mut self, now: u64) {
+        self.known.retain(|_, k| k.expires + REMEMBER_LIFE > now);
+    }
+}
+
+/// What `path` remembers, lapsed records forgotten, and whether it's from a
+/// newer mesh-node: then it's left as it is, never written over, and mail
+/// starts from nothing. A damaged file starts empty.
+fn load(path: &Path, data_key: &[u8; 32], now: u64) -> (Remembered, bool) {
+    let (mut remembered, newer) = match read_sealed(
+        path,
+        data_key,
+        REMEMBERED_CONTEXT,
+        REMEMBERED_FORMAT,
+    ) {
+        Ok(Some((_, bytes))) => match postcard::from_bytes(&bytes) {
+            Ok(remembered) => (remembered, false),
+            Err(_) => {
+                eprintln!("mesh-node: the remembered mail records were damaged; they start empty");
+                (Remembered::default(), false)
+            }
+        },
+        Ok(None) => (Remembered::default(), false),
+        Err(SealedError::Newer) => {
+            eprintln!(
+                "mesh-node: the remembered mail records are from a newer mesh-node; they're left as they are"
+            );
+            (Remembered::default(), true)
+        }
+        Err(e) => {
+            eprintln!(
+                "mesh-node: the remembered mail records couldn't be read ({e}); they start empty"
+            );
+            (Remembered::default(), false)
+        }
+    };
+    remembered.forget_lapsed(now);
+    (remembered, newer)
+}
+
+fn save(
+    path: &Path,
+    data_key: &[u8; 32],
+    remembered: &mut Remembered,
+    now: u64,
+) -> Result<(), String> {
+    remembered.forget_lapsed(now);
+    let bytes = postcard::to_allocvec(remembered).map_err(|e| e.to_string())?;
+    write_sealed(
+        path,
+        data_key,
+        REMEMBERED_CONTEXT,
+        REMEMBERED_FORMAT,
+        &bytes,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A seed's ticket, as a holder is named in records.
+pub(super) fn ticket_of(seed: &MeshAddr) -> Option<String> {
+    seed.ticket_with_direct().ok()
+}
+
+impl Helper {
+    fn remembered_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("mail")
+            .join(REMEMBERED)
+    }
+
+    /// At unlock: what was remembered.
+    pub(super) fn mail_load(&mut self) {
+        let Some(store) = &self.store else { return };
+        let path = self.remembered_path();
+        (self.mail.remembered, self.mail.newer) = load(&path, store.data_key(), unix_now());
+    }
+
+    /// Writes what's remembered, unless the file is from a newer mesh-node.
+    pub(super) fn mail_save(&mut self) {
+        let Some(store) = &self.store else { return };
+        if self.mail.newer {
+            return;
+        }
+        let path = self.remembered_path();
+        if let Err(e) = save(
+            &path,
+            store.data_key(),
+            &mut self.mail.remembered,
+            unix_now(),
+        ) {
+            eprintln!("mesh-node: couldn't save the remembered mail records: {e}");
+        }
+    }
+
+    /// Our holders, as our records list them.
+    // ponytail: the first `--seed` only, as mail goes there; Task 12 lists up
+    // to `MAX_HOLDERS` and the `--holder` flag.
+    fn our_holders(&self) -> Vec<Holder> {
+        let first = self.seeds.first().and_then(ticket_of);
+        (first.into_iter().take(MAX_HOLDERS))
+            .filter_map(|ticket| {
+                let since = *self.mail.remembered.since.get(&ticket)?;
+                Some(Holder { ticket, since })
+            })
+            .collect()
+    }
+
+    /// Puts this device's mail record for every contact and the self pair,
+    /// or `only` that one, on every seed.
+    pub(super) fn mail_records_put(&mut self, only: Option<&MeshId>) {
+        let holders = self.our_holders();
+        let (Some(store), Some(net), Some(e2ee)) = (&self.store, &self.net, self.e2ee.as_mut())
+        else {
+            return;
+        };
+        if holders.is_empty() || self.seeds.is_empty() {
+            return;
+        }
+        let now = unix_now();
+        let field = match e2ee.mail_field(now) {
+            Ok(field) => field,
+            Err(e) => return eprintln!("mesh-node: couldn't make e2ee keys: {e}"),
+        };
+        let ids = std::iter::once(store.id()).chain(store.contacts().iter().map(|c| c.id()));
+        let records: Vec<Vec<u8>> = ids
+            .filter(|id| only.is_none_or(|only| only == id))
+            .filter_map(|id| {
+                let keys = store.pair_keys(&id)?;
+                let sealed = seal_mail_record(
+                    &keys,
+                    store.device_key(),
+                    store.devices(),
+                    &field,
+                    &holders,
+                    now,
+                    MAIL_RECORD_LIFE,
+                );
+                sealed
+                    .inspect_err(|e| eprintln!("mesh-node: couldn't make a mail record: {e}"))
+                    .ok()
+            })
+            .map(|record| [&OPEN[..], &record].concat())
+            .collect();
+        let (anon, seeds) = (net.anon.clone(), self.seeds.clone());
+        tokio::spawn(async move {
+            for seed in seeds.iter() {
+                let _ = seed::ask_many(&anon, seed, seed::MREC_PUT, &records).await;
+            }
+        });
+    }
+
+    /// Reads every contact's mail record, or `only` that one's, unless a
+    /// read for them is under way.
+    pub(super) fn mail_records_read(&mut self, only: Option<&MeshId>) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        let ids: Vec<MeshId> = (store.contacts().iter().map(|c| c.id()))
+            .filter(|id| only.is_none_or(|only| only == id))
+            .filter(|id| !self.mail.reading.contains(id))
+            .collect();
+        let asked: Vec<(MeshId, PairKeys)> = ids
+            .iter()
+            .filter_map(|id| Some((*id, store.pair_keys(id)?)))
+            .collect();
+        if asked.is_empty() || self.seeds.is_empty() {
+            return;
+        }
+        self.mail.reading.extend(asked.iter().map(|(id, _)| *id));
+        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        let week = week_of(unix_now());
+        tokio::spawn(async move {
+            let mut found: Vec<(MeshId, Vec<Vec<u8>>)> =
+                asked.iter().map(|(id, _)| (*id, Vec::new())).collect();
+            // This week's lookup for everyone, then last week's for those
+            // with nothing this week.
+            for week in [week, week.saturating_sub(1)] {
+                let wanted: Vec<usize> = (0..asked.len())
+                    .filter(|i| found[*i].1.is_empty())
+                    .collect();
+                let lookups: Vec<Vec<u8>> = wanted
+                    .iter()
+                    .map(|i| asked[*i].1.mail_lookup(&asked[*i].0, week).to_vec())
+                    .collect();
+                if lookups.is_empty() {
+                    break;
+                }
+                for seed in seeds.iter() {
+                    let Ok(answers) = seed::ask_many(&anon, seed, seed::MREC_GET, &lookups).await
+                    else {
+                        continue;
+                    };
+                    for (i, answer) in wanted.iter().zip(answers) {
+                        if let Some(crate::addrs::Get::Found(sealed)) =
+                            crate::addrs::Get::from_bytes(&answer)
+                        {
+                            found[*i].1.extend(sealed);
+                        }
+                    }
+                }
+            }
+            let _ = back.send(Back::MailRecords(found));
+        });
+    }
+
+    /// Records read: each one that opens and checks is the newest for its
+    /// device if it's newer than what we hold; its keys go to e2ee. Mail
+    /// put to a holder its record no longer lists, or before its `since`,
+    /// goes again (M12); and what waited for a record goes.
+    pub(super) fn mail_records(&mut self, found: Vec<(MeshId, Vec<Vec<u8>>)>) {
+        let now = unix_now();
+        let mut changed = false;
+        let mut to_mail = Vec::new();
+        for (id, sealed) in found {
+            self.mail.reading.remove(&id);
+            let Some(keys) = self.store.as_ref().and_then(|s| s.pair_keys(&id)) else {
+                continue;
+            };
+            for bytes in sealed {
+                let Ok(record) = open_mail_record(&keys, &id, &bytes, now) else {
+                    continue;
+                };
+                if let Some(e2ee) = self.e2ee.as_mut()
+                    && e2ee
+                        .learn(&id, &record.devices, &record.device, &record.e2ee)
+                        .is_err()
+                {
+                    eprintln!(
+                        "mesh-node: a contact's mail record had e2ee keys that didn't check out"
+                    );
+                }
+                let device = record.device.to_bytes();
+                let holders = record
+                    .holders
+                    .into_iter()
+                    .map(|h| (h.ticket, h.since))
+                    .collect();
+                let known = Known {
+                    id: id.to_bytes(),
+                    holders,
+                    created: record.created_at,
+                    expires: record.expires_at,
+                };
+                if !self.mail.remembered.take(device, known) {
+                    continue;
+                }
+                changed = true;
+                to_mail.push(id);
+            }
+        }
+        if !changed {
+            return;
+        }
+        let remembered = &self.mail.remembered;
+        let again: Vec<([u8; 32], u64)> = (self.mail.marked.iter())
+            .filter(|((device, _), (holder, at))| {
+                remembered.known.get(device).is_some_and(|k| {
+                    let listed = k.holders.iter().find(|(ticket, _)| ticket == holder);
+                    listed.is_none_or(|(_, since)| since >= at)
+                })
+            })
+            .map(|(mark, _)| *mark)
+            .collect();
+        if !again.is_empty() {
+            eprintln!(
+                "mesh-node: {} mailed events go again (a holder lost or dropped them)",
+                again.len()
+            );
+        }
+        for mark in again {
+            self.mail.marked.remove(&mark);
+        }
+        self.mail_save();
+        to_mail.sort_unstable_by_key(|id| id.to_bytes());
+        to_mail.dedup();
+        for id in to_mail {
+            self.mail_out(&id);
+        }
+    }
+
+    /// Reads `id`'s record if we hold none of theirs.
+    pub(super) fn mail_records_missing(&mut self, id: &MeshId) {
+        if !self.mail.remembered.knows(id) {
+            self.mail_records_read(Some(id));
+        }
+    }
+
+    /// The daily round, and the unlock's: our records put, everyone's read.
+    pub(super) fn mail_records_round(&mut self, force: bool) {
+        let now = unix_now();
+        if force || now >= self.mail.round + MAIL_RECORD_READ {
+            self.mail.round = now;
+            self.mail_records_put(None);
+            self.mail_records_read(None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+    const KEY: [u8; 32] = [5; 32];
+
+    fn known(created: u64) -> Known {
+        Known {
+            id: [1; 32],
+            holders: vec![("mesh://node/seed".to_owned(), created)],
+            created,
+            expires: created + MAIL_RECORD_LIFE,
+        }
+    }
+
+    fn path(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mesh-remembered-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("mail").join(REMEMBERED)
+    }
+
+    /// What's read and remembered survives a restart, and only a newer
+    /// record replaces it; a read that finds nothing changes nothing.
+    #[test]
+    fn kept_until_a_newer_record_and_a_month_after_it_lapses() {
+        let path = path("kept");
+        let mut r = Remembered::default();
+        assert!(r.take([2; 32], known(NOW)));
+        assert!(!r.take([2; 32], known(NOW - 1)), "an older record");
+        r.since.insert("mesh://node/seed".to_owned(), NOW);
+        save(&path, &KEY, &mut r, NOW).unwrap();
+        let (back, newer) = load(&path, &KEY, NOW + MAIL_RECORD_LIFE + 1);
+        assert!(!newer);
+        assert_eq!(
+            back.holder(&[2; 32]),
+            Some("mesh://node/seed"),
+            "kept after it lapsed"
+        );
+        assert_eq!(back.since.get("mesh://node/seed"), Some(&NOW));
+        let gone = NOW + MAIL_RECORD_LIFE + REMEMBER_LIFE;
+        assert!(
+            load(&path, &KEY, gone).0.holder(&[2; 32]).is_none(),
+            "forgotten a month on"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    /// A remembered-records file from a newer mesh-node is refused, left on
+    /// disk as it was, and never written over.
+    #[test]
+    fn a_newer_file_is_refused_and_left() {
+        let path = path("newer");
+        write_sealed(
+            &path,
+            &KEY,
+            REMEMBERED_CONTEXT,
+            REMEMBERED_FORMAT + 1,
+            b"from later",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (r, newer) = load(&path, &KEY, NOW);
+        assert!(newer && r.known.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Damaged: starts empty, and may be written.
+        std::fs::write(&path, [REMEMBERED_FORMAT, 0, 1, 2]).unwrap();
+        assert!(!load(&path, &KEY, NOW).1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+}

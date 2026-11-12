@@ -12,10 +12,12 @@ mod id;
 mod keystore;
 mod knock;
 mod link;
+mod mailrec;
 mod pair;
 mod password;
 mod remember;
 mod safety;
+mod sealed;
 
 pub use account::{Account, Entry, Kind, MAX_REMOVED, Status};
 pub use addr::{
@@ -42,6 +44,9 @@ pub use link::{
     LINK_CODE_LIFETIME, LinkError, LinkInitiator, LinkRendezvous, LinkResponder, LinkedIdentity,
     PendingDevice,
 };
+pub use mailrec::{
+    Holder, MAIL_RECORD_LIFE, MAX_HOLDERS, MailRecord, open_mail_record, seal_mail_record,
+};
 pub use pair::{PairKeys, day_of, week_of};
 pub use password::{
     MAX_USERNAME_LEN, MIN_PASSWORD_LEN, PasswordVerdict, check_password, normalize_username,
@@ -49,3 +54,4 @@ pub use password::{
 };
 pub use remember::{is_kept, keyring_status};
 pub use safety::SafetyNumber;
+pub use sealed::{SealedError, read_sealed, write_sealed};

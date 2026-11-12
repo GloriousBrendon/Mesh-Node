@@ -419,6 +419,215 @@ fn test_6_junk_quotas_tokens_and_rates() {
     }
 }
 
+const DAY: u64 = 86_400;
+/// Long enough for a new contact's records to be put and read.
+const SETTLE: Duration = Duration::from_secs(3);
+
+/// Starts a helper again on its data with the clock `days` on, unlocked.
+fn again(dir: &std::path::Path, relay: &Relay, seeds: &[&str], name: &str, days: u64) -> Helper {
+    let offset = (days * DAY).to_string();
+    let mut args: Vec<&str> = seeds.iter().flat_map(|s| ["--seed", s]).collect();
+    args.extend(["--record-ttl", TTL, "--clock-offset", &offset]);
+    let mut h = Helper::start_with(dir, relay, &args);
+    let (binding, first) = h.event();
+    assert_eq!(binding, "meshIdentity");
+    if first["state"] != "unlocked" {
+        unlocks(&mut h, name);
+    }
+    h
+}
+
+/// The seed again on its data with the clock `days` on; its ticket doesn't
+/// change.
+fn seed_at(dir: &std::path::Path, relay: &Relay, ticket: &str, days: u64) -> Seed {
+    let offset = (days * DAY).to_string();
+    let mut seed = Seed::start_with(dir, relay, &["--mail", "--clock-offset", &offset]);
+    assert_eq!(seed.ticket(), ticket);
+    seed
+}
+
+/// Two people and their seeds: Bob's only seed holds mail; Alice lists a
+/// seed without mail first, so she mails Bob at the holder his mail record
+/// names, not at her own first seed.
+struct Pair {
+    relay: Relay,
+    dirs: [std::path::PathBuf; 4],
+    seed: Option<Seed>,
+    plain: Seed,
+    ticket: String,
+    plain_ticket: String,
+}
+
+impl Pair {
+    fn alice_seeds(&self) -> [&str; 2] {
+        [&self.plain_ticket, &self.ticket]
+    }
+
+    /// The mail seed again, `days` on.
+    fn seed_at(&mut self, days: u64) {
+        self.stop_seed();
+        self.seed = Some(seed_at(&self.dirs[0], &self.relay, &self.ticket, days));
+    }
+
+    fn stop_seed(&mut self) -> String {
+        self.seed
+            .take()
+            .map(|s| s.stop().concat())
+            .unwrap_or_default()
+    }
+
+    /// Ends the test: no claim was refused, and no log holds `secrets`.
+    fn done(mut self, mut logs: Vec<String>, secrets: &[&str]) {
+        logs.push(self.stop_seed());
+        logs.push(self.plain.stop().concat());
+        for log in &logs {
+            assert_eq!(refused(log), 0, "no claim was refused");
+            for secret in secrets {
+                assert!(
+                    !log.contains(&format!("\"{secret}\"")),
+                    "a log holds {secret}"
+                );
+            }
+        }
+        drop(self.relay.runtime);
+        for dir in self.dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Alice and Bob made friends, and (with `write`) wrote once live; then a
+/// pause so each has read the other's mail record. Their helpers and IDs.
+fn friends(name: &str, write: bool) -> (Pair, Helper, String, Helper, String) {
+    let dirs = ["seed", "alice", "bob", "plain"].map(|n| temp_dir(&format!("{name}-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let ticket = seed.ticket();
+    let mut plain = Seed::start(&dirs[3], &relay);
+    let plain_ticket = plain.ticket();
+    let (mut alice, id_a) = helper(
+        &dirs[1],
+        &relay,
+        &plain_ticket,
+        "alice",
+        &["--seed", &ticket],
+    );
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &[]);
+    alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
+    bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
+    alice.social_until(|s| has(s, "friends", &id_b));
+    bob.social_until(|s| has(s, "friends", &id_a));
+    if write {
+        ask(&mut alice, "dmSend", &[&id_b, "hi"], "meshDmMessages");
+        until(&mut bob, "meshDmNotify", |n| n["text"] == "hi");
+        page_until(&mut alice, &id_b, |p| p["events"][0]["sent"] == true);
+    }
+    std::thread::sleep(SETTLE);
+    let pair = Pair {
+        relay,
+        dirs,
+        seed: Some(seed),
+        plain,
+        ticket,
+        plain_ticket,
+    };
+    (pair, alice, id_a, bob, id_b)
+}
+
+/// Tests 9 and 10. Bob locks; Alice sends "ten" and locks. With `late`,
+/// Alice comes back on that day, Bob's record long gone, and sends "late"
+/// from her memory of his holders and their session. Bob comes back on
+/// day `away` and gets what was sent.
+fn away(name: &str, away: u64, late: Option<u64>) {
+    let (mut p, mut alice, _, mut bob, id_b) = friends(name, true);
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "ten"], "meshDmMessages");
+    locks(&mut alice);
+    let mut logs = vec![alice.quit(), bob.quit()];
+    if let Some(day) = late {
+        p.seed_at(day);
+        let mut alice = again(&p.dirs[1], &p.relay, &p.alice_seeds(), "alice", day);
+        ask(&mut alice, "dmSend", &[&id_b, "late"], "meshDmMessages");
+        locks(&mut alice);
+        logs.push(alice.quit());
+    }
+    p.seed_at(away);
+    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", away);
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "ten");
+    if late.is_some() {
+        until(&mut bob, "meshDmNotify", |n| n["text"] == "late");
+    }
+    logs.push(bob.quit());
+    p.done(logs, &["ten", "late"]);
+}
+
+/// Test 9. Away 10 days: Bob's mail record has lapsed from the seed.
+#[test]
+fn test_9_away_10_days() {
+    away("mail9", 10, None);
+}
+
+/// Test 10. Away 25 days, and Alice sends "late" on day 20.
+#[test]
+fn test_10_away_25_days() {
+    away("mail10", 25, Some(20));
+}
+
+/// Test 17. Alice and Bob have never written. On day 0 both are unlocked
+/// long enough for Alice to read Bob's mail record, then both lock. On day
+/// 20 Alice sends "first", mailed on a session she starts from the
+/// remembered fallback key; on day 25 Bob gets it.
+#[test]
+fn test_17_first_mail_from_a_record_read_ahead() {
+    let (mut p, mut alice, _, mut bob, id_b) = friends("mail17", false);
+    locks(&mut bob);
+    locks(&mut alice);
+    let mut logs = vec![alice.quit(), bob.quit()];
+    p.seed_at(20);
+    let mut alice = again(&p.dirs[1], &p.relay, &p.alice_seeds(), "alice", 20);
+    ask(&mut alice, "dmSend", &[&id_b, "first"], "meshDmMessages");
+    locks(&mut alice);
+    let late = alice.quit();
+    assert_eq!(mailed(&late), 1, "mailed on day 20");
+    logs.push(late);
+    p.seed_at(25);
+    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 25);
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "first");
+    logs.push(bob.quit());
+    p.done(logs, &["first"]);
+}
+
+/// Test 5. Alice mails Bob "three" and locks; the seed's mail is wiped. Bob
+/// unlocks, finds his claims gone, claims again, and his record says the
+/// seed is good only since now. Alice unlocks, reads that, and mails
+/// "three" again at once. Bob gets it once.
+#[test]
+fn test_5_wiped_holder() {
+    let (mut p, mut alice, id_a, mut bob, id_b) = friends("mail5", true);
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "three"], "meshDmMessages");
+    locks(&mut alice);
+    p.stop_seed();
+    std::fs::remove_dir_all(p.dirs[0].join("mail")).unwrap();
+    p.seed_at(0);
+    // Bob comes and goes: his claims are new, and so is his record. Alice
+    // stays locked meanwhile, so nothing reaches him live.
+    unlocks(&mut bob, "bob");
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "three");
+    std::thread::sleep(Duration::from_secs(2));
+    let seen = page_until(&mut bob, &id_a, |_| true);
+    assert_eq!(texts(&seen), ["hi", "three"], "once");
+    let alice_log = alice.quit();
+    assert_eq!(mailed(&alice_log), 2, "mailed, and again after the wipe");
+    p.done(vec![alice_log, bob.quit()], &["three"]);
+}
+
 /// Records that outlast the test, so no refresh comes.
 const NO_REFRESH: &str = "3600";
 

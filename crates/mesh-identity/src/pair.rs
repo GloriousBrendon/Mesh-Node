@@ -18,6 +18,7 @@ const KNOCK_SLOT_CONTEXT: &str = "mesh/v1/knock-slot";
 const CONVERSATION_CONTEXT: &str = "mesh/v1/dm-conversation";
 const MAIL_BOX_CONTEXT: &str = "mesh/v1/mail-box";
 const MAIL_SLOT_CONTEXT: &str = "mesh/v1/mail-slot";
+const MAIL_LOOKUP_CONTEXT: &str = "mesh/v1/mail-lookup";
 /// A mail week (SPEC-mailbox M5): unix days / 7.
 const WEEK: u64 = 7 * DAY;
 
@@ -84,6 +85,17 @@ impl PairKeys {
         let hash = self
             .hasher(MAIL_BOX_CONTEXT)
             .update(&reader.to_bytes())
+            .update(&week.to_be_bytes())
+            .finalize();
+        hash.as_bytes()[..16].try_into().expect("16 bytes")
+    }
+
+    /// Where `sender`'s mail records for this pair are found in `week`
+    /// (SPEC-routing D3 as changed by mailbox).
+    pub fn mail_lookup(&self, sender: &MeshId, week: u64) -> [u8; 16] {
+        let hash = self
+            .hasher(MAIL_LOOKUP_CONTEXT)
+            .update(&sender.to_bytes())
             .update(&week.to_be_bytes())
             .finalize();
         hash.as_bytes()[..16].try_into().expect("16 bytes")

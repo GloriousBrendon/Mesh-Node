@@ -451,6 +451,18 @@ impl E2ee {
         Ok(out)
     }
 
+    /// The field for this device's mail records (SPEC-mailbox M11): the
+    /// bundle and the fallback key, no one-time key, since a mail record
+    /// is read by every device of the contact over a week.
+    pub fn mail_field(&mut self, now: u64) -> Result<Vec<u8>, E2eeError> {
+        if now >= self.fallback_at + FALLBACK_LIFE {
+            self.renew_fallback(now);
+            self.dirty.account = true;
+            self.save()?;
+        }
+        Ok([&self.bundle[..], &self.fallback].concat())
+    }
+
     /// Takes the newest device list seen for `id` (D11). A device it drops
     /// loses its keys and sessions. True when the list was newer.
     pub fn learn_devices(&mut self, id: &MeshId, devices: &DeviceList) -> Result<bool, E2eeError> {
@@ -1029,6 +1041,35 @@ pub(crate) mod tests {
     fn only(out: Vec<(VerifyingKey, Vec<u8>)>) -> Vec<u8> {
         assert_eq!(out.len(), 1);
         out.into_iter().next().unwrap().1
+    }
+
+    /// A mail record's field (SPEC-mailbox M11) holds no one-time key:
+    /// the session starts from the fallback key, and opens.
+    #[test]
+    fn a_mail_field_starts_a_session_from_the_fallback_key() {
+        let (mut alice, mut bob) = (device(), device());
+        introduce(&mut bob, &mut alice);
+        let field = bob.e2ee.mail_field(NOW).unwrap();
+        assert_eq!(field.len(), MAX_BUNDLE_LEN + 32);
+        let reserved = bob.e2ee.reserved.len();
+        let (id, devices, key) = (
+            bob.who.root.id(),
+            bob.who.devices.clone(),
+            bob.who.device.public(),
+        );
+        alice.e2ee.learn(&id, &devices, &key, &field).unwrap();
+        let to_bob = only(
+            alice
+                .e2ee
+                .encrypt_direct(&id, Kind::TestNote, b"by mail")
+                .unwrap(),
+        );
+        assert_eq!(bob.e2ee.open1(&to_bob).unwrap().body, b"by mail");
+        assert_eq!(
+            bob.e2ee.reserved.len(),
+            reserved,
+            "no one-time key was reserved"
+        );
     }
 
     #[test]

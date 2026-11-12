@@ -8,8 +8,9 @@
 //!
 //! A child of `helper`, as `dm` is.
 
-// ponytail: PLAN-mailbox Task 1, the thin path. The first `--seed` is the
-// only holder; marks and `mseq`s live in memory (Task 11 saves them);
+// ponytail: our only holder is the first `--seed`, and mail goes to the
+// first holder a reader's record names (Task 12: the next on failure, and
+// `--holder`); marks and `mseq`s live in memory (Task 11 saves them);
 // receipts carry `ok` only (Task 8); friends' devices only (Task 13 adds
 // our own). When we last renewed lives in memory too, so a restart renews
 // at its first unlock.
@@ -48,14 +49,23 @@ pub(super) struct Mail {
     seq: HashMap<[u8; 32], u64>,
     /// Each put, by reader device and `mseq`: the event's number.
     sent: HashMap<([u8; 32], u64), u64>,
-    /// Events already mailed to a device, so they aren't put again (M15).
-    marked: HashSet<([u8; 32], u64)>,
+    /// Events already mailed to a device, so they aren't put again (M15):
+    /// by device and event number, the holder and time of the put.
+    pub(super) marked: HashMap<([u8; 32], u64), (String, u64)>,
     /// Puts under way, which lock and quit wait for.
     pending: Vec<JoinHandle<()>>,
     /// The unlock's collect hasn't come back: live sending waits for it.
     pub(super) collecting: bool,
     /// When we last claimed every box (0: not since this process started).
     renewed: u64,
+    /// Contacts' newest records and our holders' `since` (mailrec).
+    pub(super) remembered: mailrec::Remembered,
+    /// The remembered file is from a newer mesh-node: never write it.
+    pub(super) newer: bool,
+    /// Contacts whose records are being read.
+    pub(super) reading: HashSet<MeshId>,
+    /// When every record was last put and read.
+    pub(super) round: u64,
 }
 
 /// One of our slots: whose box it is (`None`, a dummy), the box and slot,
@@ -138,7 +148,8 @@ fn read_receipt(body: &[u8]) -> Option<Vec<u64>> {
 
 impl Helper {
     /// Mails what waits for each of `id`'s devices that has no open
-    /// connection (M2), to the first seed.
+    /// connection (M2), to the first holder its newest record names (M11).
+    /// A device we hold no record for waits, and its record is read.
     pub(super) fn mail_out(&mut self, id: &MeshId) {
         let (Some(store), Some(net), Some(e2ee)) = (&self.store, &self.net, &self.e2ee) else {
             return;
@@ -146,12 +157,10 @@ impl Helper {
         if store.id() == *id {
             return;
         }
-        let Some(seed) = self.seeds.first().cloned() else {
-            return;
-        };
         let (Some(keys), anon) = (store.pair_keys(id), net.anon.clone()) else {
             return;
         };
+        let now = unix_now();
         let me = store.device_key().public().to_bytes();
         let connected: HashSet<[u8; 32]> = (net.node.connected(id).iter())
             .map(|a| *a.device.as_bytes())
@@ -159,10 +168,15 @@ impl Helper {
         let away: Vec<[u8; 32]> = (e2ee.device_keys(id).into_iter())
             .filter(|d| !connected.contains(d))
             .collect();
-        let mut puts = Vec::new();
-        let mut numbers_put = Vec::new();
+        // Each holder's puts, and what they are.
+        let mut puts: HashMap<String, (Vec<Vec<u8>>, Vec<Put>)> = HashMap::new();
+        let mut unknown = false;
         for device in away {
-            let marked: HashSet<u64> = (self.mail.marked.iter())
+            let Some(holder) = self.mail.remembered.holder(&device).map(str::to_owned) else {
+                unknown = true;
+                continue;
+            };
+            let marked: HashSet<u64> = (self.mail.marked.keys())
                 .filter(|(d, _)| *d == device)
                 .map(|(_, n)| *n)
                 .collect();
@@ -185,25 +199,37 @@ impl Helper {
                     continue;
                 };
                 self.mail.sent.insert((device, mseq), number);
-                self.mail.marked.insert((device, number));
-                numbers_put.push((device, mseq, number));
-                puts.push([&OPEN[..], &sealed].concat());
+                self.mail
+                    .marked
+                    .insert((device, number), (holder.clone(), now));
+                let (sealed_puts, numbers) = puts.entry(holder.clone()).or_default();
+                numbers.push((device, mseq, number));
+                sealed_puts.push([&OPEN[..], &sealed].concat());
             }
+        }
+        if unknown {
+            self.mail_records_missing(id);
         }
         if puts.is_empty() {
             return;
         }
-        eprintln!("mesh-node: mailed {} events", puts.len());
-        let back = self.back.clone();
+        let count: usize = puts.values().map(|(p, _)| p.len()).sum();
+        eprintln!("mesh-node: mailed {count} events");
         self.mail.pending.retain(|h| !h.is_finished());
-        self.mail.pending.push(tokio::spawn(async move {
-            let answers = seed::ask_many(&anon, &seed, seed::MAIL_PUT, &puts).await;
-            let taken =
-                answers.is_ok_and(|a| a.iter().all(|a| a == &[mailstore::Answer::Ok as u8]));
-            if !taken {
-                let _ = back.send(Back::MailUnput(numbers_put));
-            }
-        }));
+        for (holder, (sealed, numbers_put)) in puts {
+            let (anon, back) = (anon.clone(), self.back.clone());
+            self.mail.pending.push(tokio::spawn(async move {
+                let taken = match MeshAddr::from_ticket(&holder) {
+                    Ok(seed) => seed::ask_many(&anon, &seed, seed::MAIL_PUT, &sealed)
+                        .await
+                        .is_ok_and(|a| a.iter().all(|a| a == &[mailstore::Answer::Ok as u8])),
+                    Err(_) => false,
+                };
+                if !taken {
+                    let _ = back.send(Back::MailUnput(numbers_put));
+                }
+            }));
+        }
     }
 
     /// Mails what waits for every contact.
@@ -290,7 +316,7 @@ impl Helper {
     /// Claims our slot in every box from this week to `CLAIM_WEEKS_AHEAD`
     /// (M6), or with `only`, in that new contact's boxes alone, at once.
     pub(super) fn mail_claim(&mut self, only: Option<&MeshId>) {
-        let (Some(net), Some(seed)) = (&self.net, self.seeds.first()) else {
+        let Some(seed) = self.seeds.first().cloned().filter(|_| self.net.is_some()) else {
             return;
         };
         let now = unix_now();
@@ -304,7 +330,15 @@ impl Helper {
         if only.is_none() {
             self.mail.renewed = now;
         }
-        let (anon, seed) = (net.anon.clone(), seed.clone());
+        // Our claims there are good from the first one (M12).
+        if let Some(ticket) = mailrec::ticket_of(&seed)
+            && !self.mail.remembered.since.contains_key(&ticket)
+        {
+            self.mail.remembered.since.insert(ticket, now);
+            self.mail_save();
+        }
+        let Some(net) = &self.net else { return };
+        let anon = net.anon.clone();
         tokio::spawn(async move {
             refused(seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims).await);
         });
@@ -328,6 +362,12 @@ impl Helper {
         tokio::spawn(async move {
             let collecting = seed::ask_many(&anon, &seed, seed::MAIL_GET, &gets);
             let answers = tokio::time::timeout(HOLDER_WAIT, collecting).await;
+            // Every real box answering no-box: our claims there are gone.
+            let no_box = [mailstore::Answer::NoBox as u8];
+            let wiped = matches!(&answers, Ok(Ok(a)) if {
+                let mut real = asked.iter().zip(a).filter(|(ours, _)| ours.id.is_some());
+                real.all(|(_, answer)| *answer == no_box)
+            });
             let found = match answers {
                 Ok(Ok(answers)) => (asked.into_iter().zip(answers))
                     .filter_map(|(ours, answer)| {
@@ -344,16 +384,28 @@ impl Helper {
                     .collect(),
                 _ => Vec::new(),
             };
-            let _ = back.send(Back::MailFound(found));
+            let _ = back.send(Back::MailFound(found, wiped));
         });
     }
 
     /// Collected mail: opened in each sender's order, stored, deleted from
     /// the seed, and answered by receipt; receipts move our counters. Then
     /// live sending starts.
-    pub(super) fn mail_found(&mut self, found: Vec<Found>) {
+    pub(super) fn mail_found(&mut self, found: Vec<Found>, wiped: bool) {
         self.mail.collecting = false;
+        if let Some(ticket) = self.seeds.first().and_then(mailrec::ticket_of)
+            && wiped
+            && self.mail.remembered.since.contains_key(&ticket)
+        {
+            // Claim again; our record says the seed is good only since
+            // now, so senders mail again what they put there (M12).
+            eprintln!("mesh-node: a holder lost our claims; claiming again");
+            self.mail.remembered.since.insert(ticket, unix_now());
+            self.mail_save();
+            self.mail_claim(None);
+        }
         self.mail_renew();
+        self.mail_records_round(true);
         let mut receipts = Vec::new();
         let mut takes = Vec::new();
         let mut opened_count = 0;
@@ -477,6 +529,9 @@ fn refused<E>(answers: Result<Vec<Vec<u8>>, E>) {
         eprintln!("mesh-node: {refused} mail claims refused");
     }
 }
+
+/// A put: reader device, `mseq`, event number.
+type Put = ([u8; 32], u64, u64);
 
 /// One piece of mail, unsealed: its head and the envelope inside.
 type Unsealed = (MailHead, Vec<u8>);

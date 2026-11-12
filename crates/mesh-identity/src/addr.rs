@@ -34,8 +34,8 @@ const FORMAT_V2: u8 = 2;
 /// is 3,797 bytes before it, and the seed takes 4,096. The field e2ee sends
 /// is 201 bytes.
 pub const MAX_E2EE_FIELD: usize = 256;
-const OUTER_LEN: usize = 16 + 8 + 8;
-const NONCE_LEN: usize = 24;
+pub(crate) const OUTER_LEN: usize = 16 + 8 + 8;
+pub(crate) const NONCE_LEN: usize = 24;
 /// A relay URL's limit, in bytes.
 pub const MAX_RELAY_LEN: usize = 255;
 /// A sealed record's limit; the seed refuses anything bigger.
@@ -219,14 +219,14 @@ pub fn open_addr(
     })
 }
 
-fn cipher(keys: &PairKeys) -> XChaCha20Poly1305 {
+pub(crate) fn cipher(keys: &PairKeys) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new(&Key::from(*keys.record_key()))
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], AddrError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], AddrError> {
         if self.0.len() < n {
             return Err(AddrError::Malformed);
         }
@@ -235,11 +235,11 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn u16(&mut self) -> Result<usize, AddrError> {
+    pub(crate) fn u16(&mut self) -> Result<usize, AddrError> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().expect("2 bytes")) as usize)
     }
 
-    fn u64(&mut self) -> Result<u64, AddrError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, AddrError> {
         Ok(u64::from_be_bytes(
             self.take(8)?.try_into().expect("8 bytes"),
         ))

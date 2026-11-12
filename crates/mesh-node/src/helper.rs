@@ -58,6 +58,8 @@ mod files;
 mod link;
 #[path = "mail.rs"]
 mod mail;
+#[path = "mailrec.rs"]
+mod mailrec;
 #[path = "social.rs"]
 mod social;
 use social::{
@@ -216,6 +218,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, record_ttl: u
             _ = refresh.tick() => {
                 helper.dm_retry_all();
                 helper.mail_renew();
+                helper.mail_records_round(false);
                 helper.mail_out_all();
                 helper.publish();
                 helper.dial_contacts();
@@ -386,8 +389,11 @@ enum Back {
     Requested(MeshId),
     /// What the seeds hold for our codes.
     Collected(Vec<Collected>),
-    /// What the unlock's mail collect found (mailbox).
-    MailFound(Vec<mail::Found>),
+    /// What the unlock's mail collect found (mailbox), and whether our
+    /// claims there were gone.
+    MailFound(Vec<mail::Found>, bool),
+    /// Mail records read: whose, and the sealed records found.
+    MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>),
     /// Mail a seed didn't take: reader device, `mseq`, event number.
     MailUnput(Vec<([u8; 32], u64, u64)>),
     /// Another of our devices sent its account state.
@@ -807,8 +813,11 @@ impl Helper {
     fn contacts_changed(&mut self, only: Option<&MeshId>) {
         self.allow_contacts();
         self.publish_only(only);
-        // Mail for them must have somewhere to go before the next renewal.
+        // Mail for them must have somewhere to go before the next renewal,
+        // and where to mail them must be known before it's needed.
         self.mail_claim(only);
+        self.mail_records_put(only);
+        self.mail_records_read(only);
     }
 
     /// They're no longer let in; their records lapse (routing D4).
@@ -981,6 +990,7 @@ impl Helper {
                 let promoted = self.connected(&id);
                 self.present_to(&id);
                 self.keys_for(&id);
+                self.mail_records_missing(&id);
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
                 if promoted {
@@ -988,7 +998,8 @@ impl Helper {
                 }
                 return self.emit_social(None);
             }
-            Back::MailFound(found) => return self.mail_found(found),
+            Back::MailFound(found, wiped) => return self.mail_found(found, wiped),
+            Back::MailRecords(found) => return self.mail_records(found),
             Back::MailUnput(puts) => return self.mail_unput(puts),
             Back::Connected(id) => {
                 self.send_waiting(&id);
@@ -1002,6 +1013,7 @@ impl Helper {
                     self.changed(None);
                 }
                 self.keys_for(&id);
+                self.mail_records_missing(&id);
                 return self.present_to(&id);
             }
             Back::Synced(synced) => {
@@ -1530,6 +1542,7 @@ impl Helper {
                 self.update_shown();
                 self.hold_codes(false);
                 self.collect();
+                self.mail_load();
                 self.mail_collect();
             }
             Err(e) => eprintln!("mesh-node: networking didn't start: {e}"),
