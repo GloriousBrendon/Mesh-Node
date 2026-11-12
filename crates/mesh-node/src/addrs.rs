@@ -43,6 +43,9 @@ pub enum Put {
     SlowDown = 3,
     Full = 4,
     Bad = 5,
+    /// `mrec-put` only, on a closed seed without its token (mailbox M14):
+    /// the mail store's `Closed`.
+    Closed = 6,
 }
 
 impl Put {
@@ -51,7 +54,7 @@ impl Put {
     }
 
     pub fn from_byte(byte: u8) -> Option<Self> {
-        [Put::Ok, Put::SlowDown, Put::Full, Put::Bad]
+        [Put::Ok, Put::SlowDown, Put::Full, Put::Bad, Put::Closed]
             .into_iter()
             .find(|p| p.byte() == byte)
     }

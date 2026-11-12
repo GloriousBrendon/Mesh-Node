@@ -397,6 +397,24 @@ fn test_6_junk_quotas_tokens_and_rates() {
         );
         let put = [&[TOKEN.len() as u8][..], TOKEN, &at, &[5; 10]].concat();
         assert_eq!(ask_seed(&node, &closed_addr, "mail-put", &put).await, [OK]);
+        // Nor mail records: they count in --mail-max.
+        let record = [
+            &[6u8; 16][..],
+            &[1; 8],
+            &(now() + 60).to_be_bytes(),
+            &[9; 80],
+        ]
+        .concat();
+        let stranger = [&[0u8][..], &record].concat();
+        assert_eq!(
+            ask_seed(&node, &closed_addr, "mrec-put", &stranger).await,
+            [CLOSED]
+        );
+        let friend = [&[TOKEN.len() as u8][..], TOKEN, &record].concat();
+        assert_eq!(
+            ask_seed(&node, &closed_addr, "mrec-put", &friend).await,
+            [OK]
+        );
         node.close().await;
     });
     let logs = [open.stop(), closed.stop()].concat().concat();
@@ -552,12 +570,18 @@ fn mail_records_on_the_seed() {
     let mut plain = Seed::start(&dirs[1], &relay);
     let plain_addr = MeshAddr::from_ticket(&plain.ticket()).unwrap();
     let record = |expiry: u64| [&[6u8; 16][..], &[1; 8], &expiry.to_be_bytes(), &[9; 80]].concat();
+    // An open seed's token: none (mrec-put = token | record).
+    let put = |record: &[u8]| [&[0u8][..], record].concat();
     relay.runtime.block_on(async {
         let node = client(&relay).await;
         let week = record(now() + WEEK - 5);
-        assert_eq!(ask_seed(&node, &addr, "mrec-put", &week).await, [0]);
+        assert_eq!(ask_seed(&node, &addr, "mrec-put", &put(&week)).await, [0]);
         let past = record(now() + WEEK + 3600 + 60);
-        assert_eq!(ask_seed(&node, &addr, "mrec-put", &past).await, [5], "bad");
+        assert_eq!(
+            ask_seed(&node, &addr, "mrec-put", &put(&past)).await,
+            [5],
+            "bad"
+        );
         let got = ask_seed(&node, &addr, "mrec-get", &[6; 16]).await;
         assert_eq!(got, [&[0u8, 0, week.len() as u8][..], &week].concat());
         // Without --mail the service isn't there: the stream is refused.

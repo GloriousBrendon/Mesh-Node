@@ -30,14 +30,15 @@
 //! Mail records (routing D3, D5, D6 as changed) are the third log,
 //! `<data>/mail/records`: sealed as address records are, and read by the
 //! seed the same way (`addr_outer`), but kept up to 7 days ahead, under
-//! their own rates, and counted in the store's total. `mrec-put` is a
-//! record, answered as `addr-put` is; `mrec-get` is a lookup ID [16],
+//! their own rates, and counted in the store's total. `mrec-put` is
+//! `token | record`, answered as `addr-put` is (and `closed`, 6); `mrec-get` is a lookup ID [16],
 //! answered as `addr-get` is.
 //!
 //! Limits (mailbox *Limits*, M14, M18): rates per throwaway key, per
 //! network and for everyone through a relay; a quota per box; the store's
 //! total (`--mail-max`), past which new claims and puts answer `full`; and,
-//! with `--mail-token`, nothing claimed or put without it.
+//! with `--mail-token`, nothing claimed, put or recorded without it: records
+//! count in the total, so a stranger mustn't fill a closed seed with them.
 
 use crate::addrs::{Get as RecordGet, Put as RecordPut, SLOTS_PER_LOOKUP};
 use crate::codes::{Caller, Window};
@@ -127,7 +128,7 @@ pub enum Answer {
 
 /// How the operator set the store up.
 pub struct Settings {
-    /// `--mail-token`: claims and puts need it.
+    /// `--mail-token`: claims, puts and mail records need it.
     pub token: Option<Vec<u8>>,
     /// `--mail-max`, in bytes.
     pub max: u64,
@@ -554,7 +555,12 @@ impl Store {
 
     /// Stores a mail record in its slot, replacing an older one there (a
     /// later expiry is newer), as `addr-put` does.
-    pub fn put_record(&mut self, caller: &Caller, bytes: &[u8], now: u64) -> RecordPut {
+    pub fn put_record(&mut self, caller: &Caller, request: &[u8], now: u64) -> RecordPut {
+        let bytes = match self.admits(request) {
+            None => return RecordPut::Bad,
+            Some(Err(_)) => return RecordPut::Closed,
+            Some(Ok(rest)) => rest,
+        };
         let Some((lookup, slot, expiry)) = addr_outer(bytes) else {
             return RecordPut::Bad;
         };
@@ -1032,6 +1038,11 @@ mod tests {
         assert_eq!(store.claim(&C, &with_token(&c), NOW), Answer::Ok);
         let other = claim(&head(14, 2), &SECRET, NOW + 86_400);
         assert_eq!(store.claim(&C, &with_token(&other), NOW), Answer::Full);
+        // Records too need the token: a stranger can't fill a closed seed
+        // with them, and that's checked before it's full.
+        let r = mail_record(3, 3, NOW + 60, 0);
+        assert_eq!(store.put_record(&C, &admit(&r), NOW), RecordPut::Closed);
+        assert_eq!(store.put_record(&C, &with_token(&r), NOW), RecordPut::Full);
         assert!(store.total() <= 4096);
     }
 
@@ -1060,25 +1071,28 @@ mod tests {
         let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
         let week = mail_record(1, 1, NOW + RECORD_AHEAD, 1);
         assert_eq!(
-            store.put_record(&C, &week, NOW),
+            store.put_record(&C, &admit(&week), NOW),
             RecordPut::Ok,
             "7 days ahead"
         );
         let past = mail_record(1, 2, NOW + RECORD_AHEAD + CLOCK_ROOM + 1, 1);
         assert_eq!(
-            store.put_record(&C, &past, NOW),
+            store.put_record(&C, &admit(&past), NOW),
             RecordPut::Bad,
             "past the clock's room"
         );
         // A caller whose clock is 30 s ahead still asks for a week.
         let ahead = mail_record(9, 3, NOW + 30 + RECORD_AHEAD, 1);
-        assert_eq!(store.put_record(&C, &ahead, NOW), RecordPut::Ok);
-        assert_eq!(store.put_record(&C, &b"short"[..], NOW), RecordPut::Bad);
+        assert_eq!(store.put_record(&C, &admit(&ahead), NOW), RecordPut::Ok);
+        assert_eq!(
+            store.put_record(&C, &admit(&b"short"[..]), NOW),
+            RecordPut::Bad
+        );
         // A newer record replaces its slot; an older one changes nothing.
         let newer = mail_record(1, 1, NOW + RECORD_AHEAD, 2);
         let older = mail_record(1, 1, NOW + 60, 3);
-        assert_eq!(store.put_record(&C, &newer, NOW), RecordPut::Ok);
-        assert_eq!(store.put_record(&C, &older, NOW), RecordPut::Ok);
+        assert_eq!(store.put_record(&C, &admit(&newer), NOW), RecordPut::Ok);
+        assert_eq!(store.put_record(&C, &admit(&older), NOW), RecordPut::Ok);
         assert_eq!(
             found(store.get_records(&C, &[1; 16], NOW)),
             [newer.as_slice()]
@@ -1087,10 +1101,10 @@ mod tests {
         assert!(total > 0, "records count in the total");
         // Eight slots a lookup, as address records.
         for slot in 2..=8 {
-            store.put_record(&C, &mail_record(1, slot, NOW + 60, 0), NOW);
+            store.put_record(&C, &admit(&mail_record(1, slot, NOW + 60, 0)), NOW);
         }
         let ninth = mail_record(1, 9, NOW + 60, 0);
-        assert_eq!(store.put_record(&C, &ninth, NOW), RecordPut::Full);
+        assert_eq!(store.put_record(&C, &admit(&ninth), NOW), RecordPut::Full);
         // A restart keeps them; a week later they've swept.
         drop(store);
         let mut store = Store::open(&dir, NOW + 10, Settings::default()).unwrap();
@@ -1106,10 +1120,10 @@ mod tests {
         let mut store = empty("record-rates");
         for i in 0..RECORD_PUTS_PER_KEY {
             let r = mail_record((i % 200) as u8, (i / 200) as u8, NOW + 60, 0);
-            assert_ne!(store.put_record(&C, &r, NOW), RecordPut::SlowDown);
+            assert_ne!(store.put_record(&C, &admit(&r), NOW), RecordPut::SlowDown);
         }
         let r = mail_record(0, 0, NOW + 60, 0);
-        assert_eq!(store.put_record(&C, &r, NOW), RecordPut::SlowDown);
+        assert_eq!(store.put_record(&C, &admit(&r), NOW), RecordPut::SlowDown);
         for _ in 0..RECORD_GETS_PER_KEY {
             assert_ne!(store.get_records(&C, &[0; 16], NOW), RecordGet::SlowDown);
         }
