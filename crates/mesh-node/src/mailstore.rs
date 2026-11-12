@@ -23,7 +23,9 @@
 //! memory; envelopes stay on disk, with only where each sits in memory. A
 //! put is synced before it's answered; a claim or take isn't: a lost claim
 //! comes back at the next renewal, and a lost take hands the reader a
-//! duplicate it drops by event ID.
+//! duplicate it drops by event ID. A damaged log is moved aside and starts
+//! empty; when that's the envelopes, the claims are dropped with it, so
+//! readers see `no-box` and their senders mail again.
 
 //! Mail records (routing D3, D5, D6 as changed) are the third log,
 //! `<data>/mail/records`: sealed as address records are, and read by the
@@ -198,15 +200,16 @@ fn record(len: u32) -> u64 {
     4 + u64::from(len)
 }
 
-/// Opens one of the logs; a damaged one is moved aside and started anew.
-fn open_log(path: &Path, mut each: impl FnMut(At, &[u8]) -> bool) -> Result<Log, LogError> {
+/// Opens one of the logs; a damaged one is moved aside and started anew,
+/// and says so.
+fn open_log(path: &Path, mut each: impl FnMut(At, &[u8]) -> bool) -> Result<(Log, bool), LogError> {
     match Log::open(path, &mut each) {
         Err(LogError::Damaged(_)) => {
             eprintln!("mesh-node seed: a mail log was damaged; it starts empty");
             move_aside(path).map_err(|e| LogError::Io(path.to_owned(), e))?;
-            Log::open(path, each)
+            Ok((Log::open(path, each)?, true))
         }
-        opened => opened,
+        opened => Ok((opened?, false)),
     }
 }
 
@@ -221,7 +224,7 @@ impl Store {
     /// dropped, and both compacted.
     pub fn open(dir: &Path, now: u64, settings: Settings) -> Result<Store, LogError> {
         let mut claims = HashMap::new();
-        let claims_log = open_log(&dir.join("claims"), |_, p| {
+        let (claims_log, _) = open_log(&dir.join("claims"), |_, p| {
             let Some(((key, rest), true)) = key(p).map(|k| (k, p.len() == CLAIM_RECORD)) else {
                 return false;
             };
@@ -234,7 +237,7 @@ impl Store {
             true
         })?;
         let mut slots: HashMap<Key, VecDeque<Held>> = HashMap::new();
-        let envelopes_log = open_log(&dir.join("envelopes"), |at, p| match p.first() {
+        let (envelopes_log, lost) = open_log(&dir.join("envelopes"), |at, p| match p.first() {
             Some(&PUT) if p.len() > PUT_HEAD + HEAD => {
                 let put = u64::from_be_bytes(p[1..PUT_HEAD].try_into().expect("8 bytes"));
                 let (key, _) = key(&p[PUT_HEAD..]).expect("long enough");
@@ -251,8 +254,17 @@ impl Store {
             }
             _ => false,
         })?;
+        if lost {
+            // Readers must see no-box, so their `since` moves and senders
+            // mail again (seed D9, mailbox M12).
+            eprintln!(
+                "mesh-node seed: {} mail claims dropped with it",
+                claims.len()
+            );
+            claims.clear();
+        }
         let mut records: HashMap<[u8; 16], Vec<Record>> = HashMap::new();
-        let records_log = open_log(&dir.join("records"), |at, p| {
+        let (records_log, _) = open_log(&dir.join("records"), |at, p| {
             let Some((lookup, slot, expiry)) = addr_outer(p) else {
                 return false;
             };
@@ -843,10 +855,34 @@ mod tests {
         std::fs::write(dir.join("envelopes"), b"MLOG\x01\x00\x00\x00\x02??").unwrap();
         let mut store = Store::open(&dir, NOW, Settings::default()).unwrap();
         assert!(dir.join("envelopes.damaged").exists());
+        // Mail was lost, so the claims go too: the reader's next renewal or
+        // collect answers no-box, its `since` moves, and senders mail again
+        // (seed D9, mailbox M12).
+        let get = with(&at, &SECRET, &[]);
+        assert_eq!(
+            store.get(&C, &get, NOW),
+            [Answer::NoBox as u8],
+            "claims gone"
+        );
         assert_eq!(
             store.put(&C, &admit(&[at.clone(), b"x".to_vec()].concat()), NOW),
-            Answer::Ok,
-            "claims kept"
+            Answer::NoBox
+        );
+        drop(store);
+        let store = Store::open(&dir, NOW, Settings::default()).unwrap();
+        assert_eq!(store.claims.len(), 0, "and stay gone after a restart");
+        // A damaged claims log alone takes nothing else with it.
+        let mut store = store;
+        store.claim(&C, &admit(&claim(&at, &SECRET, NOW + 86_400)), NOW);
+        let put = admit(&[at.clone(), b"y".to_vec()].concat());
+        assert_eq!(store.put(&C, &put, NOW), Answer::Ok);
+        drop(store);
+        std::fs::write(dir.join("records"), b"junk").unwrap();
+        let store = Store::open(&dir, NOW, Settings::default()).unwrap();
+        assert_eq!(
+            (store.claims.len(), store.len()),
+            (1, 1),
+            "a damaged records log only"
         );
         drop(store);
         std::fs::write(dir.join("claims"), b"MLOG\x02").unwrap();
