@@ -16,7 +16,8 @@ pub use envelope::{
 };
 pub use group::{Deliveries, MAX_MEMBERS, ROTATE_AFTER, ROTATE_MESSAGES, WAIT_FOR_KEY};
 pub use session::{
-    Conversation, E2ee, FALLBACK_LIFE, MAX_FIELD_LEN, MAX_ONE_TIME_KEYS, Opened, Received,
+    Conversation, E2ee, FALLBACK_LIFE, FRESH_SESSION_MIN, MAX_FIELD_LEN, MAX_ONE_TIME_KEYS, Opened,
+    Received,
 };
 
 /// Why something couldn't be encrypted or opened. Each is fixed text and

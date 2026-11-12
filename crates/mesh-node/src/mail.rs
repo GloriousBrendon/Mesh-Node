@@ -5,8 +5,9 @@
 //! before any live delivery, opens what it finds as if it had come live,
 //! stores it, deletes it from the seed, and puts a receipt into the sender's
 //! box at its holder: `ok`, `failed` and couldn't-open (M9). A sender that
-//! collects it moves its counters on the `ok`s and mails the `failed`s
-//! again. Every wrapper carries the pair's tag; one that fails it, or whose
+//! collects it moves its counters on the `ok`s, mails the `failed`s again,
+//! and mails a couldn't-open that has no `ok` again on a fresh session
+//! (M16). Every wrapper carries the pair's tag; one that fails it, or whose
 //! sender isn't a current device of the contact, is dropped (M7).
 //!
 //! A child of `helper`, as `dm` is.
@@ -480,6 +481,9 @@ impl Helper {
         let (mut opened_count, mut dropped) = (0, 0);
         let mut acked = false;
         let mut again = Vec::new();
+        // Receipts are acted on once the mail is opened: opening mail on an
+        // old session brings it back in front, after a fresh one (M16).
+        let mut receipts_got = Vec::new();
         // Each sender device's mail, whichever box or week it was in.
         let mut by_sender: BTreeMap<([u8; 32], [u8; 32]), BySender> = BTreeMap::new();
         for Found {
@@ -529,9 +533,11 @@ impl Helper {
                     Err(_) => dropped += 1,
                 }
             }
-            for (head, body) in got_receipts {
-                acked |= self.mail_receipt(&id, &head, &body, &mut again);
-            }
+            receipts_got.extend(
+                got_receipts
+                    .into_iter()
+                    .map(|(head, body)| (id, head, body)),
+            );
         }
         // Olm opens each sender device's mail in its `mseq` order (M8); the
         // events wait, to go to dm all together.
@@ -560,6 +566,9 @@ impl Helper {
             });
         }
         self.mail_take(&mut batches);
+        for (id, head, body) in receipts_got {
+            acked |= self.mail_receipt(&id, &head, &body, &mut again);
+        }
         let cant_open: usize = (batches.iter())
             .map(|b| b.answers.iter().filter(|a| **a == dm::CANT_OPEN).count())
             .sum();
@@ -745,12 +754,33 @@ impl Helper {
                 receipt.failed.len()
             );
         }
-        // ponytail: counted only; PLAN-mailbox Task 10 answers them.
+        // Couldn't open (M16): what has an `ok` is left be; the rest goes
+        // again at once on a fresh session, if the limits allow one.
         if !receipt.cant_open.is_empty() {
             eprintln!(
                 "mesh-node: {} mailed events couldn't be opened",
                 receipt.cant_open.len()
             );
+        }
+        let lost: Vec<(u64, u64)> = (receipt.cant_open.iter())
+            .filter_map(|mseq| Some((*mseq, *self.mail.sent.get(&(reader, *mseq))?)))
+            .filter(|(_, number)| !history.has_ok(&reader, *number))
+            .collect();
+        let fresh = match (VerifyingKey::from_bytes(&reader), self.e2ee.as_mut()) {
+            (Ok(key), Some(e2ee)) if !lost.is_empty() => e2ee.fresh_session(id, &key, now),
+            _ => Ok(false),
+        };
+        match fresh {
+            Ok(true) => {
+                eprintln!("mesh-node: a fresh mail session for {} events", lost.len());
+                for (mseq, number) in lost {
+                    self.mail.sent.remove(&(reader, mseq));
+                    self.mail.marked.remove(&(reader, number));
+                }
+                again.push(*id);
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("mesh-node: couldn't start a fresh mail session: {e}"),
         }
         moved
     }

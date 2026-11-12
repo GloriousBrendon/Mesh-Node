@@ -185,6 +185,14 @@ impl Counters {
         self.devices.get(device).map(|c| c.upto)
     }
 
+    /// Whether `device` has acknowledged event `number` (or it wasn't for
+    /// it): its counter is past it, or it's acknowledged above.
+    pub fn has_ok(&self, device: &Device, number: u64) -> bool {
+        self.devices
+            .get(device)
+            .is_some_and(|c| number <= c.upto || c.above.contains(&number))
+    }
+
     /// What `device` gets next. `shares` says whether a chat includes a
     /// person; `now` is in milliseconds.
     pub fn to_send(
@@ -440,6 +448,9 @@ mod tests {
         counters.acked(&LAPTOP, 2, false, &log, all);
         counters.acked(&LAPTOP, 3, true, &log, all);
         assert_eq!(counters.counter(&LAPTOP), Some(1));
+        let oks: Vec<bool> = (1..=3).map(|n| counters.has_ok(&LAPTOP, n)).collect();
+        assert_eq!(oks, [true, false, true], "1 by the counter, 3 above it");
+        assert!(!counters.has_ok(&DESK, 1), "a device we don't send to");
         assert_eq!(
             counters.to_send(&LAPTOP, &log, all, NOW).send,
             [2],

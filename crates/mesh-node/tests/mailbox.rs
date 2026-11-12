@@ -511,19 +511,30 @@ impl Pair {
 /// Alice and Bob made friends, and (with `write`) wrote once live; then a
 /// pause so each has read the other's mail record. Their helpers and IDs.
 fn friends(name: &str, write: bool) -> (Pair, Helper, String, Helper, String) {
+    friends_with(name, write, true)
+}
+
+/// `friends`; with `plain_first`, Alice's first seed is one without mail.
+/// Without, it's the mail seed, so mail for Alice (receipts) reaches her.
+// ponytail: a helper's own holder is its first seed until PLAN-mailbox Task
+// 12, so with the plain seed first nothing can be mailed to Alice.
+fn friends_with(
+    name: &str,
+    write: bool,
+    plain_first: bool,
+) -> (Pair, Helper, String, Helper, String) {
     let dirs = ["seed", "alice", "bob", "plain"].map(|n| temp_dir(&format!("{name}-{n}")));
     let relay = Relay::start();
     let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
     let ticket = seed.ticket();
     let mut plain = Seed::start(&dirs[3], &relay);
     let plain_ticket = plain.ticket();
-    let (mut alice, id_a) = helper(
-        &dirs[1],
-        &relay,
-        &plain_ticket,
-        "alice",
-        &["--seed", &ticket],
-    );
+    let (first, then) = if plain_first {
+        (&plain_ticket, &ticket)
+    } else {
+        (&ticket, &plain_ticket)
+    };
+    let (mut alice, id_a) = helper(&dirs[1], &relay, first, "alice", &["--seed", then]);
     let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &[]);
     alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
     bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
@@ -854,7 +865,7 @@ fn test_12_an_add_and_a_message_in_one_collect() {
 /// repair and leaves no error.
 #[test]
 fn test_13_out_of_order() {
-    let (p, mut alice, id_a, mut bob, id_b) = friends("mail13", true);
+    let (p, mut alice, id_a, mut bob, id_b) = friends_with("mail13", true, false);
     locks(&mut bob);
     let sent: Vec<String> = (1..=60).map(|i| format!("m{i}")).collect();
     for text in &sent {
@@ -892,8 +903,72 @@ fn test_13_out_of_order() {
         "no error for mail"
     );
     assert!(bob_log.contains("couldn't be opened"), "counted");
-    logs.extend([alice.quit(), bob_log]);
+    // Alice collects his receipt: every one it lists has an `ok`.
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    let alice_log = alice.quit();
+    assert!(
+        alice_log.contains("couldn't be opened"),
+        "the receipt listed them"
+    );
+    assert!(
+        !alice_log.contains("fresh mail session"),
+        "no fresh session"
+    );
+    logs.extend([alice_log, bob_log]);
     p.done(logs, &["m1", "m60"]);
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+}
+
+/// Test 14. Bob's stored session with Alice is lost: his e2ee state is put
+/// back as it was before they wrote, so he holds her keys but no session.
+/// Alice, away, mails him "four" and locks; Bob can't open it, drops it,
+/// and his receipt lists it as couldn't-open. Bob locks. Alice unlocks,
+/// collects the receipt and mails "four" again at once on a fresh session.
+/// Bob unlocks and gets it. The two are never online together.
+#[test]
+fn test_14_a_broken_session_heals_by_mail() {
+    let (p, mut alice, id_a, bob, id_b) = friends_with("mail14", false, false);
+    let e2ee = p.dirs[2].join("e2ee");
+    let before = p.dirs[2].join("e2ee-before");
+    let mut logs = vec![bob.quit()];
+    copy_dir(&e2ee, &before);
+    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0);
+    ask(&mut alice, "dmSend", &[&id_b, "hi"], "meshDmMessages");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "hi");
+    ask(&mut bob, "dmSend", &[&id_a, "hey"], "meshDmMessages");
+    page_until(&mut alice, &id_b, |p| texts(p).contains(&"hey".to_owned()));
+    locks(&mut bob);
+    logs.push(bob.quit());
+    std::fs::remove_dir_all(&e2ee).unwrap();
+    copy_dir(&before, &e2ee);
+
+    ask(&mut alice, "dmSend", &[&id_b, "four"], "meshDmMessages");
+    locks(&mut alice);
+    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0);
+    std::thread::sleep(SETTLE);
+    let page = page_until(&mut bob, &id_a, |_| true);
+    assert!(!texts(&page).contains(&"four".to_owned()), "it can't open");
+    locks(&mut bob);
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    page_until(&mut bob, &id_a, |p| texts(p).contains(&"four".to_owned()));
+    let alice_log = alice.quit();
+    assert!(
+        alice_log.contains("a fresh mail session for 1 events"),
+        "four, again, on a fresh session"
+    );
+    logs.extend([alice_log, bob.quit()]);
+    p.done(logs, &["four"]);
 }
 
 /// Test 16. A group of Alice, Bob and Dave, made by Alice. Bob locks. Over

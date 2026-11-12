@@ -46,6 +46,9 @@ const FIRST_MESSAGES_KEPT: usize = 1000;
 /// How often a device may get a fresh session after a first message we
 /// couldn't open.
 const UNWEDGE_EVERY: u64 = 3600;
+/// How often a device may get a fresh session by receipt (SPEC-mailbox
+/// `FRESH_SESSION_MIN`): e2ee D4's once an hour.
+pub const FRESH_SESSION_MIN: u64 = UNWEDGE_EVERY;
 /// The longest record field.
 pub const MAX_FIELD_LEN: usize = MAX_BUNDLE_LEN + 64;
 const _: () = assert!(MAX_FIELD_LEN <= mesh_identity::MAX_E2EE_FIELD);
@@ -86,6 +89,9 @@ pub(crate) struct Keys {
     /// The one-time key a session was started from, so a stale record
     /// can't hand it back.
     used: Option<Key>,
+    /// The fallback key a fresh session by receipt was last started from
+    /// (SPEC-mailbox M16): never twice from one.
+    fresh_from: Option<Key>,
 }
 
 /// What we know about one person (or about ourselves).
@@ -111,6 +117,7 @@ impl Person {
                         fallback: k.fallback,
                         one_time: k.one_time,
                         used: k.used,
+                        fresh_from: k.fresh_from,
                     };
                     (*device, file)
                 })
@@ -133,7 +140,8 @@ impl Person {
                 ed25519: k.ed25519,
                 created_at: k.created_at,
             };
-            let (fallback, one_time, used) = (k.fallback, k.one_time, k.used);
+            let (fallback, one_time, used, fresh_from) =
+                (k.fallback, k.one_time, k.used, k.fresh_from);
             keys.insert(
                 device,
                 Keys {
@@ -141,6 +149,7 @@ impl Person {
                     fallback,
                     one_time,
                     used,
+                    fresh_from,
                 },
             );
         }
@@ -201,6 +210,9 @@ pub struct E2ee {
     unwedged: HashMap<Key, u64>,
     /// Opening mail: no fresh session is sent back (SPEC-mailbox M8).
     mail: bool,
+    /// When each device last got a fresh session by receipt. In memory, as
+    /// `unwedged` is.
+    fresh_at: HashMap<Key, u64>,
     /// `None` keeps everything in memory (tests).
     store: Option<Store>,
     pub(crate) dirty: Dirty,
@@ -236,6 +248,9 @@ struct KeysFile {
     fallback: Key,
     one_time: Option<Key>,
     used: Option<Key>,
+    /// Added with mailbox; files from before read it as none.
+    #[serde(default)]
+    fresh_from: Option<Key>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,6 +292,7 @@ impl E2ee {
             groups: Groups::default(),
             unwedged: HashMap::new(),
             mail: false,
+            fresh_at: HashMap::new(),
             store: None,
             dirty: Dirty::default(),
             #[cfg(test)]
@@ -366,6 +382,7 @@ impl E2ee {
             groups,
             unwedged: HashMap::new(),
             mail: false,
+            fresh_at: HashMap::new(),
             store: Some(store),
             dirty: Dirty::default(),
             #[cfg(test)]
@@ -555,6 +572,7 @@ impl E2ee {
             fallback,
             one_time: None,
             used: None,
+            fresh_from: None,
         });
         if keys.bundle.curve != bundle.curve {
             // A new account on the same device: its old sessions are useless.
@@ -861,6 +879,53 @@ impl E2ee {
             .collect();
         self.save()?;
         Ok(opened)
+    }
+
+    /// A fresh outbound session with `id`'s `device`, from the newest
+    /// fallback key we hold for it, in front of the others, so everything
+    /// after goes on it (SPEC-mailbox M16). Never twice from one fallback
+    /// key, and at most once per `FRESH_SESSION_MIN` per device. True if
+    /// one was started.
+    pub fn fresh_session(
+        &mut self,
+        id: &MeshId,
+        device: &VerifyingKey,
+        now: u64,
+    ) -> Result<bool, E2eeError> {
+        let key = device.to_bytes();
+        if self
+            .fresh_at
+            .get(&key)
+            .is_some_and(|at| now < at + FRESH_SESSION_MIN)
+        {
+            return Ok(false);
+        }
+        let Some(person) = self.people.get_mut(id) else {
+            return Ok(false);
+        };
+        let Some(keys) = person.keys.get_mut(&key) else {
+            return Ok(false);
+        };
+        if keys.fresh_from == Some(keys.fallback) {
+            return Ok(false);
+        }
+        let (curve, fallback) = (keys.bundle.curve, keys.fallback);
+        let session = self
+            .account
+            .create_outbound_session(
+                SessionConfig::version_1(),
+                Curve25519PublicKey::from_bytes(curve),
+                Curve25519PublicKey::from_bytes(fallback),
+            )
+            .map_err(|_| E2eeError::NoKeys)?;
+        keys.fresh_from = Some(fallback);
+        let sessions = person.sessions.entry(key).or_default();
+        sessions.push_front(session);
+        sessions.truncate(SESSIONS_PER_DEVICE);
+        self.fresh_at.insert(key, now);
+        self.dirty.people.insert(*id);
+        self.save()?;
+        Ok(true)
     }
 
     /// `decrypt_batch` for collected mail (SPEC-mailbox M8): a first
@@ -1537,6 +1602,49 @@ pub(crate) mod tests {
             bob.e2ee.decrypt(&lost, NOW).err(),
             Some(E2eeError::CantOpen)
         );
+    }
+
+    /// A fresh session by receipt (SPEC-mailbox M16) replaces the old one
+    /// for what follows, and opens; then not again within the hour, and
+    /// never twice from one fallback key.
+    #[test]
+    fn a_fresh_session_by_receipt_and_its_limits() {
+        let (mut alice, mut bob) = (device(), device());
+        friends(&mut alice, &mut bob);
+        let (bob_id, bob_key) = (bob.who.root.id(), bob.who.device.public());
+        let first = alice.e2ee.encrypt_direct(&bob_id, Kind::TestNote, b"one");
+        bob.e2ee.open1(&to(first.unwrap(), &bob_key)).unwrap();
+        assert!(alice.e2ee.fresh_session(&bob_id, &bob_key, NOW).unwrap());
+        let fresh = to(
+            alice
+                .e2ee
+                .encrypt_direct(&bob_id, Kind::TestNote, b"two")
+                .unwrap(),
+            &bob_key,
+        );
+        assert_eq!(
+            fresh[1],
+            EnvelopeType::OlmFirst as u8,
+            "a first message on the new session"
+        );
+        assert_eq!(bob.e2ee.open1(&fresh).unwrap().body, b"two");
+        assert!(
+            !alice
+                .e2ee
+                .fresh_session(&bob_id, &bob_key, NOW + 60)
+                .unwrap(),
+            "within the hour"
+        );
+        let later = NOW + FRESH_SESSION_MIN;
+        assert!(
+            !alice.e2ee.fresh_session(&bob_id, &bob_key, later).unwrap(),
+            "the same fallback key"
+        );
+        // A newer fallback key (Bob's next week) allows one more.
+        let field = bob.e2ee.mail_field(NOW + FALLBACK_LIFE).unwrap();
+        let (devices, key) = (bob.who.devices.clone(), bob.who.device.public());
+        alice.e2ee.learn(&bob_id, &devices, &key, &field).unwrap();
+        assert!(alice.e2ee.fresh_session(&bob_id, &bob_key, later).unwrap());
     }
 
     /// Collected mail starts no session repair (SPEC-mailbox M8): a first

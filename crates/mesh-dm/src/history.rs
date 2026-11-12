@@ -816,6 +816,12 @@ impl History {
         self.counters.counter(device)
     }
 
+    /// Whether `device` has acknowledged event `number` (SPEC-mailbox M16:
+    /// a couldn't-open for it is ignored).
+    pub fn has_ok(&self, device: &Device, number: u64) -> bool {
+        self.counters.has_ok(device, number)
+    }
+
     /// Every chat with events.
     pub fn chats(&self) -> Vec<Where> {
         let listed = self.known.iter().filter(|(key, at)| match at {
