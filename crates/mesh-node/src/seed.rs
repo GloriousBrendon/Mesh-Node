@@ -35,6 +35,8 @@ const KEY_FILE: &str = "seed.key";
 const STORE_FILE: &str = "codes.bin";
 const ADDR_FILE: &str = "addrs.bin";
 const KNOCK_FILE: &str = "knocks.bin";
+/// The mail store's logs (mailstore).
+const MAIL_DIR: &str = "mail";
 /// Address records come back within 30 minutes, so losing a few minutes of
 /// them costs nothing (SPEC-routing).
 const SAVE_ADDRS_EVERY: Duration = Duration::from_secs(300);
@@ -172,7 +174,14 @@ pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), Str
         codes: Arc::new(Mutex::new(store)),
         addrs: Arc::new(Mutex::new(addrs)),
         knocks: Arc::new(Mutex::new(knocks)),
-        mail: options.mail.then(Arc::default),
+        mail: if options.mail {
+            let mail = mailstore::Store::open(&dir.join(MAIL_DIR), unix_now())
+                .map_err(|e| format!("the mail store didn't open: {e}"))?;
+            eprintln!("mesh-node seed: holding {} envelopes of mail", mail.len());
+            Some(Arc::new(Mutex::new(mail)))
+        } else {
+            None
+        },
     };
     let mut services = vec![HOLD, GET, REVOKE, ADDR_PUT, ADDR_GET, KNOCK_PUT, KNOCK_GET];
     if options.mail {
@@ -521,7 +530,11 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
             take(&counts.knock_gets),
         );
         if let Some(mail) = &stores.mail {
-            let held = lock(mail).len();
+            let held = {
+                let mut mail = lock(mail);
+                mail.sweep(now);
+                mail.len()
+            };
             eprintln!(
                 "mesh-node seed: last hour mail {} claims, {} puts, {} collects, {} takes; {held} envelopes held",
                 take(&counts.mail_claims),

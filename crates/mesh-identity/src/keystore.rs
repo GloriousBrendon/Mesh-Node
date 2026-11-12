@@ -1076,11 +1076,29 @@ fn expired(code: &ActiveCode, now: u64) -> bool {
     code.expires_at.is_some_and(|at| at <= now)
 }
 
-/// Seconds since 1970 (0 if the clock is before it).
+/// Seconds since 1970 (0 if the clock is before it), moved by the clock
+/// offset if one was set.
 pub fn unix_now() -> u64 {
-    SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| d.as_secs());
+    now.saturating_add_signed(CLOCK_OFFSET.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Seconds added to `unix_now`: 0, unless a test moved the clock.
+static CLOCK_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// How far a test may move the clock (`--clock-offset`).
+pub const MAX_CLOCK_OFFSET: i64 = 60 * 86_400;
+
+/// Moves this process's clock by `secs`, for tests (`--clock-offset`,
+/// SPEC-mailbox decided Q14). `false`, and nothing moved, past
+/// `MAX_CLOCK_OFFSET`.
+pub fn set_clock_offset(secs: i64) -> bool {
+    if secs.abs() > MAX_CLOCK_OFFSET {
+        return false;
+    }
+    CLOCK_OFFSET.store(secs, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Writes `bytes` to a temporary file beside `path` (owner-only), syncs

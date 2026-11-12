@@ -13,12 +13,16 @@
 //! `--public <ip:port>` puts that address in its ticket, so callers reach it
 //! direct (D8c). `--report-every <secs>` shortens the hourly counts, for
 //! tests. `--mail` turns on the mail services (SPEC-mailbox; off by default).
+//!
+//! `--clock-offset <secs>`, on either, moves the process's clock, for tests
+//! only (SPEC-mailbox), as `--record-ttl` is.
 
 mod addrs;
 mod codes;
 mod e2ee;
 mod helper;
 mod knocks;
+mod maillog;
 mod mailstore;
 mod routing;
 mod saved;
@@ -45,6 +49,19 @@ fn main() {
         eprintln!("mesh-node: no data directory; pass --data <dir>");
         std::process::exit(2);
     };
+    // Tests only (SPEC-mailbox decided Q14): this process's clock, moved.
+    if let Some(w) = args.windows(2).find(|w| w[0] == "--clock-offset") {
+        let moved = w[1]
+            .parse::<i64>()
+            .is_ok_and(mesh_identity::set_clock_offset);
+        if !moved {
+            eprintln!(
+                "mesh-node: --clock-offset takes seconds, at most {}",
+                mesh_identity::MAX_CLOCK_OFFSET
+            );
+            std::process::exit(2);
+        }
+    }
     let relays: Vec<RelayUrl> = match args
         .windows(2)
         .filter(|w| w[0] == "--relay")

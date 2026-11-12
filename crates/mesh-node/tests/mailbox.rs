@@ -292,3 +292,67 @@ fn test_6_junk_unclaimed_and_secrets() {
     drop(relay.runtime);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Test 7. Mail older than `MAIL_LIFE` (30 days) and claims not renewed
+/// for `CLAIM_LIFE` (35 days) are gone from the seed's files.
+#[test]
+fn test_7_expiry() {
+    const DAY: u64 = 86_400;
+    let dir = temp_dir("mail7-seed");
+    let relay = Relay::start();
+    let (short, long) = (
+        [[3u8; 16].as_slice(), &[1u8; 8]].concat(),
+        [[3u8; 16].as_slice(), &[2u8; 8]].concat(),
+    );
+    let letter = b"a letter that must not outlive its month".to_vec();
+    let mut seed = Seed::start_with(&dir, &relay, &["--mail"]);
+    let addr = MeshAddr::from_ticket(&seed.ticket()).unwrap();
+    relay.runtime.block_on(async {
+        let node = client(&relay).await;
+        let tag = mail_collect_tag(&[7; 32]);
+        for (at, life) in [(&short, DAY), (&long, 35 * DAY)] {
+            let claim = [
+                at.clone(),
+                tag.to_vec(),
+                (now() + life).to_be_bytes().to_vec(),
+            ]
+            .concat();
+            assert_eq!(ask_seed(&node, &addr, "mail-claim", &claim).await, [OK]);
+        }
+        let put = [long.clone(), letter.clone()].concat();
+        assert_eq!(ask_seed(&node, &addr, "mail-put", &put).await, [OK]);
+        node.close().await;
+    });
+    seed.stop();
+    let files =
+        || ["claims", "envelopes"].map(|f| std::fs::read(dir.join("mail").join(f)).unwrap());
+    let [claims, envelopes] = files();
+    assert!(contains(&envelopes, &letter) && contains(&claims, &short));
+
+    // 31 days on: the letter is gone, and the short claim; the long stands.
+    let offset = (31 * DAY).to_string();
+    let mut seed = Seed::start_with(&dir, &relay, &["--mail", "--clock-offset", &offset]);
+    seed.ticket();
+    seed.stop();
+    let [claims, envelopes] = files();
+    assert!(
+        !contains(&envelopes, &letter),
+        "the letter outlived its month"
+    );
+    assert!(!contains(&claims, &short), "the lapsed claim stayed");
+    assert!(contains(&claims, &long));
+
+    // 36 days on, the long claim has lapsed too.
+    let offset = (36 * DAY).to_string();
+    let mut seed = Seed::start_with(&dir, &relay, &["--mail", "--clock-offset", &offset]);
+    seed.ticket();
+    seed.stop();
+    let [claims, _] = files();
+    assert!(!contains(&claims, &long), "a claim outlived CLAIM_LIFE");
+    drop(relay.runtime);
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -17,10 +17,19 @@
 //! fit one frame; a take of `count` then deletes those, once the reader has
 //! stored them. Envelopes put meanwhile go after them, so they stay.
 
-// ponytail: in memory, no limits (PLAN-mailbox Tasks 3 and 4).
+//! On disk (seed D9 as changed): `<data>/mail/claims` and
+//! `<data>/mail/envelopes`, append-only logs (`maillog`). Claims are held in
+//! memory; envelopes stay on disk, with only where each sits in memory. A
+//! put is synced before it's answered; a claim or take isn't: a lost claim
+//! comes back at the next renewal, and a lost take hands the reader a
+//! duplicate it drops by event ID.
 
+// ponytail: no limits yet (PLAN-mailbox Task 4).
+
+use crate::maillog::{At, Keep, Log, LogError, move_aside};
 use mesh_identity::mail_collect_tag;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 pub const BOX: usize = 16;
 pub const SLOT: usize = 8;
@@ -34,6 +43,16 @@ const MAX_GET_BYTES: usize = mesh_transport::frame::MAX_FRAME - 1024;
 /// A claim lasts this long after its last renewal (mailbox *Limits*): 30
 /// days away plus a partial first week.
 pub const CLAIM_LIFE: u64 = 35 * 86_400;
+/// An envelope is held this long after its put (mailbox *Limits*): the
+/// 30-day promise.
+pub const MAIL_LIFE: u64 = 30 * 86_400;
+/// A claim's record in its log: box, slot, tag, expiry.
+const CLAIM_RECORD: usize = HEAD + 32 + 8;
+/// An envelope log's records: a put, or a take.
+const PUT: u8 = 1;
+const TAKE: u8 = 2;
+/// A put's record before its sealed bytes: the op and the put time.
+const PUT_HEAD: usize = 1 + 8;
 
 /// An answer to a claim, put or take (and to a get that may not collect).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,10 +72,34 @@ struct Claim {
     expiry: u64,
 }
 
-#[derive(Default)]
+/// Where an envelope sits in its log, and when it was put.
+struct Held {
+    at: At,
+    put: u64,
+}
+
 pub struct Store {
     claims: HashMap<Key, Claim>,
-    slots: HashMap<Key, Vec<Vec<u8>>>,
+    slots: HashMap<Key, VecDeque<Held>>,
+    claims_log: Log,
+    envelopes_log: Log,
+}
+
+/// A log's size for a record of `len` payload bytes.
+fn record(len: u32) -> u64 {
+    4 + u64::from(len)
+}
+
+/// Opens one of the logs; a damaged one is moved aside and started anew.
+fn open_log(path: &Path, mut each: impl FnMut(At, &[u8]) -> bool) -> Result<Log, LogError> {
+    match Log::open(path, &mut each) {
+        Err(LogError::Damaged(_)) => {
+            eprintln!("mesh-node seed: a mail log was damaged; it starts empty");
+            move_aside(path).map_err(|e| LogError::Io(path.to_owned(), e))?;
+            Log::open(path, each)
+        }
+        opened => opened,
+    }
 }
 
 fn key(request: &[u8]) -> Option<(Key, &[u8])> {
@@ -66,6 +109,100 @@ fn key(request: &[u8]) -> Option<(Key, &[u8])> {
 }
 
 impl Store {
+    /// The store in `dir`: its logs read, what has expired by `now`
+    /// dropped, and both compacted.
+    pub fn open(dir: &Path, now: u64) -> Result<Store, LogError> {
+        let mut claims = HashMap::new();
+        let claims_log = open_log(&dir.join("claims"), |_, p| {
+            let Some(((key, rest), true)) = key(p).map(|k| (k, p.len() == CLAIM_RECORD)) else {
+                return false;
+            };
+            let (tag, expiry) = rest.split_at(32);
+            let claim = Claim {
+                tag: tag.try_into().expect("32 bytes"),
+                expiry: u64::from_be_bytes(expiry.try_into().expect("8 bytes")),
+            };
+            claims.insert(key, claim);
+            true
+        })?;
+        let mut slots: HashMap<Key, VecDeque<Held>> = HashMap::new();
+        let envelopes_log = open_log(&dir.join("envelopes"), |at, p| match p.first() {
+            Some(&PUT) if p.len() > PUT_HEAD + HEAD => {
+                let put = u64::from_be_bytes(p[1..PUT_HEAD].try_into().expect("8 bytes"));
+                let (key, _) = key(&p[PUT_HEAD..]).expect("long enough");
+                slots.entry(key).or_default().push_back(Held { at, put });
+                true
+            }
+            Some(&TAKE) if p.len() == 1 + HEAD + 4 => {
+                let (key, count) = key(&p[1..]).expect("long enough");
+                let count = u32::from_be_bytes(count.try_into().expect("4 bytes")) as usize;
+                if let Some(held) = slots.get_mut(&key) {
+                    held.drain(..count.min(held.len()));
+                }
+                true
+            }
+            _ => false,
+        })?;
+        let mut store = Store {
+            claims,
+            slots,
+            claims_log,
+            envelopes_log,
+        };
+        store.sweep(now);
+        store
+            .compact()
+            .map_err(|e| LogError::Io(dir.to_owned(), e))?;
+        Ok(store)
+    }
+
+    /// Drops claims past their expiry and envelopes past `MAIL_LIFE`, and
+    /// compacts a log that's more dead than live.
+    pub fn sweep(&mut self, now: u64) {
+        self.claims.retain(|_, c| c.expiry > now);
+        for held in self.slots.values_mut() {
+            held.retain(|h| h.put + MAIL_LIFE > now);
+        }
+        self.slots.retain(|_, held| !held.is_empty());
+        self.count_live();
+        if (self.claims_log.wants_compacting() || self.envelopes_log.wants_compacting())
+            && let Err(e) = self.compact()
+        {
+            eprintln!("mesh-node seed: couldn't compact the mail logs: {e}");
+        }
+    }
+
+    fn count_live(&mut self) {
+        self.claims_log.live = self.claims.len() as u64 * record(CLAIM_RECORD as u32);
+        self.envelopes_log.live = (self.slots.values().flatten())
+            .map(|h| record(h.at.len))
+            .sum();
+    }
+
+    /// Writes both logs anew with only what's live.
+    fn compact(&mut self) -> std::io::Result<()> {
+        let claims: Vec<Keep> = (self.claims.iter())
+            .map(|((b, s), c)| Keep::Bytes([&b[..], s, &c.tag, &c.expiry.to_be_bytes()].concat()))
+            .collect();
+        self.claims_log.compact(&claims)?;
+        let keep: Vec<Keep> = (self.slots.values().flatten())
+            .map(|h| Keep::At(h.at))
+            .collect();
+        let places = self.envelopes_log.compact(&keep)?;
+        for (held, at) in self.slots.values_mut().flatten().zip(places) {
+            held.at = at;
+        }
+        self.count_live();
+        Ok(())
+    }
+
+    fn log_claim(&mut self, key: &Key, claim: &Claim) {
+        let bytes = [&key.0[..], &key.1, &claim.tag, &claim.expiry.to_be_bytes()].concat();
+        if let Err(e) = self.claims_log.append(&bytes, false) {
+            eprintln!("mesh-node seed: couldn't write a mail claim: {e}");
+        }
+    }
+
     pub fn claim(&mut self, request: &[u8], now: u64) -> Answer {
         let Some((key, rest)) = key(request) else {
             return Answer::Bad;
@@ -79,17 +216,19 @@ impl Store {
         if expiry <= now || expiry > now + CLAIM_LIFE {
             return Answer::Bad;
         }
-        match self.claims.get_mut(&key) {
-            Some(c) if c.expiry > now && c.tag != *tag => Answer::Taken,
-            Some(c) => {
-                *c = Claim { tag: *tag, expiry };
-                Answer::Ok
-            }
-            None => {
-                self.claims.insert(key, Claim { tag: *tag, expiry });
-                Answer::Ok
-            }
+        if self
+            .claims
+            .get(&key)
+            .is_some_and(|c| c.expiry > now && c.tag != *tag)
+        {
+            return Answer::Taken;
         }
+        let claim = Claim { tag: *tag, expiry };
+        self.log_claim(&key, &claim);
+        if self.claims.insert(key, claim).is_none() {
+            self.claims_log.live += record(CLAIM_RECORD as u32);
+        }
+        Answer::Ok
     }
 
     fn claimed(&self, key: &Key, now: u64) -> bool {
@@ -108,26 +247,46 @@ impl Store {
         match key(request) {
             Some((_, sealed)) if sealed.is_empty() || sealed.len() > MAX_SEALED => Answer::Bad,
             Some((key, _)) if self.claimed(&key, now) => {
-                self.slots.entry(key).or_default().push(request.to_vec());
-                Answer::Ok
+                let payload = [&[PUT][..], &now.to_be_bytes(), request].concat();
+                match self.envelopes_log.append(&payload, true) {
+                    Ok(at) => {
+                        self.envelopes_log.live += record(at.len);
+                        let held = Held { at, put: now };
+                        self.slots.entry(key).or_default().push_back(held);
+                        Answer::Ok
+                    }
+                    Err(e) => {
+                        eprintln!("mesh-node seed: couldn't write mail: {e}");
+                        Answer::Bad
+                    }
+                }
             }
             Some(_) => Answer::NoBox,
             None => Answer::Bad,
         }
     }
 
-    pub fn get(&self, request: &[u8], now: u64) -> Vec<u8> {
+    pub fn get(&mut self, request: &[u8], now: u64) -> Vec<u8> {
         let Some((key, [])) = self.collecting(request, now) else {
             return vec![Answer::NoBox as u8];
         };
         let mut out = vec![0, 0];
         let mut count = 0u16;
-        for sealed in self.slots.get(&key).into_iter().flatten() {
-            if out.len() + 4 + sealed.len() > MAX_GET_BYTES || count == u16::MAX {
+        let places: Vec<At> = (self.slots.get(&key).into_iter().flatten())
+            .filter(|h| h.put + MAIL_LIFE > now)
+            .map(|h| h.at)
+            .collect();
+        for at in places {
+            let sealed_len = at.len as usize - PUT_HEAD;
+            if out.len() + 4 + sealed_len > MAX_GET_BYTES || count == u16::MAX {
                 break;
             }
-            out.extend_from_slice(&(sealed.len() as u32).to_be_bytes());
-            out.extend_from_slice(sealed);
+            let Ok(payload) = self.envelopes_log.read(at) else {
+                eprintln!("mesh-node seed: couldn't read mail");
+                break;
+            };
+            out.extend_from_slice(&(sealed_len as u32).to_be_bytes());
+            out.extend_from_slice(&payload[PUT_HEAD..]);
             count += 1;
         }
         out[..2].copy_from_slice(&count.to_be_bytes());
@@ -141,19 +300,30 @@ impl Store {
         let Ok(count) = <[u8; 4]>::try_from(count) else {
             return Answer::Bad;
         };
-        if let Some(held) = self.slots.get_mut(&key) {
-            let count = (u32::from_be_bytes(count) as usize).min(held.len());
-            held.drain(..count);
-            if held.is_empty() {
-                self.slots.remove(&key);
-            }
+        let Some(held) = self.slots.get_mut(&key) else {
+            return Answer::Ok;
+        };
+        let count = (u32::from_be_bytes(count) as usize).min(held.len());
+        let gone: u64 = held.drain(..count).map(|h| record(h.at.len)).sum();
+        if held.is_empty() {
+            self.slots.remove(&key);
+        }
+        let payload = [&[TAKE][..], &key.0, &key.1, &(count as u32).to_be_bytes()].concat();
+        if let Err(e) = self.envelopes_log.append(&payload, false) {
+            eprintln!("mesh-node seed: couldn't write a mail take: {e}");
+        }
+        self.envelopes_log.live -= gone;
+        if self.envelopes_log.wants_compacting()
+            && let Err(e) = self.compact()
+        {
+            eprintln!("mesh-node seed: couldn't compact the mail logs: {e}");
         }
         Answer::Ok
     }
 
     /// Envelopes held.
     pub fn len(&self) -> usize {
-        self.slots.values().map(Vec::len).sum()
+        self.slots.values().map(VecDeque::len).sum()
     }
 }
 
@@ -191,8 +361,12 @@ mod tests {
         [at, secret, more].concat()
     }
 
+    fn empty(name: &str) -> Store {
+        Store::open(&crate::maillog::temp(name), NOW).unwrap()
+    }
+
     fn claimed(at: &[u8]) -> Store {
-        let mut store = Store::default();
+        let mut store = empty(&format!("claimed-{}", at[0]));
         assert_eq!(
             store.claim(&claim(at, &SECRET, NOW + 86_400), NOW),
             Answer::Ok
@@ -221,13 +395,13 @@ mod tests {
 
     #[test]
     fn only_claimed_slots_hold_and_only_their_secret_collects() {
-        let at = head(1, 2);
-        let mut store = Store::default();
+        let at = head(3, 2);
+        let mut store = empty("only-claimed");
         let put = [at.clone(), b"x".to_vec()].concat();
         assert_eq!(store.put(&put, NOW), Answer::NoBox);
         store = claimed(&at);
         // Another slot of the same box is its own.
-        let other = [head(1, 3), b"x".to_vec()].concat();
+        let other = [head(3, 3), b"x".to_vec()].concat();
         assert_eq!(store.put(&other, NOW), Answer::NoBox);
         assert_eq!(store.put(&put, NOW), Answer::Ok);
         let wrong = [8; 32];
@@ -259,7 +433,7 @@ mod tests {
 
     #[test]
     fn bad_requests() {
-        let at = head(1, 2);
+        let at = head(4, 2);
         let mut store = claimed(&at);
         assert_eq!(store.put(&at, NOW), Answer::Bad, "nothing to hold");
         assert_eq!(store.put(&[0; 10], NOW), Answer::Bad);
@@ -284,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_get_fits_one_frame() {
-        let at = head(1, 2);
+        let at = head(5, 2);
         let mut store = claimed(&at);
         for _ in 0..40 {
             store.put(&[at.clone(), vec![7; 60 * 1024]].concat(), NOW);
@@ -292,5 +466,69 @@ mod tests {
         let got = store.get(&with(&at, &SECRET, &[]), NOW);
         assert!(got.len() <= mesh_transport::frame::MAX_FRAME);
         assert!(read_got(&got).unwrap().len() < 40);
+    }
+
+    #[test]
+    fn a_restart_keeps_claims_and_mail_and_drops_the_expired() {
+        let dir = crate::maillog::temp("restart");
+        let (a, b) = (head(6, 1), head(6, 2));
+        let mut store = Store::open(&dir, NOW).unwrap();
+        store.claim(&claim(&a, &SECRET, NOW + 86_400), NOW);
+        store.claim(&claim(&b, &SECRET, NOW + CLAIM_LIFE), NOW);
+        let whole = |at: &[u8], s: &[u8]| [at.to_vec(), s.to_vec()].concat();
+        store.put(&whole(&a, b"one"), NOW);
+        store.put(&whole(&a, b"two"), NOW);
+        store.put(&whole(&b, b"old"), NOW);
+        store.take(&with(&a, &SECRET, &1u32.to_be_bytes()), NOW);
+        drop(store);
+        let mut store = Store::open(&dir, NOW + 10).unwrap();
+        let got = store.get(&with(&a, &SECRET, &[]), NOW + 10);
+        assert_eq!(
+            read_got(&got),
+            Some(vec![whole(&a, b"two")]),
+            "the take held too"
+        );
+        // A day later the first claim has lapsed; a month on, the mail too.
+        let later = NOW + MAIL_LIFE;
+        drop(store);
+        let mut store = Store::open(&dir, later).unwrap();
+        assert_eq!(store.put(&whole(&a, b"x"), later), Answer::NoBox);
+        assert_eq!(store.len(), 0);
+        let got = store.get(&with(&b, &SECRET, &[]), later);
+        assert_eq!(
+            read_got(&got),
+            Some(vec![]),
+            "the claim stands, the mail is gone"
+        );
+        drop(store);
+        let files = [dir.join("claims"), dir.join("envelopes")].map(|f| std::fs::read(f).unwrap());
+        assert!(
+            !crate::maillog::tests_contain(&files[1], b"old"),
+            "gone from the file"
+        );
+        assert!(
+            !crate::maillog::tests_contain(&files[0], &a[..HEAD]),
+            "the lapsed claim too"
+        );
+    }
+
+    #[test]
+    fn a_damaged_log_starts_empty_and_a_newer_one_stops() {
+        let dir = crate::maillog::temp("damaged");
+        let at = head(7, 1);
+        let mut store = Store::open(&dir, NOW).unwrap();
+        store.claim(&claim(&at, &SECRET, NOW + 86_400), NOW);
+        drop(store);
+        std::fs::write(dir.join("envelopes"), b"MLOG\x01\x00\x00\x00\x02??").unwrap();
+        let mut store = Store::open(&dir, NOW).unwrap();
+        assert!(dir.join("envelopes.damaged").exists());
+        assert_eq!(
+            store.put(&[at.clone(), b"x".to_vec()].concat(), NOW),
+            Answer::Ok,
+            "claims kept"
+        );
+        drop(store);
+        std::fs::write(dir.join("claims"), b"MLOG\x02").unwrap();
+        assert!(matches!(Store::open(&dir, NOW), Err(LogError::Newer(_))));
     }
 }

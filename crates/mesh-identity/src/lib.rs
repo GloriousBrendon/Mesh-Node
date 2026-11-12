@@ -30,7 +30,10 @@ pub use contacts::{Contact, LastAddr, MAX_CONTACT_NAME, MAX_CONTACTS};
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
 pub use ed25519_dalek::VerifyingKey;
 pub use id::{DeviceKey, IdError, Link, MeshId, RootKey, mail_collect_tag, verify_device};
-pub use keystore::{KdfParams, Keystore, KeystoreError, unix_now, write_atomically};
+pub use keystore::{
+    KdfParams, Keystore, KeystoreError, MAX_CLOCK_OFFSET, set_clock_offset, unix_now,
+    write_atomically,
+};
 pub use knock::{
     Knock, KnockError, KnockFrom, MAX_KNOCK_LEN, MAX_KNOCK_NAME, MAX_NOTE, knock_outer, open_knock,
     seal_knock,
