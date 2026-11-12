@@ -1024,6 +1024,34 @@ fn a_couldnt_open_with_a_stale_fallback_key_goes_again() {
     p.done(logs, &["four", "five", "ok"]);
 }
 
+/// A round the seed didn't answer is tried again at the next refresh, not
+/// a day later (PLAN-mailbox Task 10b, fix 3). The seed's mail is wiped
+/// and Alice forgets Bob's record. Bob unlocks while the seed is down, so
+/// his claims and record don't arrive; it comes back while he's unlocked.
+/// Bob locks; Alice reads his record, mails him "x", and he gets it.
+#[test]
+fn a_round_the_seed_missed_goes_again() {
+    let (mut p, alice, _, bob, id_b) = friends("mail-missed", true);
+    let mut logs = vec![alice.quit(), bob.quit()];
+    p.stop_seed();
+    std::fs::remove_dir_all(p.dirs[0].join("mail")).unwrap();
+    std::fs::remove_dir_all(p.dirs[1].join("mail")).unwrap();
+    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0);
+    // Past `HOLDER_WAIT`, so the unlock's collect gives up.
+    std::thread::sleep(Duration::from_secs(12));
+    p.seed_at(0);
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+    let mut alice = again(&p.dirs[1], &p.relay, &p.alice_seeds(), "alice", 0);
+    std::thread::sleep(SETTLE);
+    ask(&mut alice, "dmSend", &[&id_b, "x"], "meshDmMessages");
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "x");
+    logs.extend([alice.quit(), bob.quit()]);
+    p.done(logs, &["x"]);
+}
+
 /// Test 16. A group of Alice, Bob and Dave, made by Alice. Bob locks. Over
 /// five days Dave sends "d1" to "d5", mailed to Bob, and locks; Alice sees
 /// each. Alice removes Dave and locks. Bob collects all six in one

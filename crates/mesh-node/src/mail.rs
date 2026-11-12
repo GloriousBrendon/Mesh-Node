@@ -60,16 +60,18 @@ pub(super) struct Mail {
     pending: Vec<JoinHandle<()>>,
     /// The unlock's collect hasn't come back: live sending waits for it.
     pub(super) collecting: bool,
-    /// When we last claimed every box (0: not since this process started).
-    renewed: u64,
+    /// When we last claimed every box and the seed answered (0: not since
+    /// this process started).
+    pub(super) renewed: u64,
     /// Contacts' newest records and our holders' `since` (mailrec).
     pub(super) remembered: mailrec::Remembered,
     /// The remembered file is from a newer mesh-node: never write it.
     pub(super) newer: bool,
     /// Contacts whose records are being read.
     pub(super) reading: HashSet<MeshId>,
-    /// When every record was last put and read.
-    pub(super) round: u64,
+    /// When every record was last put, and read, with a seed answering.
+    pub(super) put_at: u64,
+    pub(super) read_at: u64,
     /// Events a reader device answered `failed` by receipt: how many times,
     /// and not to be mailed again before when (M9).
     retry: HashMap<([u8; 32], u64), (u32, u64)>,
@@ -406,9 +408,6 @@ impl Helper {
         if claims.is_empty() {
             return;
         }
-        if only.is_none() {
-            self.mail.renewed = now;
-        }
         // Our claims there are good from the first one (M12).
         if let Some(ticket) = mailrec::ticket_of(&seed)
             && !self.mail.remembered.since.contains_key(&ticket)
@@ -417,9 +416,17 @@ impl Helper {
             self.mail_save();
         }
         let Some(net) = &self.net else { return };
-        let anon = net.anon.clone();
+        let (anon, back, full) = (net.anon.clone(), self.back.clone(), only.is_none());
         tokio::spawn(async move {
-            refused(seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims).await);
+            let claiming = seed::ask_many(&anon, &seed, seed::MAIL_CLAIM, &claims);
+            // Renewed only once the seed answers; else at the next refresh.
+            let Ok(answers) = tokio::time::timeout(HOLDER_WAIT, claiming).await else {
+                return;
+            };
+            if full && answers.is_ok() {
+                let _ = back.send(Back::MailClaimed(now));
+            }
+            refused(answers);
         });
     }
 

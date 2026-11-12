@@ -405,8 +405,13 @@ enum Back {
     /// What the unlock's mail collect found (mailbox), and whether our
     /// claims there were gone.
     MailFound(Vec<mail::Found>, bool),
-    /// Mail records read: whose, and the sealed records found.
-    MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>),
+    /// Mail records read: whose, and the sealed records found; with a
+    /// time, it was the round's read and a seed answered.
+    MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>, Option<u64>),
+    /// The seed answered a full claim (when it was sent).
+    MailClaimed(u64),
+    /// A seed answered the round's record puts (when they were sent).
+    MailPut(u64),
     /// Mail a seed didn't take: reader device, `mseq`, event number.
     MailUnput(Vec<([u8; 32], u64, u64)>),
     /// Another of our devices sent its account state.
@@ -1023,7 +1028,14 @@ impl Helper {
                 return self.emit_social(None);
             }
             Back::MailFound(found, wiped) => return self.mail_found(found, wiped),
-            Back::MailRecords(found) => return self.mail_records(found),
+            Back::MailRecords(found, round) => {
+                if let Some(at) = round {
+                    self.mail.read_at = at;
+                }
+                return self.mail_records(found);
+            }
+            Back::MailClaimed(at) => return self.mail.renewed = at,
+            Back::MailPut(at) => return self.mail.put_at = at,
             Back::MailUnput(puts) => return self.mail_unput(puts),
             Back::Connected(id) => {
                 self.send_waiting(&id);

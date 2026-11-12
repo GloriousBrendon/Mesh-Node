@@ -222,10 +222,20 @@ impl Helper {
             })
             .map(|record| [&OPEN[..], &record].concat())
             .collect();
-        let (anon, seeds) = (net.anon.clone(), self.seeds.clone());
+        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        let only_round = only.is_none();
         tokio::spawn(async move {
+            let mut answered = false;
             for seed in seeds.iter() {
-                let _ = seed::ask_many(&anon, seed, seed::MREC_PUT, &records).await;
+                let putting = seed::ask_many(&anon, seed, seed::MREC_PUT, &records);
+                answered |= matches!(
+                    tokio::time::timeout(mail::HOLDER_WAIT, putting).await,
+                    Ok(Ok(_))
+                );
+            }
+            // The round's puts count once a seed answers; else the next refresh.
+            if answered && only_round {
+                let _ = back.send(Back::MailPut(now));
             }
         });
     }
@@ -248,9 +258,11 @@ impl Helper {
             return;
         }
         self.mail.reading.extend(asked.iter().map(|(id, _)| *id));
+        let (round, now) = (only.is_none(), unix_now());
         let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
         let week = week_of(unix_now());
         tokio::spawn(async move {
+            let mut answered = false;
             let mut found: Vec<(MeshId, Vec<Vec<u8>>)> =
                 asked.iter().map(|(id, _)| (*id, Vec::new())).collect();
             // This week's lookup for everyone, then last week's for those
@@ -267,10 +279,12 @@ impl Helper {
                     break;
                 }
                 for seed in seeds.iter() {
-                    let Ok(answers) = seed::ask_many(&anon, seed, seed::MREC_GET, &lookups).await
+                    let getting = seed::ask_many(&anon, seed, seed::MREC_GET, &lookups);
+                    let Ok(Ok(answers)) = tokio::time::timeout(mail::HOLDER_WAIT, getting).await
                     else {
                         continue;
                     };
+                    answered = true;
                     for (i, answer) in wanted.iter().zip(answers) {
                         if let Some(crate::addrs::Get::Found(sealed)) =
                             crate::addrs::Get::from_bytes(&answer)
@@ -280,7 +294,8 @@ impl Helper {
                     }
                 }
             }
-            let _ = back.send(Back::MailRecords(found));
+            let round = (round && answered).then_some(now);
+            let _ = back.send(Back::MailRecords(found, round));
         });
     }
 
@@ -368,10 +383,12 @@ impl Helper {
 
     /// The daily round, and the unlock's: our records put, everyone's read.
     pub(super) fn mail_records_round(&mut self, force: bool) {
+        // Each half counts as done when a seed answers it (mail.rs Back).
         let now = unix_now();
-        if force || now >= self.mail.round + MAIL_RECORD_READ {
-            self.mail.round = now;
+        if force || now >= self.mail.put_at + MAIL_RECORD_READ {
             self.mail_records_put(None);
+        }
+        if force || now >= self.mail.read_at + MAIL_RECORD_READ {
             self.mail_records_read(None);
         }
     }
