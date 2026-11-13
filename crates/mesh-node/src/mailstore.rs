@@ -1214,4 +1214,171 @@ mod tests {
         }
         assert_eq!(store.get_records(&C, &[0; 16], NOW), RecordGet::SlowDown);
     }
+    /// PLAN-mailbox Task 16, measurements 2 to 4, on the real disk (not
+    /// /tmp, which may be RAM): a seed filled as 100 people of 1,000
+    /// contacts and 1,000 of 100 would fill it (claims for six weeks,
+    /// records for a week, 10 envelopes a person a day for a week); then a
+    /// batch of 256 synced puts, and a compaction, each with a caller
+    /// waiting on the lock meanwhile.
+    #[test]
+    #[ignore = "a measurement: cargo test --release -p mesh-node --bin mesh-node seed_at_scale -- --ignored --nocapture"]
+    fn seed_at_scale() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        const WEEKS: u64 = 6;
+        const RECORD: usize = 800;
+        const ENVELOPE: usize = 1024;
+        const MAIL_A_WEEK: usize = 70;
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let dir = target.join(format!("mesh-seed-scale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = || Settings {
+            token: None,
+            max: u64::MAX / 4,
+        };
+        let rss = || {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            let pages: u64 = (statm.split_whitespace().nth(1))
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0);
+            pages * 4096
+        };
+        let people: Vec<usize> = [vec![1000; 100], vec![100; 1000]].concat();
+        let person = |p: usize| Caller {
+            device: {
+                let mut d = [0; 32];
+                d[..4].copy_from_slice(&(p as u32).to_be_bytes());
+                d
+            },
+            network: Some([(p >> 8) as u8, p as u8, 1, 0, 0, 0]),
+        };
+        let at = |p: usize, w: u64, i: usize| -> Vec<u8> {
+            let mut b = [0u8; BOX];
+            b[..4].copy_from_slice(&(p as u32).to_be_bytes());
+            b[4] = w as u8;
+            b[5..7].copy_from_slice(&(i as u16).to_be_bytes());
+            [&b[..], &(p as u64).to_be_bytes()].concat()
+        };
+        let secret = |p: usize| {
+            let mut s = [9u8; 32];
+            s[..4].copy_from_slice(&(p as u32).to_be_bytes());
+            s
+        };
+        let before = rss();
+        let started = Instant::now();
+        let mut store = Store::open(&dir, NOW, settings()).unwrap();
+        let (mut claims, mut records, mut mail) = (0, 0, 0);
+        for (p, contacts) in people.iter().enumerate() {
+            let caller = person(p);
+            let boxes = (contacts + 1).div_ceil(64) * 64;
+            for w in 0..WEEKS {
+                for i in 0..boxes {
+                    let request = admit(&claim(&at(p, w, i), &secret(p), NOW + CLAIM_LIFE));
+                    assert_eq!(store.claim(&caller, &request, NOW), Answer::Ok);
+                    claims += 1;
+                }
+            }
+            for c in 0..=*contacts {
+                let mut lookup = [0u8; 16];
+                lookup[..4].copy_from_slice(&(p as u32).to_be_bytes());
+                lookup[4..8].copy_from_slice(&(c as u32).to_be_bytes());
+                let record = [
+                    &lookup[..],
+                    &(p as u64).to_be_bytes(),
+                    &(NOW + RECORD_AHEAD).to_be_bytes(),
+                    &[3; RECORD - 32],
+                ]
+                .concat();
+                assert_eq!(
+                    store.put_record(&caller, &admit(&record), NOW),
+                    RecordPut::Ok
+                );
+                records += 1;
+            }
+            for m in 0..MAIL_A_WEEK {
+                let put = [at(p, 0, m % boxes), vec![5; ENVELOPE]].concat();
+                assert_eq!(store.put(&caller, &admit(&put), NOW), Answer::Ok);
+                mail += 1;
+            }
+        }
+        let filled = started.elapsed();
+        let held = rss().saturating_sub(before);
+        drop(store);
+        let mut disk = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            disk.push((entry.file_name(), entry.metadata().unwrap().len()));
+        }
+        let started = Instant::now();
+        let mut store = Store::open(&dir, NOW, settings()).unwrap();
+        let start = started.elapsed();
+        let started = Instant::now();
+        store.sweep(NOW);
+        let sweep = started.elapsed();
+        eprintln!(
+            "measure 2: {} people, {claims} claims, {records} records, {mail} envelopes; filled in {filled:?}",
+            people.len()
+        );
+        eprintln!(
+            "measure 2: disk {disk:?}; memory held {} MB",
+            held / 1_000_000
+        );
+        eprintln!("measure 2: start {start:?}, sweep {sweep:?}");
+
+        // A caller asking for its mail over and over, timing its waits.
+        let store = Arc::new(Mutex::new(store));
+        let waiting = |store: Arc<Mutex<Store>>, stop: Arc<std::sync::atomic::AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut longest = Duration::ZERO;
+                let get = with(&at(0, 0, 0), &secret(0), &[]);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let asked = Instant::now();
+                    let mut s = store.lock().unwrap();
+                    longest = longest.max(asked.elapsed());
+                    s.get(&person(0), &get, NOW);
+                    drop(s);
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                longest
+            })
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = waiting(store.clone(), stop.clone());
+        // 256 puts from one caller, a lock each, as a batch is answered:
+        // between them the seed reads the next frame, so a short pause.
+        let sender = person(people.len() + 1);
+        let started = Instant::now();
+        let mut held_most = Duration::ZERO;
+        for m in 0..256 {
+            let put = [at(500, 1, m % 128), vec![6; ENVELOPE]].concat();
+            let mut s = store.lock().unwrap();
+            let locked = Instant::now();
+            assert_eq!(s.put(&sender, &admit(&put), NOW), Answer::Ok);
+            held_most = held_most.max(locked.elapsed());
+            drop(s);
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let batch = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let longest = other.join().unwrap();
+        eprintln!(
+            "measure 3: 256 synced puts {batch:?}; the lock held at most {held_most:?} a put; another call waited at most {longest:?}"
+        );
+
+        // A week on, the records lapse: their log is mostly dead, and the
+        // sweep compacts it (and the rest) under the lock.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = waiting(store.clone(), stop.clone());
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        store.lock().unwrap().sweep(NOW + RECORD_AHEAD + 1);
+        let compaction = started.elapsed();
+        std::thread::sleep(Duration::from_millis(20));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let longest = other.join().unwrap();
+        eprintln!(
+            "measure 4: a sweep that compacts {compaction:?}; another call waited at most {longest:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -2,7 +2,7 @@
 //! the mail services on, collected when they come back. The acceptance
 //! tests, by number.
 
-use mesh_identity::{DeviceCert, DeviceKey, MeshId, RootKey, mail_collect_tag};
+use mesh_identity::{DeviceCert, DeviceKey, Keystore, MeshId, RootKey, mail_collect_tag};
 use mesh_transport::{Config, MeshAddr, Node, Relays, frame};
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -991,6 +991,60 @@ fn a_holder_that_refuses_every_claim_gets_no_since() {
     // Bob's refusals are the point here, so his log isn't checked for them.
     logs.push(String::new());
     p.done(logs, &[]);
+}
+
+/// PLAN-mailbox Task 16, measurement 1: Bob with 1,000 contacts (Alice and
+/// 999 made here, with no network) unlocks against a seed holding his
+/// 6,144 claims and one envelope: the time from his helper coming online to
+/// the envelope shown, on loopback. Compare test 1's line, the same at one
+/// contact.
+#[test]
+#[ignore = "a measurement: cargo test --release -p mesh-node --test mailbox unlock_at_1000 -- --ignored --nocapture"]
+fn unlock_at_1000_contacts() {
+    let (p, mut alice, id_a, bob, id_b) = friends("mail-k", true);
+    let mut logs = vec![bob.quit()];
+    let path = p.dirs[2].join("identity.mks");
+    let mut store = Keystore::unlock(&path, "bob", PASSWORD).unwrap();
+    for i in 0..999 {
+        let id = RootKey::generate().unwrap().id();
+        store.add_contact(id, &format!("c{i}")).unwrap();
+    }
+    assert_eq!(store.contacts().len(), 1000);
+    drop(store);
+    // The first unlock claims all 6,144 slots (1,024 boxes, six weeks).
+    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0);
+    std::thread::sleep(Duration::from_secs(20));
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "one"], "meshDmMessages");
+    locks(&mut alice);
+    bob.send("idUnlock", &["bob", PASSWORD]);
+    let (mut online, mut shown) = (None, None);
+    let started = Instant::now();
+    while online.is_none() || shown.is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "\"one\" never came"
+        );
+        let (binding, payload) = bob.line();
+        let now = Instant::now();
+        match binding.as_str() {
+            "meshNet" if payload["state"] == "online" => {
+                online.get_or_insert(now);
+            }
+            "meshDmNotify" if payload["text"] == "one" => shown = Some(now),
+            _ => {}
+        }
+    }
+    // From the unlock: at 1,000 contacts "one" can show before the helper
+    // says it's online (its relay comes later than the seed's answer).
+    eprintln!(
+        "measure 1: \"one\" showed {:?} after Bob unlocked; online came {:?} after",
+        shown.unwrap() - started,
+        online.unwrap() - started
+    );
+    let _ = id_a;
+    logs.extend([alice.quit(), bob.quit()]);
+    p.done(logs, &["one"]);
 }
 
 /// `x` and `y` become friends.
