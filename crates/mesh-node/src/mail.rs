@@ -554,15 +554,17 @@ impl Helper {
                 let Ok(answers) = tokio::time::timeout(HOLDER_WAIT, claiming).await else {
                     return;
                 };
-                if answers.is_ok() {
-                    let _ = back.send(Back::MailClaimed(ticket, now, full));
+                if let Ok(answers) = &answers {
+                    let renewed = full && renewed_by(answers);
+                    let _ = back.send(Back::MailClaimed(ticket, now, renewed));
                 }
                 refused(answers);
             });
         }
     }
 
-    /// A holder answered our claims: renewed, if they were all of them; our
+    /// A holder answered our claims: renewed, if they were all of them and
+    /// none was slowed (`renewed_by`); our
     /// claims there are good from the first it answered (M12), and a new
     /// holder in our records means putting them again.
     pub(super) fn mail_claimed(&mut self, ticket: String, at: u64, full: bool) {
@@ -993,6 +995,14 @@ impl Helper {
     }
 }
 
+/// Whether a claim round counts as a renewal.
+/// Not if any claim was answered `slow-down`: those weren't taken, so the
+/// round goes again at the next refresh.
+fn renewed_by(answers: &[Vec<u8>]) -> bool {
+    let slow = [mailstore::Answer::SlowDown as u8];
+    !answers.iter().any(|a| *a == slow)
+}
+
 /// Counts in our log the claims a seed answered with anything but `ok`.
 fn refused<E>(answers: Result<Vec<Vec<u8>>, E>) {
     let Ok(answers) = answers else { return };
@@ -1066,6 +1076,18 @@ mod tests {
 
     /// Marks, `mseq`s and backoffs read back after a restart (M15), so a
     /// couldn't-open's wait (fix 1) holds across it.
+    /// A claim round answered `slow-down` anywhere isn't a renewal: it's
+    /// tried again at the next refresh (Task 12b). Other answers are.
+    #[test]
+    fn a_slowed_round_isnt_renewed() {
+        let ok = vec![mailstore::Answer::Ok as u8];
+        let slow = vec![mailstore::Answer::SlowDown as u8];
+        let full = vec![mailstore::Answer::Full as u8];
+        assert!(renewed_by(&[ok.clone(), ok.clone()]));
+        assert!(renewed_by(&[ok.clone(), full]));
+        assert!(!renewed_by(&[ok, slow]));
+    }
+
     /// A ticket's `&mail=` token goes length-first; none, or one too long
     /// to be a token, is the open seed's.
     #[test]

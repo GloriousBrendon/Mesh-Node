@@ -430,7 +430,7 @@ enum Back {
     /// time, it was the round's read and a seed answered.
     MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>, Option<u64>),
     /// A holder answered our claims: which, when they were sent, and
-    /// whether they were all of them.
+    /// whether that renews them (all of them, none slowed).
     MailClaimed(String, u64, bool),
     /// A seed answered the round's record puts (when they were sent).
     MailPut(u64),
