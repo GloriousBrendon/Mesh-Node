@@ -332,6 +332,11 @@ impl Store {
         }
         self.records.retain(|_, slots| !slots.is_empty());
         self.count_live();
+        // ponytail: compaction runs under the store's lock, so every mail
+        // call waits for it: 460 ms for a 338 MB store (PLAN-mailbox Task
+        // 16, measurement 4). Move it off the lock (write the new log from
+        // a snapshot, then swap under the lock) once a store passes about
+        // 1 GB or a call's wait matters more than half a second.
         if (self.claims_log.wants_compacting()
             || self.envelopes_log.wants_compacting()
             || self.records_log.wants_compacting())
