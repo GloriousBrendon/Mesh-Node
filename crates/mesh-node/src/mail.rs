@@ -87,6 +87,8 @@ pub(super) struct Mail {
     pub(super) newer: bool,
     /// Contacts whose records are being read.
     pub(super) reading: HashSet<MeshId>,
+    /// Those reads, which lock and quit wait for: what each found.
+    pub(super) reads: Vec<JoinHandle<mailrec::Found>>,
     /// When every record was last put, and read, with a seed answering.
     pub(super) put_at: u64,
     pub(super) read_at: u64,
@@ -284,9 +286,13 @@ impl Helper {
         let (Some(store), Some(net), Some(e2ee)) = (&self.store, &self.net, &self.e2ee) else {
             return;
         };
-        if store.id() == *id || self.cut.is_some() {
+        if self.cut.is_some() {
             return;
         }
+        // Our own other devices get by mail only what this device wrote
+        // (its messages and read markers): the rest comes from its authors
+        // (SPEC-mailbox, delivers 3).
+        let own = store.id() == *id;
         let (Some(keys), anon) = (store.pair_keys(id), net.anon.clone()) else {
             return;
         };
@@ -295,8 +301,17 @@ impl Helper {
         let connected: HashSet<[u8; 32]> = (net.node.connected(id).iter())
             .map(|a| *a.device.as_bytes())
             .collect();
-        let away: Vec<[u8; 32]> = (e2ee.device_keys(id).into_iter())
-            .filter(|d| !connected.contains(d))
+        // Our own list is in the keystore; e2ee lists only devices whose keys
+        // it has seen, so a new device of ours would never have its record read.
+        let devices: Vec<[u8; 32]> = if own {
+            (store.devices().devices().iter())
+                .map(|c| c.device().to_bytes())
+                .collect()
+        } else {
+            e2ee.device_keys(id)
+        };
+        let away: Vec<[u8; 32]> = (devices.into_iter())
+            .filter(|d| !connected.contains(d) && *d != me)
             .collect();
         // Each holder's puts, and what they are.
         let mut puts: HashMap<Vec<String>, Puts> = HashMap::new();
@@ -316,8 +331,10 @@ impl Helper {
                         .map(|((_, n), _)| *n),
                 )
                 .collect();
-            let Some((numbers, envelopes)) = self.dm_batch(id, device, |n| marked.contains(&n))
-            else {
+            let skip = |t: &mesh_dm::history::ToSend| {
+                marked.contains(&t.number) || (own && t.from.device != me)
+            };
+            let Some((numbers, envelopes)) = self.dm_batch(id, device, skip) else {
                 continue;
             };
             let Ok(reader) = VerifyingKey::from_bytes(&device) else {
@@ -372,10 +389,10 @@ impl Helper {
         }
     }
 
-    /// Mails what waits for every contact.
+    /// Mails what waits for every contact and our own other devices.
     pub(super) fn mail_out_all(&mut self) {
         let ids: Vec<MeshId> = (self.store.iter())
-            .flat_map(|s| s.contacts().iter().map(|c| c.id()))
+            .flat_map(|s| s.contacts().iter().map(|c| c.id()).chain([s.id()]))
             .collect();
         for id in ids {
             self.mail_out(&id);
@@ -408,13 +425,22 @@ impl Helper {
         }
     }
 
-    /// At lock and quit: mail what waits, then let the puts finish, up to
-    /// `MAIL_FLUSH`, and save the marks: a put not answered by then isn't
+    /// At lock and quit: let record reads under way finish, mail what
+    /// waits, then let the puts finish, all within `MAIL_FLUSH`, and save the marks: a put not answered by then isn't
     /// marked, so it's mailed again rather than lost (the reader shows it
     /// once).
     pub(super) async fn mail_flush(&mut self) {
-        self.mail_out_all();
         let deadline = tokio::time::Instant::now() + MAIL_FLUSH;
+        // A record read under way may name holders for what waits (a new
+        // device of ours, say): it's mailed now rather than next unlock.
+        // ponytail: its answer is handled again once we're locked, to no
+        // effect; a read still out at the deadline waits for next unlock.
+        for reading in std::mem::take(&mut self.mail.reads) {
+            if let Ok(Ok(found)) = tokio::time::timeout_at(deadline, reading).await {
+                self.mail_records(found);
+            }
+        }
+        self.mail_out_all();
         for (put, numbers) in std::mem::take(&mut self.mail.pending) {
             match tokio::time::timeout_at(deadline, put).await {
                 Ok(Ok((taken, untaken))) => self.retake(taken, untaken),

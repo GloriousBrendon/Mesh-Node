@@ -732,6 +732,71 @@ fn a_crash_between_the_saves_still_mails_again() {
     p.done(logs, &["three"]);
 }
 
+/// Test 2. Alice, Bob and Carol (Dave here) in a group. Bob and Carol lock.
+/// Alice sends "g1" and locks. Bob unlocks, Alice and Carol still off: he
+/// gets "g1". Bob locks; Carol unlocks: she gets "g1".
+#[test]
+fn test_2_a_group() {
+    let (t, mut alice, mut bob, mut carol) = three("mail2", true);
+    locks(&mut bob);
+    locks(&mut carol);
+    ask(&mut alice, "dmSend", &[&t.g, "g1"], "meshDmMessages");
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "g1");
+    locks(&mut bob);
+    unlocks(&mut carol, "dave");
+    until(&mut carol, "meshDmNotify", |n| n["text"] == "g1");
+    let logs = [alice.quit(), bob.quit(), carol.quit()];
+    assert_eq!(mailed(&logs[0]), 2, "once for each member");
+    assert!(logs.iter().all(|l| !l.contains("g1")), "no text in a log");
+    t.done(logs.to_vec());
+}
+
+/// Test 3. Alice's laptop has been unlocked once since it was linked, then
+/// locked. Her desk sends Bob "two" and locks. The laptop unlocks while the
+/// desk is still off: it shows "two" in the chat with Bob.
+#[test]
+fn test_3_your_own_second_device() {
+    let (p, mut desk, id_a, mut bob, id_b) = friends_with("mail3", true, false);
+    let laptop_dir = temp_dir("mail3-laptop");
+    let args = ["--seed", p.ticket.as_str(), "--record-ttl", TTL];
+    let mut laptop = Helper::start_with(&laptop_dir, &p.relay, &args);
+    assert_eq!(laptop.event().0, "meshIdentity");
+    let code = ask(&mut desk, "linkStart", &[], "meshLink")["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    laptop.send("linkJoin", &[&code, "laptop"]);
+    until(&mut desk, "meshLinkConfirm", |_| true);
+    desk.send("linkConfirm", &["true"]);
+    until(&mut laptop, "meshLinkReceived", |_| true);
+    laptop.send("linkFinish", &["alice", PASSWORD]);
+    until(&mut laptop, "meshIdentity", |i| i["state"] == "unlocked");
+    std::thread::sleep(SETTLE);
+    locks(&mut laptop);
+    // Bob writes to Alice while the laptop is away. The desk mustn't mail
+    // it on (own devices get by mail only what was written here); Bob
+    // hasn't read Alice's records since the link, so he can't yet.
+    ask(&mut bob, "dmSend", &[&id_a, "from bob"], "meshDmMessages");
+    page_until(&mut desk, &id_b, |p| {
+        texts(p).contains(&"from bob".to_owned())
+    });
+    // Bob is away too: the laptop can only have "two" by mail.
+    locks(&mut bob);
+    ask(&mut desk, "dmSend", &[&id_b, "two"], "meshDmMessages");
+    locks(&mut desk);
+    unlocks(&mut laptop, "alice");
+    let page = page_until(&mut laptop, &id_b, |p| texts(p).contains(&"two".to_owned()));
+    assert!(
+        !texts(&page).contains(&"from bob".to_owned()),
+        "the desk mailed on Bob's message"
+    );
+    let logs = vec![desk.quit(), laptop.quit(), bob.quit()];
+    let _ = std::fs::remove_dir_all(laptop_dir);
+    p.done(logs, &["two"]);
+}
+
 /// `x` and `y` become friends.
 fn befriend(x: &mut Helper, id_x: &str, y: &mut Helper, id_y: &str) {
     x.expect("friendAdd", &[id_y, ""], "meshSocial");

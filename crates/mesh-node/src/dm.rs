@@ -209,7 +209,7 @@ impl Helper {
         &mut self,
         id: &MeshId,
         device: [u8; 32],
-        skip: impl Fn(u64) -> bool,
+        skip: impl Fn(&mesh_dm::history::ToSend) -> bool,
     ) -> Option<(Vec<u64>, Vec<Vec<u8>>)> {
         let own = self.store.as_ref().is_some_and(|s| s.id() == *id);
         let (Some(history), Some(e2ee)) = (&mut self.dm, &mut self.e2ee) else {
@@ -223,7 +223,7 @@ impl Helper {
                 return None;
             }
         };
-        out.retain(|t| !skip(t.number));
+        out.retain(|t| !skip(t));
         out.truncate(e2ee::MAX_FRAMES);
         if out.is_empty() {
             return None;
@@ -538,6 +538,7 @@ impl Helper {
         }
         if let Some(me) = self.store.as_ref().map(Keystore::id) {
             self.dm_deliver(&me);
+            self.mail_out(&me);
         }
         Ok(())
     }

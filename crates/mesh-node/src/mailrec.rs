@@ -171,6 +171,9 @@ fn lost(since: u64, at: u64) -> bool {
     since + crate::mailstore::CLOCK_ROOM >= at
 }
 
+/// What a record read found: each contact's sealed records.
+pub(super) type Found = Vec<(MeshId, Vec<Vec<u8>>)>;
+
 impl Helper {
     fn remembered_path(&self) -> PathBuf {
         self.path
@@ -297,7 +300,9 @@ impl Helper {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
         };
+        // Our own other devices' records too, under the self pair.
         let ids: Vec<MeshId> = (store.contacts().iter().map(|c| c.id()))
+            .chain([store.id()])
             .filter(|id| only.is_none_or(|only| only == id))
             .filter(|id| !self.mail.reading.contains(id))
             .collect();
@@ -312,7 +317,8 @@ impl Helper {
         let (round, now) = (only.is_none(), unix_now());
         let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
         let week = week_of(unix_now());
-        tokio::spawn(async move {
+        self.mail.reads.retain(|h| !h.is_finished());
+        let reading = tokio::spawn(async move {
             let mut answered = false;
             let mut found: Vec<(MeshId, Vec<Vec<u8>>)> =
                 asked.iter().map(|(id, _)| (*id, Vec::new())).collect();
@@ -346,21 +352,24 @@ impl Helper {
                 }
             }
             let round = (round && answered).then_some(now);
-            let _ = back.send(Back::MailRecords(found, round));
+            let _ = back.send(Back::MailRecords(found.clone(), round));
+            found
         });
+        self.mail.reads.push(reading);
     }
 
     /// Records read: each one that opens and checks is the newest for its
     /// device if it's newer than what we hold; its keys go to e2ee. Mail
     /// put to a holder its record no longer lists, or before its `since`,
     /// goes again (M12); and what waited for a record goes.
-    pub(super) fn mail_records(&mut self, found: Vec<(MeshId, Vec<Vec<u8>>)>) {
+    pub(super) fn mail_records(&mut self, found: Found) {
         let now = unix_now();
         let mut changed = false;
         let mut to_mail = Vec::new();
         // Holders whose `since` moved in what we just read: only those can
         // have lost what we put (M12).
         let mut moved: HashSet<([u8; 32], String)> = HashSet::new();
+        let me = (self.store.as_ref()).map(|s| s.device_key().public().to_bytes());
         for (id, sealed) in found {
             self.mail.reading.remove(&id);
             let Some(keys) = self.store.as_ref().and_then(|s| s.pair_keys(&id)) else {
@@ -380,6 +389,12 @@ impl Helper {
                     );
                 }
                 let device = record.device.to_bytes();
+                // Our own record, read under the self pair: nothing to mail
+                // to, and remembering it would stop our other devices'
+                // records being read (`knows`).
+                if Some(device) == me {
+                    continue;
+                }
                 let before = (self.mail.remembered.known.get(&device))
                     .map(|k| k.holders.clone())
                     .unwrap_or_default();
