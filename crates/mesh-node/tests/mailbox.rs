@@ -436,9 +436,22 @@ fn again_with(
     days: u64,
     more: &[&str],
 ) -> Helper {
-    let offset = (days * DAY).to_string();
+    again_at(dir, relay, seeds, name, days * DAY, TTL, more)
+}
+
+/// `again_with`, the clock `offset` seconds on, with records of `ttl`.
+fn again_at(
+    dir: &std::path::Path,
+    relay: &Relay,
+    seeds: &[&str],
+    name: &str,
+    offset: u64,
+    ttl: &str,
+    more: &[&str],
+) -> Helper {
+    let offset = offset.to_string();
     let mut args: Vec<&str> = seeds.iter().flat_map(|s| ["--seed", s]).collect();
-    args.extend(["--record-ttl", TTL, "--clock-offset", &offset]);
+    args.extend(["--record-ttl", ttl, "--clock-offset", &offset]);
     args.extend(more);
     let mut h = Helper::start_with(dir, relay, &args);
     let (binding, first) = h.event();
@@ -795,6 +808,61 @@ fn test_3_your_own_second_device() {
     let logs = vec![desk.quit(), laptop.quit(), bob.quit()];
     let _ = std::fs::remove_dir_all(laptop_dir);
     p.done(logs, &["two"]);
+}
+
+/// Test 18. Bob stays unlocked over a week's edge (the clock a little
+/// before it), his live connection to Alice cut. Alice mails "edge" just
+/// before the edge; Bob's next refresh comes after it, and he gets "edge"
+/// from last week's box.
+#[test]
+fn test_18_a_refresh_over_a_weeks_edge() {
+    const WEEK: u64 = 7 * DAY;
+    // Bob refreshes every 50 s (a quarter of his records' life): his first
+    // after the unlock comes after the edge.
+    const BOB_TTL: &str = "200";
+    let (mut p, alice, _, bob, id_b) = friends("mail18", true);
+    let mut logs = vec![alice.quit(), bob.quit()];
+    let edge = (now() / WEEK + 1) * WEEK;
+    let offset = edge - 40 - now();
+    logs.push(p.stop_seed());
+    let seed_offset = offset.to_string();
+    let args = ["--mail", "--clock-offset", &seed_offset];
+    p.seed = Some(Seed::start_with(&p.dirs[0], &p.relay, &args));
+    let seeds = [p.ticket.as_str()];
+    let cut = ["--cut", "live"];
+    let mut bob = again_at(&p.dirs[2], &p.relay, &seeds, "bob", offset, BOB_TTL, &cut);
+    // His unlock's collect is done before Alice puts.
+    std::thread::sleep(SETTLE);
+    let mut alice = again_at(&p.dirs[1], &p.relay, &seeds, "alice", offset, TTL, &[]);
+    std::thread::sleep(SETTLE);
+    ask(&mut alice, "dmSend", &[&id_b, "edge"], "meshDmMessages");
+    assert!(now() + offset < edge, "sent before the edge");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "edge");
+    assert!(now() + offset >= edge, "collected after it");
+    logs.extend([alice.quit(), bob.quit()]);
+    p.done(logs, &["edge"]);
+}
+
+/// A device left unlocked over a wipe finds it at its next refresh, which
+/// collects before it renews: it claims again and moves `since` (M12).
+#[test]
+fn a_wipe_while_unlocked_moves_since() {
+    let (mut p, alice, _, mut bob, _) = friends("mail-wipe", true);
+    let mut logs = vec![alice.quit()];
+    std::thread::sleep(SETTLE);
+    logs.push(p.stop_seed());
+    std::fs::remove_dir_all(p.dirs[0].join("mail")).unwrap();
+    p.seed_at(0);
+    // Refreshes come every 2 s here.
+    std::thread::sleep(Duration::from_secs(8));
+    locks(&mut bob);
+    let bob_log = bob.quit();
+    assert!(
+        bob_log.contains("holders lost our claims; claiming again"),
+        "{bob_log}"
+    );
+    logs.push(bob_log);
+    p.done(logs, &[]);
 }
 
 /// `x` and `y` become friends.

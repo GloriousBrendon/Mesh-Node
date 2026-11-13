@@ -58,6 +58,9 @@ const ADDRESS: usize = mailstore::BOX + mailstore::SLOT;
 pub(super) const CLAIM_WEEKS_AHEAD: u64 = 5;
 /// Weeks collected before this one at unlock: the 30-day promise.
 pub(super) const COLLECT_WEEKS_BACK: u64 = 5;
+/// Weeks collected before this one at a refresh: mail put just before a
+/// week's edge (test 18).
+const REFRESH_WEEKS_BACK: u64 = 1;
 /// Claims, renewals and collects go in buckets of this many boxes a week,
 /// the rest dummies (M13).
 pub(super) const CLAIM_BUCKET: usize = 64;
@@ -610,10 +613,26 @@ impl Helper {
     /// and `COLLECT_WEEKS_BACK` before it, dummies too (M13), before any
     /// live sending. Claims follow, once it's back.
     pub(super) fn mail_collect(&mut self) {
+        self.mail_collect_weeks(COLLECT_WEEKS_BACK, true);
+    }
+
+    /// At each refresh: this week and last, the same way, live sending
+    /// going on; renewals follow it, so a wipe is seen before a renewal
+    /// could hide it (Behaviour, Receiving 2).
+    pub(super) fn mail_refresh(&mut self) {
+        // ponytail: skipped while the unlock's collect is out; two
+        // refreshes' collects can overlap if a holder takes longer than a
+        // refresh, which only takes the same mail twice.
+        if !self.mail.collecting {
+            self.mail_collect_weeks(REFRESH_WEEKS_BACK, false);
+        }
+    }
+
+    fn mail_collect_weeks(&mut self, back: u64, unlock: bool) {
         let Some(net) = &self.net else { return };
         let now = unix_now();
         let week = week_of(now);
-        let asked = Arc::new(self.our_slots(week.saturating_sub(COLLECT_WEEKS_BACK)..=week, None));
+        let asked = Arc::new(self.our_slots(week.saturating_sub(back)..=week, None));
         let gets: Arc<Vec<Vec<u8>>> = Arc::new(asked.iter().map(Ours::get).collect());
         // Our holders, and those we dropped while our claims there stand
         // (M12): a wipe is only seen at a holder we still claim at.
@@ -627,7 +646,7 @@ impl Helper {
         if asked.is_empty() || holders.is_empty() {
             return;
         }
-        self.mail.collecting = true;
+        self.mail.collecting = unlock;
         let (anon, back) = (net.anon.clone(), self.back.clone());
         tokio::spawn(async move {
             let mut each = tokio::task::JoinSet::new();
@@ -676,15 +695,17 @@ impl Helper {
                     }
                 }
             }
-            let _ = back.send(Back::MailFound(found, wiped));
+            let _ = back.send(Back::MailFound(found, wiped, unlock));
         });
     }
 
     /// Collected mail: opened in each sender's order, stored, deleted from
     /// the seed, and answered by receipt; receipts move our counters. Then
     /// live sending starts.
-    pub(super) fn mail_found(&mut self, found: Vec<Found>, wiped: Vec<String>) {
-        self.mail.collecting = false;
+    pub(super) fn mail_found(&mut self, found: Vec<Found>, wiped: Vec<String>, unlock: bool) {
+        if unlock {
+            self.mail.collecting = false;
+        }
         let wiped: Vec<String> = (wiped.into_iter())
             .filter(|t| self.mail.remembered.since.contains_key(t))
             .collect();
@@ -702,7 +723,7 @@ impl Helper {
             self.mail_claim(None);
         }
         self.mail_renew();
-        self.mail_records_round(true);
+        self.mail_records_round(unlock);
         // Receipts by the holders they go to; takes by where it was found.
         let mut receipts: HashMap<Vec<String>, Vec<Vec<u8>>> = HashMap::new();
         let mut takes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();

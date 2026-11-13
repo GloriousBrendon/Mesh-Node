@@ -242,8 +242,8 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
             }
             _ = refresh.tick() => {
                 helper.dm_retry_all();
-                helper.mail_renew();
-                helper.mail_records_round(false);
+                // Renewals and the daily records round follow the collect.
+                helper.mail_refresh();
                 helper.mail_out_all();
                 helper.publish();
                 helper.dial_contacts();
@@ -423,9 +423,9 @@ enum Back {
     Requested(MeshId),
     /// What the seeds hold for our codes.
     Collected(Vec<Collected>),
-    /// What the unlock's mail collect found (mailbox), and whether our
-    /// claims there were gone.
-    MailFound(Vec<mail::Found>, Vec<String>),
+    /// What a mail collect found (mailbox), the holders where our claims
+    /// were gone, and whether it was the unlock's (not a refresh's).
+    MailFound(Vec<mail::Found>, Vec<String>, bool),
     /// Mail records read: whose, and the sealed records found; with a
     /// time, it was the round's read and a seed answered.
     MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>, Option<u64>),
@@ -1058,7 +1058,9 @@ impl Helper {
                 }
                 return self.emit_social(None);
             }
-            Back::MailFound(found, wiped) => return self.mail_found(found, wiped),
+            Back::MailFound(found, wiped, unlock) => {
+                return self.mail_found(found, wiped, unlock);
+            }
             Back::MailRecords(found, round) => {
                 if let Some(at) = round {
                     self.mail.read_at = at;
