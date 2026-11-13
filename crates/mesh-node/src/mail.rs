@@ -586,7 +586,13 @@ impl Helper {
                 let Ok(answers) = tokio::time::timeout(HOLDER_WAIT, claiming).await else {
                     return;
                 };
-                if let Ok(answers) = &answers {
+                // Our claims stand there only if one was taken: a holder
+                // answering every claim closed or full gets no `since`, or
+                // it would look wiped at every collect.
+                let ok = [mailstore::Answer::Ok as u8];
+                if let Ok(answers) = &answers
+                    && answers.iter().any(|a| *a == ok)
+                {
                     let renewed = full && renewed_by(answers);
                     let _ = back.send(Back::MailClaimed(ticket, now, renewed));
                 }

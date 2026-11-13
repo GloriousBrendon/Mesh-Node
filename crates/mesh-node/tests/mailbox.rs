@@ -961,6 +961,38 @@ fn test_8_nothing_readable_on_the_holder() {
     }
 }
 
+/// A holder that answers every claim `closed` (a closed seed, no token)
+/// never gets a `since`: it isn't taken for wiped at each refresh, and the
+/// claims don't all go again every time.
+#[test]
+fn a_holder_that_refuses_every_claim_gets_no_since() {
+    let (p, alice, _, bob, _) = friends("mail-closed", true);
+    let mut logs = vec![alice.quit(), bob.quit()];
+    let closed_dir = temp_dir("mail-closed-shut");
+    let args = ["--mail", "--mail-token", "let-me-in-please-0"];
+    let mut closed = Seed::start_with(&closed_dir, &p.relay, &args);
+    // Its ticket without the token: every claim is refused.
+    let ticket = closed.ticket();
+    let ticket = ticket.split("&mail=").next().unwrap().to_owned();
+    let seeds = [p.ticket.as_str()];
+    let holder = ["--holder", ticket.as_str()];
+    let mut bob = again_at(&p.dirs[2], &p.relay, &seeds, "bob", 0, TTL, &holder);
+    // Refreshes every 2 s: several of them.
+    std::thread::sleep(Duration::from_secs(10));
+    locks(&mut bob);
+    let bob_log = bob.quit();
+    assert!(refused(&bob_log) > 0, "the claims were refused");
+    assert!(
+        !bob_log.contains("holders lost our claims"),
+        "taken for wiped: {bob_log}"
+    );
+    closed.stop();
+    let _ = std::fs::remove_dir_all(closed_dir);
+    // Bob's refusals are the point here, so his log isn't checked for them.
+    logs.push(String::new());
+    p.done(logs, &[]);
+}
+
 /// `x` and `y` become friends.
 fn befriend(x: &mut Helper, id_x: &str, y: &mut Helper, id_y: &str) {
     x.expect("friendAdd", &[id_y, ""], "meshSocial");
