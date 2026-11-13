@@ -844,25 +844,38 @@ fn test_18_a_refresh_over_a_weeks_edge() {
 }
 
 /// A device left unlocked over a wipe finds it at its next refresh, which
-/// collects before it renews: it claims again and moves `since` (M12).
+/// collects before it renews: it claims again and moves `since` (M12), and
+/// puts its record at once, not at the daily round. Alice, reading it at
+/// her next unlock, mails "w" again; Bob gets it.
 #[test]
 fn a_wipe_while_unlocked_moves_since() {
-    let (mut p, alice, _, mut bob, _) = friends("mail-wipe", true);
-    let mut logs = vec![alice.quit()];
+    // Bob refreshes every 50 s, so "w" waits on the seed until the wipe.
+    const BOB_TTL: &str = "200";
+    let (mut p, mut alice, _, bob, id_b) = friends("mail-wipe", true);
+    let mut logs = vec![bob.quit()];
+    let seeds = [p.ticket.as_str()];
+    let cut = ["--cut", "live"];
+    let mut bob = again_at(&p.dirs[2], &p.relay, &seeds, "bob", 0, BOB_TTL, &cut);
+    std::thread::sleep(SETTLE);
+    ask(&mut alice, "dmSend", &[&id_b, "w"], "meshDmMessages");
     std::thread::sleep(SETTLE);
     logs.push(p.stop_seed());
     std::fs::remove_dir_all(p.dirs[0].join("mail")).unwrap();
     p.seed_at(0);
-    // Refreshes come every 2 s here.
-    std::thread::sleep(Duration::from_secs(8));
-    locks(&mut bob);
+    // Bob's next refresh finds the wipe; his claims and record follow.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    locks(&mut alice);
+    unlocks(&mut alice, "alice");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "w");
+    let alice_log = alice.quit();
+    assert_eq!(mailed(&alice_log), 2, "mailed, and again after the wipe");
     let bob_log = bob.quit();
-    assert!(
-        bob_log.contains("holders lost our claims; claiming again"),
-        "{bob_log}"
-    );
-    logs.push(bob_log);
-    p.done(logs, &[]);
+    assert!(bob_log.contains("holders lost our claims; claiming again"));
+    logs.extend([alice_log, bob_log]);
+    p.done(logs, &["w"]);
 }
 
 /// Test 8. A 1:1 message and a group's go by mail; then the seed's mail

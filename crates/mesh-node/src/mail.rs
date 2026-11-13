@@ -95,6 +95,9 @@ pub(super) struct Mail {
     /// When every record was last put, and read, with a seed answering.
     pub(super) put_at: u64,
     pub(super) read_at: u64,
+    /// A wipe moved a holder's `since`: put our records at the next
+    /// answered claim.
+    since_moved: bool,
     /// Events a reader device answered `failed` by receipt: how many times,
     /// and not to be mailed again before when (M9).
     retry: HashMap<([u8; 32], u64), (u32, u64)>,
@@ -604,7 +607,7 @@ impl Helper {
         let new = !remembered.since.contains_key(&ticket);
         remembered.since.entry(ticket).or_insert(at);
         self.mail_save();
-        if new {
+        if new || std::mem::take(&mut self.mail.since_moved) {
             self.mail_records_put(None);
         }
     }
@@ -719,6 +722,9 @@ impl Helper {
             for ticket in wiped {
                 self.mail.remembered.since.insert(ticket, unix_now());
             }
+            // Our record goes out once the new claims are answered, not at
+            // the daily round: senders read the moved `since` from it.
+            self.mail.since_moved = true;
             self.mail_save();
             self.mail_claim(None);
         }
