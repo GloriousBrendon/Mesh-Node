@@ -432,8 +432,14 @@ impl Helper {
         for mark in again {
             self.mail.marked.remove(&mark);
         }
-        self.mail_save();
+        // Marks first: a crash before the records are saved leaves this
+        // record unread, so it moves `since` again after the restart (M15).
         self.mail_state_save();
+        if self.crash_at_records {
+            eprintln!("mesh-node: crashing between the saves (--crash-at)");
+            std::process::exit(3);
+        }
+        self.mail_save();
         to_mail.sort_unstable_by_key(|id| id.to_bytes());
         to_mail.dedup();
         for id in to_mail {

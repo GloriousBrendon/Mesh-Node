@@ -699,6 +699,39 @@ fn test_5_wiped_holder() {
     p.done(vec![alice_log, bob.quit()], &["three"]);
 }
 
+/// Test 5 with a crash where Alice reads Bob's moved `since`: after the
+/// marks are saved, before the remembered records (M15, Task 12b). After
+/// the restart she reads the record as new again and mails "three".
+#[test]
+fn a_crash_between_the_saves_still_mails_again() {
+    let (mut p, mut alice, _, mut bob, id_b) = friends_with("mail-crash", true, false);
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "three"], "meshDmMessages");
+    locks(&mut alice);
+    let mut logs = vec![alice.quit()];
+    p.stop_seed();
+    std::fs::remove_dir_all(p.dirs[0].join("mail")).unwrap();
+    p.seed_at(0);
+    unlocks(&mut bob, "bob");
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+    let seeds = [p.ticket.as_str(), p.plain_ticket.as_str()];
+    let crash = ["--crash-at", "records"];
+    let alice = again_with(&p.dirs[1], &p.relay, &seeds, "alice", 0, &crash);
+    let crashed = alice.crashed();
+    assert!(crashed.contains("crashing between the saves"), "{crashed}");
+    logs.push(crashed);
+    let mut alice = again_with(&p.dirs[1], &p.relay, &seeds, "alice", 0, &[]);
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "three");
+    logs.extend([alice.quit(), bob.quit()]);
+    let mailed: u64 = logs.iter().map(|l| mailed(l)).sum();
+    assert_eq!(mailed, 2, "mailed, and again after the restart");
+    p.done(logs, &["three"]);
+}
+
 /// `x` and `y` become friends.
 fn befriend(x: &mut Helper, id_x: &str, y: &mut Helper, id_y: &str) {
     x.expect("friendAdd", &[id_y, ""], "meshSocial");

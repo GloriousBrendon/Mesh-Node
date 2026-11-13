@@ -194,6 +194,16 @@ impl Helper {
         payload
     }
 
+    /// Waits for a helper that must exit on its own, failing (`--crash-at`).
+    /// Returns its stderr.
+    pub fn crashed(mut self) -> String {
+        assert!(!self.child.wait().unwrap().success(), "it crashed");
+        let mut err = String::new();
+        let stderr = self.child.stderr.take().unwrap();
+        BufReader::new(stderr).read_to_string(&mut err).unwrap();
+        err
+    }
+
     /// Closes stdin (Mesh quitting); the helper must exit. Returns its stderr.
     pub fn quit(mut self) -> String {
         drop(self.stdin);

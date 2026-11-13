@@ -185,6 +185,8 @@ pub struct Options {
     /// `--holder` or `MESH_HOLDERS`: the tickets of who keeps our mail
     /// (SPEC-mailbox), each with its `&mail=` token if it has one.
     pub holders: Vec<String>,
+    /// `--crash-at records` (tests only).
+    pub crash_at_records: bool,
 }
 
 /// Reads commands until stdin closes (Mesh quit or restarted us).
@@ -194,6 +196,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     helper.record_ttl = options.record_ttl;
     helper.holders = options.holders;
     helper.cut_live = options.cut.live;
+    helper.crash_at_records = options.crash_at_records;
     if options.cut.seed {
         helper.cut = Some(std::mem::take(&mut helper.seeds));
     }
@@ -304,6 +307,8 @@ struct Helper {
     cut: Option<Arc<Vec<MeshAddr>>>,
     /// `--cut live`: no live connections with contacts until `cutOff`.
     cut_live: bool,
+    /// `--crash-at records`: exit between a record read's two saves.
+    crash_at_records: bool,
     /// `--holder` tickets; none means our first seeds' (mail.rs
     /// `holder_tickets`).
     holders: Vec<String>,
@@ -460,6 +465,7 @@ impl Helper {
             record_ttl: routing::RECORD_TTL,
             cut: None,
             cut_live: false,
+            crash_at_records: false,
             holders: Vec::new(),
             publish_retry: PUBLISH_RETRY,
             presence: HashMap::new(),

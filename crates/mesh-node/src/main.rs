@@ -20,7 +20,8 @@
 //! only (SPEC-mailbox), as `--record-ttl` is.
 //! `--cut seed` and `--cut live` (either or both), on the helper and for
 //! tests only, start it cut off from its seeds, or from live connections
-//! with its contacts, until a `cutOff` command.
+//! with its contacts, until a `cutOff` command. `--crash-at records`, for
+//! tests only, exits between a record read's two saves (SPEC-mailbox M15).
 //!
 //! `--holder <ticket>` (repeatable, up to three) names the seeds that keep
 //! this device's mail (SPEC-mailbox, *Choosing your own holder*); without
@@ -193,6 +194,9 @@ fn main() {
             record_ttl,
             cut,
             holders,
+            crash_at_records: args
+                .windows(2)
+                .any(|w| w[0] == "--crash-at" && w[1] == "records"),
         };
         runtime.block_on(helper::run(&dir, relays, seeds, options));
     }
