@@ -678,6 +678,11 @@ impl Helper {
                 let Some(answers) = answers else {
                     continue;
                 };
+                let slow = [mailstore::Answer::SlowDown as u8];
+                let slowed = answers.iter().filter(|a| **a == slow).count();
+                if slowed > 0 {
+                    eprintln!("mesh-node: {slowed} mail collects answered slow-down");
+                }
                 // Every real box answering no-box: our claims there are gone.
                 let no_box = [mailstore::Answer::NoBox as u8];
                 let mut real = asked

@@ -89,6 +89,11 @@ impl Helper {
         }
     }
 
+    /// The helper's process ID (a measurement reads its CPU time).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The next line's binding and decoded payload.
     pub fn line(&mut self) -> (String, Value) {
         let line = match self.stdout.recv_timeout(LINE_TIMEOUT) {

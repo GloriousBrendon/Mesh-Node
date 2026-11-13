@@ -1001,49 +1001,86 @@ fn a_holder_that_refuses_every_claim_gets_no_since() {
 #[test]
 #[ignore = "a measurement: cargo test --release -p mesh-node --test mailbox unlock_at_1000 -- --ignored --nocapture"]
 fn unlock_at_1000_contacts() {
-    let (p, mut alice, id_a, bob, id_b) = friends("mail-k", true);
+    // MESH_CONTACTS runs it at another size (PLAN-mailbox Task 16 follow-up).
+    let contacts: usize = std::env::var("MESH_CONTACTS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1000);
+    let (mut p, mut alice, _, bob, id_b) = friends("mail-k", true);
     let mut logs = vec![bob.quit()];
     let path = p.dirs[2].join("identity.mks");
     let mut store = Keystore::unlock(&path, "bob", PASSWORD).unwrap();
-    for i in 0..999 {
+    for i in 1..contacts {
         let id = RootKey::generate().unwrap().id();
         store.add_contact(id, &format!("c{i}")).unwrap();
     }
-    assert_eq!(store.contacts().len(), 1000);
+    assert_eq!(store.contacts().len(), contacts);
     drop(store);
-    // The first unlock claims all 6,144 slots (1,024 boxes, six weeks).
-    let mut bob = again(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0);
+    // The seed reports every 5 s from here.
+    logs.push(p.seed_with(&["--report-every", "5"]));
+    // The first unlock claims every slot (six weeks of boxes). MESH_TTL sets
+    // Bob's records' life, so his refresh (a quarter of it): 8 s by default.
+    let ttl = std::env::var("MESH_TTL").unwrap_or_else(|_| TTL.to_owned());
+    let mut bob = again_at(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0, &ttl, &[]);
     std::thread::sleep(Duration::from_secs(20));
     locks(&mut bob);
     ask(&mut alice, "dmSend", &[&id_b, "one"], "meshDmMessages");
     locks(&mut alice);
-    bob.send("idUnlock", &["bob", PASSWORD]);
-    let (mut online, mut shown) = (None, None);
-    let started = Instant::now();
-    while online.is_none() || shown.is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "\"one\" never came"
-        );
-        let (binding, payload) = bob.line();
-        let now = Instant::now();
-        match binding.as_str() {
-            "meshNet" if payload["state"] == "online" => {
-                online.get_or_insert(now);
-            }
-            "meshDmNotify" if payload["text"] == "one" => shown = Some(now),
-            _ => {}
+    // Bob's CPU time while he unlocks: busy or idle.
+    let pid = bob.pid();
+    let ticks = move || -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let after = stat.rsplit(')').next().unwrap_or("");
+        let f: Vec<&str> = after.split_whitespace().collect();
+        f.get(11).and_then(|u| u.parse::<u64>().ok()).unwrap_or(0)
+            + f.get(12).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+    };
+    let sampler = std::thread::spawn(move || {
+        let mut last = ticks();
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_secs(5));
+            let now = ticks();
+            seen.push(now.saturating_sub(last));
+            last = now;
         }
+        seen
+    });
+    bob.send("idUnlock", &["bob", PASSWORD]);
+    let started = Instant::now();
+    let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (mut online, mut shown) = (None, None);
+        while online.is_none() || shown.is_none() {
+            let (binding, payload) = bob.line();
+            let now = Instant::now();
+            match binding.as_str() {
+                "meshNet" if payload["state"] == "online" => {
+                    online.get_or_insert(now);
+                }
+                "meshDmNotify" if payload["text"] == "one" => shown = Some(now),
+                _ => {}
+            }
+        }
+        (shown.unwrap() - started, online.unwrap() - started)
+    }));
+    let cpu = sampler.join().unwrap();
+    let seed_log = p.stop_seed();
+    let mail_lines: Vec<&str> = (seed_log.lines())
+        .filter(|l| l.contains("last hour mail") && !l.contains(" 0 collects"))
+        .collect();
+    let bob_log = bob.quit();
+    eprintln!("measure 1 at {contacts} contacts: Bob's CPU ticks (1/100 s) every 5 s {cpu:?}");
+    eprintln!("measure 1: seed {mail_lines:#?}");
+    eprintln!("measure 1: Bob's log {bob_log}");
+    match waited {
+        // From the unlock: "one" can show before the helper says it's
+        // online (its relay comes later than the seed's answer).
+        Ok((shown, online)) => eprintln!(
+            "measure 1: \"one\" showed {shown:?} after Bob unlocked; online came {online:?} after"
+        ),
+        Err(_) => panic!("\"one\" never showed at {contacts} contacts"),
     }
-    // From the unlock: at 1,000 contacts "one" can show before the helper
-    // says it's online (its relay comes later than the seed's answer).
-    eprintln!(
-        "measure 1: \"one\" showed {:?} after Bob unlocked; online came {:?} after",
-        shown.unwrap() - started,
-        online.unwrap() - started
-    );
-    let _ = id_a;
-    logs.extend([alice.quit(), bob.quit()]);
+    logs.extend([alice.quit(), bob_log, seed_log]);
     p.done(logs, &["one"]);
 }
 
