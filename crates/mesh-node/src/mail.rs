@@ -655,6 +655,9 @@ impl Helper {
     /// A full publish went up, so the seeds answer: a holder still owed the
     /// unlock's weeks (an unlock before the network was up) is collected at
     /// once, or as soon as a collect under way comes back.
+    // ponytail: this collects at every holder, so with one holder owed and
+    // another alive, the live one is collected twice a refresh; collect only
+    // at owed holders once there is a second seed.
     pub(super) fn mail_seeds_answer(&mut self) {
         if self.mail.owed.is_empty() {
             return;
