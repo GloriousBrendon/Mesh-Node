@@ -2,7 +2,7 @@
 //! the mail services on, collected when they come back. The acceptance
 //! tests, by number.
 
-use mesh_identity::{DeviceCert, DeviceKey, RootKey, mail_collect_tag};
+use mesh_identity::{DeviceCert, DeviceKey, MeshId, RootKey, mail_collect_tag};
 use mesh_transport::{Config, MeshAddr, Node, Relays, frame};
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -863,6 +863,89 @@ fn a_wipe_while_unlocked_moves_since() {
     );
     logs.push(bob_log);
     p.done(logs, &[]);
+}
+
+/// Test 8. A 1:1 message and a group's go by mail; then the seed's mail
+/// files and every helper's stderr hold no ID, device key, conversation ID
+/// or message text, as text or as bytes (M17, M19).
+#[test]
+fn test_8_nothing_readable_on_the_holder() {
+    const ONE: &str = "a private word for Bob";
+    const GROUP: &str = "a private word for the trip";
+    let (t, mut alice, mut bob, mut dave) = three("mail8", true);
+    let mut keys: Vec<String> = Vec::new();
+    for (h, name) in [
+        (&mut alice, "alice"),
+        (&mut bob, "bob"),
+        (&mut dave, "dave"),
+    ] {
+        locks(h);
+        h.send("idUnlock", &[name, PASSWORD]);
+        let me = until(h, "meshIdentity", |i| i["state"] == "unlocked");
+        let devices = me["devices"].as_array().unwrap();
+        keys.extend(
+            devices
+                .iter()
+                .map(|d| d["key"].as_str().unwrap().to_owned()),
+        );
+    }
+    locks(&mut bob);
+    locks(&mut dave);
+    ask(&mut alice, "dmSend", &[&t.ids[1], ONE], "meshDmMessages");
+    ask(&mut alice, "dmSend", &[&t.g, GROUP], "meshDmMessages");
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    page_until(&mut bob, &t.ids[0], |p| texts(p).contains(&ONE.to_owned()));
+    page_until(&mut bob, &t.g, |p| texts(p).contains(&GROUP.to_owned()));
+    locks(&mut bob);
+    unlocks(&mut dave, "dave");
+    page_until(&mut dave, &t.g, |p| texts(p).contains(&GROUP.to_owned()));
+    let stderr = [alice, bob, dave].map(Helper::quit).concat();
+    let log = t.seed.stop().join("\n");
+    let mut stored = Vec::new();
+    for entry in std::fs::read_dir(t.dirs[0].join("mail")).unwrap() {
+        stored.extend(std::fs::read(entry.unwrap().path()).unwrap());
+    }
+    assert!(!stored.is_empty(), "the seed held mail");
+    let unhex = |h: &str| -> Vec<u8> {
+        (0..h.len() / 2)
+            .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    };
+    // Hex of the right lengths, so the byte greps compare real bytes.
+    assert!(
+        t.g.len() == 32 && keys.iter().all(|k| k.len() == 64),
+        "{} {keys:?}",
+        t.g
+    );
+    let raw = |b: &[u8]| stored.windows(b.len()).any(|w| w == b);
+    let readable = |what: &str| log.contains(what) || stderr.contains(what);
+    for id in &t.ids {
+        let bytes = MeshId::parse(id).unwrap().to_bytes();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!readable(id) && !readable(&hex), "an ID in a log");
+        assert!(!raw(&bytes), "an ID in the seed's mail files");
+    }
+    for key in &keys {
+        assert!(!readable(key), "a device key in a log");
+        assert!(!raw(&unhex(key)), "a device key in the seed's mail files");
+    }
+    assert!(!readable(&t.g), "a conversation ID in a log");
+    assert!(
+        !raw(&unhex(&t.g)),
+        "a conversation ID in the seed's mail files"
+    );
+    for text in [ONE, GROUP] {
+        assert!(!readable(text), "message text in a log");
+        assert!(
+            !raw(text.as_bytes()),
+            "message text in the seed's mail files"
+        );
+    }
+    drop(t.relay.runtime);
+    for dir in t.dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// `x` and `y` become friends.
