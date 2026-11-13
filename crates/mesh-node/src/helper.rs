@@ -170,20 +170,31 @@ fn emit(binding: &str, payload: Value) {
 /// Commands read but not yet handled; the reader waits past this.
 const QUEUED_COMMANDS: usize = 16;
 
+/// `--cut` (test-only, SPEC-mailbox decided Q16): what starts cut off,
+/// until a `cutOff` command.
+#[derive(Default)]
+pub struct Cut {
+    pub seed: bool,
+    pub live: bool,
+}
+
+/// The helper's flags beyond its relays and seeds.
+pub struct Options {
+    pub record_ttl: u64,
+    pub cut: Cut,
+    /// `--holder` or `MESH_HOLDERS`: the tickets of who keeps our mail
+    /// (SPEC-mailbox), each with its `&mail=` token if it has one.
+    pub holders: Vec<String>,
+}
+
 /// Reads commands until stdin closes (Mesh quit or restarted us).
-/// `cut_seed` (`--cut seed`, test-only): start with the seeds cut off,
-/// until a `cutOff` command (SPEC-mailbox decided Q16).
-pub async fn run(
-    dir: &Path,
-    relays: Relays,
-    seeds: Vec<MeshAddr>,
-    record_ttl: u64,
-    cut_seed: bool,
-) {
+pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Options) {
     let (back, mut answers) = tokio::sync::mpsc::unbounded_channel();
     let mut helper = Helper::new(dir.join(KEYSTORE_FILE), relays, seeds, back);
-    helper.record_ttl = record_ttl;
-    if cut_seed {
+    helper.record_ttl = options.record_ttl;
+    helper.holders = options.holders;
+    helper.cut_live = options.cut.live;
+    if options.cut.seed {
         helper.cut = Some(std::mem::take(&mut helper.seeds));
     }
     helper.emit_identity();
@@ -203,7 +214,7 @@ pub async fn run(
     let mut rehold = tokio::time::interval(REHOLD_EVERY);
     rehold.tick().await;
     let mut refresh = tokio::time::interval(Duration::from_secs(
-        routing::REFRESH_EVERY.min(record_ttl / 4).max(1),
+        routing::REFRESH_EVERY.min(helper.record_ttl / 4).max(1),
     ));
     refresh.tick().await;
     let mut collect = tokio::time::interval(COLLECT_EVERY);
@@ -291,6 +302,11 @@ struct Helper {
     record_ttl: u64,
     /// `--cut seed`: the seeds, held back until `cutOff`.
     cut: Option<Arc<Vec<MeshAddr>>>,
+    /// `--cut live`: no live connections with contacts until `cutOff`.
+    cut_live: bool,
+    /// `--holder` tickets; none means our first seeds' (mail.rs
+    /// `holder_tickets`).
+    holders: Vec<String>,
     /// The wait before the next publish after a failed one.
     publish_retry: Duration,
     /// Each friend's devices and what each last said (D12).
@@ -404,16 +420,17 @@ enum Back {
     Collected(Vec<Collected>),
     /// What the unlock's mail collect found (mailbox), and whether our
     /// claims there were gone.
-    MailFound(Vec<mail::Found>, bool),
+    MailFound(Vec<mail::Found>, Vec<String>),
     /// Mail records read: whose, and the sealed records found; with a
     /// time, it was the round's read and a seed answered.
     MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>, Option<u64>),
-    /// The seed answered a full claim (when it was sent).
-    MailClaimed(u64),
+    /// A holder answered our claims: which, when they were sent, and
+    /// whether they were all of them.
+    MailClaimed(String, u64, bool),
     /// A seed answered the round's record puts (when they were sent).
     MailPut(u64),
-    /// Mail a seed didn't take: reader device, `mseq`, event number.
-    MailUnput(Vec<([u8; 32], u64, u64)>),
+    /// Puts answered: where each was taken, and what none took.
+    MailPutDone(mail::Taken),
     /// Another of our devices sent its account state.
     Synced(Box<(Account, MeshAddr)>),
     /// A device of someone's said what it shows, or went quiet.
@@ -442,6 +459,8 @@ impl Helper {
             allowed: Arc::default(),
             record_ttl: routing::RECORD_TTL,
             cut: None,
+            cut_live: false,
+            holders: Vec::new(),
             publish_retry: PUBLISH_RETRY,
             presence: HashMap::new(),
             idle: false,
@@ -496,6 +515,9 @@ impl Helper {
                 if let Some(seeds) = self.cut.take() {
                     self.seeds = seeds;
                 }
+                self.cut_live = false;
+                self.allow_contacts();
+                self.dial_contacts();
                 self.publish();
                 self.mail_renew();
                 self.mail_out_all();
@@ -870,6 +892,9 @@ impl Helper {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
         };
+        if self.cut_live {
+            return;
+        }
         let Some(target) = Target::of(store, id) else {
             return;
         };
@@ -1034,9 +1059,9 @@ impl Helper {
                 }
                 return self.mail_records(found);
             }
-            Back::MailClaimed(at) => return self.mail.renewed = at,
+            Back::MailClaimed(ticket, at, full) => return self.mail_claimed(ticket, at, full),
             Back::MailPut(at) => return self.mail.put_at = at,
-            Back::MailUnput(puts) => return self.mail_unput(puts),
+            Back::MailPutDone(taken) => return self.mail_put_done(taken),
             Back::Connected(id) => {
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
@@ -1655,6 +1680,8 @@ impl Helper {
             ))
             .chain((store.contacts().iter()).map(|c| (c.id().to_bytes(), revoked(c.devices()))))
         });
+        // `--cut live`: our own devices still connect; contacts don't.
+        let ids = ids.take(if self.cut_live { 1 } else { usize::MAX });
         *self
             .allowed
             .write()

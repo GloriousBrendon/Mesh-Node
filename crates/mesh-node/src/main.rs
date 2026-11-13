@@ -18,8 +18,14 @@
 //!
 //! `--clock-offset <secs>`, on either, moves the process's clock, for tests
 //! only (SPEC-mailbox), as `--record-ttl` is.
-//! `--cut seed`, on the helper and for tests only, starts it cut off from
-//! its seeds until a `cutOff` command.
+//! `--cut seed` and `--cut live` (either or both), on the helper and for
+//! tests only, start it cut off from its seeds, or from live connections
+//! with its contacts, until a `cutOff` command.
+//!
+//! `--holder <ticket>` (repeatable, up to three) names the seeds that keep
+//! this device's mail (SPEC-mailbox, *Choosing your own holder*); without
+//! it, `MESH_HOLDERS` (space-separated tickets); with neither, the first
+//! three seeds.
 
 mod addrs;
 mod codes;
@@ -148,16 +154,47 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        // ponytail: `--cut live` comes with PLAN-mailbox Task 14.
-        let cut_seed = match args.windows(2).find(|w| w[0] == "--cut") {
-            None => false,
-            Some(w) if w[1] == "seed" => true,
-            Some(_) => {
-                eprintln!("mesh-node: --cut takes seed");
-                std::process::exit(2);
+        let mut cut = helper::Cut::default();
+        for w in args.windows(2).filter(|w| w[0] == "--cut") {
+            match w[1].as_str() {
+                "seed" => cut.seed = true,
+                "live" => cut.live = true,
+                _ => {
+                    eprintln!("mesh-node: --cut takes seed or live");
+                    std::process::exit(2);
+                }
             }
+        }
+        let mut holders: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--holder")
+            .map(|w| w[1].as_str())
+            .collect();
+        let holders_env = std::env::var("MESH_HOLDERS").ok();
+        if holders.is_empty()
+            && let Some(tickets) = &holders_env
+        {
+            holders = tickets.split_whitespace().collect();
+        }
+        if let Some(Err(e)) = holders
+            .iter()
+            .map(|t| MeshAddr::from_ticket(t))
+            .find(Result::is_err)
+        {
+            eprintln!("mesh-node: bad --holder ticket: {e}");
+            std::process::exit(2);
+        }
+        let holders: Vec<String> = holders.into_iter().map(str::to_owned).collect();
+        if holders.len() > mesh_identity::MAX_HOLDERS {
+            eprintln!("mesh-node: at most {} holders", mesh_identity::MAX_HOLDERS);
+            std::process::exit(2);
+        }
+        let options = helper::Options {
+            record_ttl,
+            cut,
+            holders,
         };
-        runtime.block_on(helper::run(&dir, relays, seeds, record_ttl, cut_seed));
+        runtime.block_on(helper::run(&dir, relays, seeds, options));
     }
 }
 

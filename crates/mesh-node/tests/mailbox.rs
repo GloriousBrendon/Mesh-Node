@@ -486,14 +486,30 @@ impl Pair {
     fn stop_seed(&mut self) -> String {
         self.seed
             .take()
-            .map(|s| s.stop().concat())
+            .map(|s| s.stop().join("\n"))
             .unwrap_or_default()
+    }
+
+    /// The mail seed again with `args` beside `--mail`; its log so far.
+    fn seed_with(&mut self, args: &[&str]) -> String {
+        let log = self.stop_seed();
+        let args = [&["--mail"][..], args].concat();
+        let mut seed = Seed::start_with(&self.dirs[0], &self.relay, &args);
+        assert_eq!(seed.ticket(), self.ticket);
+        self.seed = Some(seed);
+        log
+    }
+
+    /// The mail seed again, full: the claims it holds stand, and nothing
+    /// new fits (test 4).
+    fn seed_full(&mut self) -> String {
+        self.seed_with(&["--mail-max", "1"])
     }
 
     fn stop_plain(&mut self) -> String {
         self.plain
             .take()
-            .map(|s| s.stop().concat())
+            .map(|s| s.stop().join("\n"))
             .unwrap_or_default()
     }
 
@@ -1078,6 +1094,168 @@ fn test_15_no_re_mail_on_unlock() {
     let restarted = alice.quit();
     assert_eq!(mailed(&restarted), 0, "nothing again after a restart");
     p.done(vec![first, restarted, bob.quit()], &["t1", "t20"]);
+}
+
+/// Test 4. Bob's holder is full: Alice's message waits on her devices
+/// (`full`), and reaches Bob when they're next online together.
+#[test]
+fn test_4_full_holder() {
+    let (mut p, mut alice, id_a, mut bob, id_b) = friends("mail4", true);
+    locks(&mut bob);
+    let mut logs = vec![p.seed_full()];
+    ask(&mut alice, "dmSend", &[&id_b, "full"], "meshDmMessages");
+    locks(&mut alice);
+    // Bob comes back while Alice is away: nothing was held for him.
+    unlocks(&mut bob, "bob");
+    std::thread::sleep(SETTLE);
+    let page = page_until(&mut bob, &id_a, |_| true);
+    assert!(!texts(&page).contains(&"full".to_owned()), "nothing held");
+    unlocks(&mut alice, "alice");
+    // Bob has the chat open, so it comes as a page, not a note.
+    page_until(&mut bob, &id_a, |p| texts(p).contains(&"full".to_owned()));
+    let alice_log = alice.quit();
+    assert!(alice_log.contains("mailed events weren't taken"), "full");
+    logs.extend([alice_log, bob.quit()]);
+    p.done(logs, &["full"]);
+}
+
+/// Bob lists two holders, the first full: Alice's mail goes to the
+/// second, and Bob collects it there (M10).
+#[test]
+fn the_next_holder_takes_what_the_first_wont() {
+    let (mut p, mut alice, _, bob, id_b) = friends_on("mail-next", true, true, true);
+    let mut logs = vec![bob.quit()];
+    let holders = ["--holder", &p.ticket, "--holder", &p.plain_ticket];
+    let mut bob = again_with(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0, &holders);
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+    // Alice reads Bob's record, which lists both.
+    locks(&mut alice);
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    logs.push(p.seed_full());
+    ask(&mut alice, "dmSend", &[&id_b, "second"], "meshDmMessages");
+    locks(&mut alice);
+    unlocks(&mut bob, "bob");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "second");
+    let alice_log = alice.quit();
+    assert_eq!(mailed(&alice_log), 1);
+    assert!(
+        !alice_log.contains("weren't taken"),
+        "the second holder took it"
+    );
+    logs.extend([alice_log, bob.quit()]);
+    p.done(logs, &["second"]);
+}
+
+/// A seed's reported counts: the sum of `what` ("claims", "collects") over
+/// its report lines.
+fn seed_count(log: &str, what: &str) -> u64 {
+    (log.lines())
+        .filter_map(|l| l.strip_prefix("mesh-node seed: last hour mail "))
+        .flat_map(|l| l.split([',', ';']))
+        .filter_map(|part| {
+            let mut words = part.split_whitespace();
+            let n = words.next()?.parse::<u64>().ok()?;
+            (words.next()? == what).then_some(n)
+        })
+        .sum()
+}
+
+/// Test 19. Bob lists seeds S1 and S2. Alice mails Bob "five" (to S1) and
+/// locks. Bob unlocks with only S2 listed, his live connection to Alice
+/// cut: he still collects "five" from S1, where his claims stand. Alice
+/// unlocks and reads Bob's record without S1. Bob shows "five" once, makes
+/// no new claims at S1, and stops collecting there once his claims run out.
+#[test]
+fn test_19_a_holder_dropped_from_a_record() {
+    let (mut p, alice, id_a, bob, id_b) = friends_on("mail19", true, true, true);
+    let mut logs = vec![bob.quit(), alice.quit()];
+    // Alice keeps her mail at S2 only, so S1's claims are Bob's alone.
+    let seeds = [p.plain_ticket.as_str(), p.ticket.as_str()];
+    let s2 = ["--holder", p.plain_ticket.as_str()];
+    let mut alice = again_with(&p.dirs[1], &p.relay, &seeds, "alice", 0, &s2);
+    let both = ["--holder", &p.ticket, "--holder", &p.plain_ticket];
+    let mut bob = again_with(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0, &both);
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+    logs.push(bob.quit());
+    locks(&mut alice);
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    ask(&mut alice, "dmSend", &[&id_b, "five"], "meshDmMessages");
+    locks(&mut alice);
+    // S1 reports every second from here.
+    logs.push(p.seed_with(&["--report-every", "1"]));
+    let s2 = ["--holder", &p.plain_ticket, "--cut", "live"];
+    let mut bob = again_with(&p.dirs[2], &p.relay, &[&p.ticket], "bob", 0, &s2);
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "five");
+    std::thread::sleep(SETTLE);
+    unlocks(&mut alice, "alice");
+    std::thread::sleep(SETTLE);
+    locks(&mut alice);
+    let page = page_until(&mut bob, &id_a, |_| true);
+    let fives = texts(&page).iter().filter(|t| *t == "five").count();
+    assert_eq!(fives, 1, "once");
+    locks(&mut bob);
+    logs.extend([alice.quit(), bob.quit()]);
+    let s1 = p.stop_seed();
+    assert_eq!(seed_count(&s1, "claims"), 0, "no new claims at S1");
+    assert!(seed_count(&s1, "collects") > 0, "collected there");
+    logs.push(s1);
+    // A day past his claims there: S1 isn't asked any more.
+    let day = 36;
+    let offset = (day * DAY).to_string();
+    let args = ["--mail", "--report-every", "1", "--clock-offset", &offset];
+    p.seed = Some(Seed::start_with(&p.dirs[0], &p.relay, &args));
+    // S2 on the same day, or it refuses Bob's claims as too far ahead.
+    logs.push(p.stop_plain());
+    let plain_args = ["--mail", "--clock-offset", &offset];
+    p.plain = Some(Seed::start_with(&p.dirs[3], &p.relay, &plain_args));
+    let mut s2 = vec!["--holder", p.plain_ticket.as_str()];
+    s2.extend(["--cut", "live"]);
+    let mut bob = again_with(&p.dirs[2], &p.relay, &[&p.ticket], "bob", day, &s2);
+    std::thread::sleep(SETTLE);
+    locks(&mut bob);
+    logs.push(bob.quit());
+    let s1 = p.stop_seed();
+    assert_eq!(seed_count(&s1, "collects"), 0, "not collected there");
+    logs.push(s1);
+    p.done(logs, &["five"]);
+}
+
+/// Test 20. Alice and Bob have met. (a) The seed is down; (b) it's up
+/// without the mail services. Alice is unlocked; Bob comes back, and
+/// Alice's message, sent as his helper comes online, shows on him within
+/// 2 s of that.
+#[test]
+fn test_20_an_unreachable_holder_holds_nothing_up() {
+    for plain in [false, true] {
+        let name = if plain { "mail20b" } else { "mail20a" };
+        let (mut p, mut alice, _, bob, id_b) = friends(name, true);
+        let mut logs = vec![bob.quit()];
+        logs.push(p.stop_seed());
+        if plain {
+            let mut seed = Seed::start(&p.dirs[0], &p.relay);
+            assert_eq!(seed.ticket(), p.ticket);
+            p.seed = Some(seed);
+        }
+        let args = ["--seed", p.ticket.as_str(), "--record-ttl", TTL];
+        let mut bob = Helper::start_with(&p.dirs[2], &p.relay, &args);
+        let (binding, first) = bob.event();
+        assert_eq!(binding, "meshIdentity");
+        if first["state"] != "unlocked" {
+            unlocks(&mut bob, "bob");
+        }
+        bob.net_state("online");
+        let online = Instant::now();
+        ask(&mut alice, "dmSend", &[&id_b, "quick"], "meshDmMessages");
+        until(&mut bob, "meshDmNotify", |n| n["text"] == "quick");
+        let took = online.elapsed();
+        assert!(took < Duration::from_secs(2), "{name}: {took:?}");
+        logs.extend([alice.quit(), bob.quit()]);
+        p.done(logs, &["quick"]);
+    }
 }
 
 /// Test 16. A group of Alice, Bob and Dave, made by Alice. Bob locks. Over

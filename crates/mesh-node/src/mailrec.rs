@@ -29,9 +29,6 @@ pub(super) const MAIL_RECORD_READ: u64 = 86_400;
 const REMEMBERED: &str = "remembered";
 const REMEMBERED_FORMAT: u8 = 1;
 const REMEMBERED_CONTEXT: &str = "mesh/v1/mail-remembered";
-/// The token a record put to an open seed carries: none.
-// ponytail: closed seeds' tokens from their tickets come with Task 12.
-const OPEN: [u8; 1] = [0];
 
 /// What the newest record read from one contact device said.
 #[derive(Serialize, Deserialize, Clone)]
@@ -50,13 +47,40 @@ pub(super) struct Remembered {
     pub known: HashMap<[u8; 32], Known>,
     /// Since when our claims at each of our holders are good, by ticket.
     pub since: HashMap<String, u64>,
+    /// When each of our holders last answered a renewal of all our claims,
+    /// in this process: a restart renews at its first unlock.
+    #[serde(skip)]
+    pub renewed: HashMap<String, u64>,
+    /// Holders we've dropped, and when our claims there end: we collect
+    /// there until then, and claim nothing (M12).
+    pub dropped: HashMap<String, u64>,
 }
 
 impl Remembered {
-    /// The first holder `device`'s newest record names.
-    pub fn holder(&self, device: &[u8; 32]) -> Option<&str> {
-        let known = self.known.get(device)?;
-        known.holders.first().map(|(ticket, _)| ticket.as_str())
+    /// The holders `device`'s newest record names, in the order to try.
+    pub fn holders(&self, device: &[u8; 32]) -> Vec<String> {
+        let known = self.known.get(device);
+        known.map_or(Vec::new(), |k| {
+            k.holders.iter().map(|(ticket, _)| ticket.clone()).collect()
+        })
+    }
+
+    /// Holders we no longer list move to `dropped` until our claims there
+    /// end; dropped ones whose claims have ended are forgotten.
+    fn drop_unlisted(&mut self, holders: &[String], now: u64) {
+        let unlisted: Vec<String> = (self.since.keys())
+            .filter(|t| !holders.contains(t))
+            .cloned()
+            .collect();
+        for ticket in unlisted {
+            self.since.remove(&ticket);
+            // Not renewed in this process: now bounds the last renewal.
+            let renewed = self.renewed.remove(&ticket).unwrap_or(now);
+            self.dropped
+                .insert(ticket, renewed + crate::mailstore::CLAIM_LIFE);
+        }
+        self.dropped
+            .retain(|t, until| *until > now && !holders.contains(t));
     }
 
     /// Takes `known` as `device`'s newest record if it's newer than what's
@@ -160,7 +184,14 @@ impl Helper {
     pub(super) fn mail_load(&mut self) {
         let Some(store) = &self.store else { return };
         let path = self.remembered_path();
-        (self.mail.remembered, self.mail.newer) = load(&path, store.data_key(), unix_now());
+        let now = unix_now();
+        (self.mail.remembered, self.mail.newer) = load(&path, store.data_key(), now);
+        let holders = self.holder_tickets();
+        // ponytail: with `--cut seed` there are no holders, so nothing is
+        // dropped; a cut device holds the list it had.
+        if !holders.is_empty() {
+            self.mail.remembered.drop_unlisted(&holders, now);
+        }
         self.mail_state_load();
     }
 
@@ -181,12 +212,10 @@ impl Helper {
         }
     }
 
-    /// Our holders, as our records list them.
-    // ponytail: the first `--seed` only, as mail goes there; Task 12 lists up
-    // to `MAX_HOLDERS` and the `--holder` flag.
+    /// Our holders, as our records list them: those that have answered a
+    /// claim.
     fn our_holders(&self) -> Vec<Holder> {
-        let first = self.seeds.first().and_then(ticket_of);
-        (first.into_iter().take(MAX_HOLDERS))
+        (self.holder_tickets().into_iter().take(MAX_HOLDERS))
             .filter_map(|ticket| {
                 let since = *self.mail.remembered.since.get(&ticket)?;
                 Some(Holder { ticket, since })
@@ -228,13 +257,27 @@ impl Helper {
                     .inspect_err(|e| eprintln!("mesh-node: couldn't make a mail record: {e}"))
                     .ok()
             })
-            .map(|record| [&OPEN[..], &record].concat())
             .collect();
-        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        // On every seed, where senders read them, and every holder, with
+        // its token if it has one (M14); a seed that's a holder once.
+        let mut to: Vec<(MeshAddr, Vec<u8>)> = Vec::new();
+        for ticket in self.holder_tickets() {
+            if let Ok(addr) = MeshAddr::from_ticket(&ticket) {
+                to.push((addr, mail::token_of(&ticket)));
+            }
+        }
+        for seed in self.seeds.iter() {
+            if !to.iter().any(|(a, _)| a.device == seed.device) {
+                to.push((seed.clone(), mail::OPEN.to_vec()));
+            }
+        }
+        let (anon, back) = (net.anon.clone(), self.back.clone());
         let only_round = only.is_none();
         tokio::spawn(async move {
             let mut answered = false;
-            for seed in seeds.iter() {
+            for (seed, token) in &to {
+                let records: Vec<Vec<u8>> =
+                    records.iter().map(|r| [&token[..], r].concat()).collect();
                 let putting = seed::ask_many(&anon, seed, seed::MREC_PUT, &records);
                 answered |= matches!(
                     tokio::time::timeout(mail::HOLDER_WAIT, putting).await,
@@ -441,6 +484,28 @@ mod tests {
         dir.join("mail").join(REMEMBERED)
     }
 
+    /// A holder no longer listed is collected from until our claims there
+    /// end, then forgotten; one listed again isn't dropped.
+    #[test]
+    fn a_dropped_holder_lasts_as_long_as_its_claims() {
+        let (s1, s2) = ("mesh://node/s1".to_owned(), "mesh://node/s2".to_owned());
+        let mut r = Remembered::default();
+        r.since.insert(s1.clone(), NOW);
+        r.since.insert(s2.clone(), NOW);
+        r.renewed.insert(s1.clone(), NOW - 10);
+        r.drop_unlisted(std::slice::from_ref(&s2), NOW);
+        assert_eq!(r.dropped[&s1], NOW - 10 + crate::mailstore::CLAIM_LIFE);
+        assert!(r.since.contains_key(&s2) && !r.since.contains_key(&s1));
+        r.drop_unlisted(
+            std::slice::from_ref(&s2),
+            NOW - 10 + crate::mailstore::CLAIM_LIFE,
+        );
+        assert!(r.dropped.is_empty(), "its claims have ended");
+        r.dropped.insert(s1.clone(), NOW + 1);
+        r.drop_unlisted(&[s1, s2], NOW);
+        assert!(r.dropped.is_empty(), "listed again");
+    }
+
     /// What's read and remembered survives a restart, and only a newer
     /// record replaces it; a read that finds nothing changes nothing.
     #[test]
@@ -454,14 +519,14 @@ mod tests {
         let (back, newer) = load(&path, &KEY, NOW + MAIL_RECORD_LIFE + 1);
         assert!(!newer);
         assert_eq!(
-            back.holder(&[2; 32]),
+            back.holders(&[2; 32]).first().map(String::as_str),
             Some("mesh://node/seed"),
             "kept after it lapsed"
         );
         assert_eq!(back.since.get("mesh://node/seed"), Some(&NOW));
         let gone = NOW + MAIL_RECORD_LIFE + REMEMBER_LIFE;
         assert!(
-            load(&path, &KEY, gone).0.holder(&[2; 32]).is_none(),
+            load(&path, &KEY, gone).0.holders(&[2; 32]).is_empty(),
             "forgotten a month on"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());

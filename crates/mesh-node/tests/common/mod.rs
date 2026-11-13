@@ -144,6 +144,7 @@ impl Helper {
                     self.social = Some(payload)
                 }
                 (binding, payload) if binding == "meshNote" => self.notes.push(payload),
+                (binding, _) if binding == "meshCodes" => {}
                 (binding, payload) => panic!("unexpected {binding} {payload}"),
             }
         }
@@ -303,7 +304,8 @@ impl Seed {
             assert_ne!(unsafe { GenerateConsoleCtrlEvent(1, self.child.id()) }, 0);
         }
         assert!(self.child.wait().unwrap().success(), "exits cleanly");
-        self.log.extend(self.lines.try_iter());
+        // The seed has exited, so its stderr ends: every line, none lost.
+        self.log.extend(self.lines.iter());
         std::mem::take(&mut self.log)
     }
 }
