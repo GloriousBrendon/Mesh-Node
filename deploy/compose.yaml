@@ -5,6 +5,11 @@
 #   cp .env.example .env   # then set MESH_RELAY_URL and PROXY_NETWORK
 #   docker compose up -d --build
 #   docker compose logs seed | grep ticket   # the seed's ticket
+#
+# To update, unpack the new source (`git archive <commit>`) into a fresh
+# folder and carry over deploy/.env and any local compose changes; don't
+# unpack over the old tree, which keeps files the new one deleted. The
+# project name (`name: mesh`) keeps the same seed-data volume and ticket.
 name: mesh
 
 x-hardened: &hardened
