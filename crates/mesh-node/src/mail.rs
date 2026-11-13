@@ -95,6 +95,12 @@ pub(super) struct Mail {
     /// When every record was last put, and read, with a seed answering.
     pub(super) put_at: u64,
     pub(super) read_at: u64,
+    /// Holders not yet answered the unlock's six weeks (unreachable, or
+    /// slowed): each collect there asks for all of them.
+    owed: HashSet<String>,
+    /// The seeds answered while the unlock's collect was out: collect again
+    /// when it's back, if a holder is still owed.
+    collect_again: bool,
     /// A wipe moved a holder's `since`: put our records at the next
     /// answered claim.
     since_moved: bool,
@@ -622,7 +628,16 @@ impl Helper {
     /// and `COLLECT_WEEKS_BACK` before it, dummies too (M13), before any
     /// live sending. Claims follow, once it's back.
     pub(super) fn mail_collect(&mut self) {
-        self.mail_collect_weeks(COLLECT_WEEKS_BACK, true);
+        // Every holder is owed the unlock's six weeks until it answers them.
+        let now = unix_now();
+        let mut owed = self.holder_tickets();
+        owed.extend(
+            (self.mail.remembered.dropped.iter())
+                .filter(|(_, until)| **until > now)
+                .map(|(t, _)| t.clone()),
+        );
+        self.mail.owed = owed.into_iter().collect();
+        self.mail_collect_holders(true);
     }
 
     /// At each refresh: this week and last, the same way, live sending
@@ -633,16 +648,36 @@ impl Helper {
         // refreshes' collects can overlap if a holder takes longer than a
         // refresh, which only takes the same mail twice.
         if !self.mail.collecting {
-            self.mail_collect_weeks(REFRESH_WEEKS_BACK, false);
+            self.mail_collect_holders(false);
         }
     }
 
-    fn mail_collect_weeks(&mut self, back: u64, unlock: bool) {
+    /// A full publish went up, so the seeds answer: a holder still owed the
+    /// unlock's weeks (an unlock before the network was up) is collected at
+    /// once, or as soon as a collect under way comes back.
+    pub(super) fn mail_seeds_answer(&mut self) {
+        if self.mail.owed.is_empty() {
+            return;
+        }
+        if self.mail.collecting {
+            self.mail.collect_again = true;
+        } else {
+            self.mail_collect_holders(false);
+        }
+    }
+
+    /// A collect at each holder: all six weeks at one still owed them (the
+    /// unlock's, unanswered or slowed), else this week and last.
+    fn mail_collect_holders(&mut self, unlock: bool) {
         let Some(net) = &self.net else { return };
         let now = unix_now();
         let week = week_of(now);
-        let asked = Arc::new(self.our_slots(week.saturating_sub(back)..=week, None));
-        let gets: Arc<Vec<Vec<u8>>> = Arc::new(asked.iter().map(Ours::get).collect());
+        let slots = |back: u64| {
+            let asked = Arc::new(self.our_slots(week.saturating_sub(back)..=week, None));
+            let gets: Arc<Vec<Vec<u8>>> = Arc::new(asked.iter().map(Ours::get).collect());
+            (asked, gets)
+        };
+        let (full, short) = (slots(COLLECT_WEEKS_BACK), slots(REFRESH_WEEKS_BACK));
         // Our holders, and those we dropped while our claims there stand
         // (M12): a wipe is only seen at a holder we still claim at.
         let current = self.holder_tickets();
@@ -652,15 +687,18 @@ impl Helper {
                 holders.push((ticket.clone(), false));
             }
         }
-        if asked.is_empty() || holders.is_empty() {
+        if full.0.is_empty() || holders.is_empty() {
             return;
         }
         self.mail.collecting = unlock;
         let (anon, back) = (net.anon.clone(), self.back.clone());
+        let owed = self.mail.owed.clone();
         tokio::spawn(async move {
             let mut each = tokio::task::JoinSet::new();
             for (ticket, claimed) in holders {
-                let (anon, gets) = (anon.clone(), gets.clone());
+                let in_full = owed.contains(&ticket);
+                let (asked, gets) = if in_full { full.clone() } else { short.clone() };
+                let anon = anon.clone();
                 each.spawn(async move {
                     let answers = match MeshAddr::from_ticket(&ticket) {
                         Ok(holder) => {
@@ -670,11 +708,15 @@ impl Helper {
                         }
                         Err(_) => None,
                     };
-                    (ticket, claimed, answers)
+                    (ticket, claimed, in_full, asked, answers)
                 });
             }
-            let (mut found, mut wiped) = (Vec::new(), Vec::new());
-            while let Some(Ok((ticket, claimed, answers))) = each.join_next().await {
+            let (mut found, mut wiped, mut paid) = (Vec::new(), Vec::new(), Vec::new());
+            while let Some(Ok((ticket, claimed, in_full, asked, answers))) = each.join_next().await
+            {
+                if !still_owed(in_full, answers.as_deref()) {
+                    paid.push(ticket.clone());
+                }
                 let Some(answers) = answers else {
                     continue;
                 };
@@ -709,16 +751,28 @@ impl Helper {
                     }
                 }
             }
-            let _ = back.send(Back::MailFound(found, wiped, unlock));
+            let _ = back.send(Back::MailFound(found, wiped, unlock, paid));
         });
     }
 
     /// Collected mail: opened in each sender's order, stored, deleted from
     /// the seed, and answered by receipt; receipts move our counters. Then
     /// live sending starts.
-    pub(super) fn mail_found(&mut self, found: Vec<Found>, wiped: Vec<String>, unlock: bool) {
+    pub(super) fn mail_found(
+        &mut self,
+        found: Vec<Found>,
+        wiped: Vec<String>,
+        unlock: bool,
+        paid: Vec<String>,
+    ) {
         if unlock {
             self.mail.collecting = false;
+        }
+        for ticket in paid {
+            self.mail.owed.remove(&ticket);
+        }
+        if std::mem::take(&mut self.mail.collect_again) && !self.mail.owed.is_empty() {
+            self.mail_collect_holders(false);
         }
         let wiped: Vec<String> = (wiped.into_iter())
             .filter(|t| self.mail.remembered.since.contains_key(t))
@@ -1059,6 +1113,14 @@ impl Helper {
     }
 }
 
+/// Whether a holder is still owed the unlock's six weeks after a collect
+/// there: yes unless it was asked for all of them and answered, with no
+/// slow-down (a slowed get took nothing).
+fn still_owed(in_full: bool, answers: Option<&[Vec<u8>]>) -> bool {
+    let slow = [mailstore::Answer::SlowDown as u8];
+    !(in_full && answers.is_some_and(|a| !a.iter().any(|x| *x == slow)))
+}
+
 /// Whether a claim round counts as a renewal.
 /// Not if any claim was answered `slow-down`: those weren't taken, so the
 /// round goes again at the next refresh.
@@ -1140,6 +1202,24 @@ mod tests {
 
     /// Marks, `mseq`s and backoffs read back after a restart (M15), so a
     /// couldn't-open's wait (fix 1) holds across it.
+    /// A holder stays owed the unlock's six weeks until it answers a collect
+    /// of all six with no slow-down; a refresh's two weeks don't pay it.
+    #[test]
+    fn a_holder_is_owed_six_weeks_until_it_answers_them() {
+        let ok = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let slow = vec![mailstore::Answer::SlowDown as u8];
+        assert!(still_owed(true, None), "no answer");
+        assert!(still_owed(true, Some(&[ok.clone(), slow])), "slowed");
+        assert!(
+            still_owed(false, Some(std::slice::from_ref(&ok))),
+            "two weeks only"
+        );
+        assert!(
+            !still_owed(true, Some(&[ok.clone(), ok])),
+            "answered in full"
+        );
+    }
+
     /// A claim round answered `slow-down` anywhere isn't a renewal: it's
     /// tried again at the next refresh (Task 12b). Other answers are.
     #[test]

@@ -1084,6 +1084,40 @@ fn unlock_at_1000_contacts() {
     p.done(logs, &["one"]);
 }
 
+/// An unlock while the seed can't be reached: the collect gets no answer.
+/// Alice's mail is three weeks old, so a refresh's two weeks wouldn't find
+/// it; Bob's refresh is 10 minutes off anyway. When the seed is back, his
+/// next full publish starts a collect, which asks that holder for all six
+/// weeks, and Bob gets "old" without unlocking again.
+#[test]
+fn an_unanswered_unlock_collect_goes_again_in_full() {
+    // Records of 40 minutes: a refresh every 10.
+    const BOB_TTL: &str = "2400";
+    let (mut p, mut alice, _, mut bob, id_b) = friends("mail-owed", true);
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "old"], "meshDmMessages");
+    locks(&mut alice);
+    let mut logs = vec![alice.quit(), bob.quit()];
+    logs.push(p.stop_seed());
+    let seeds = [p.ticket.as_str()];
+    let mut bob = again_at(&p.dirs[2], &p.relay, &seeds, "bob", 21 * DAY, BOB_TTL, &[]);
+    std::thread::sleep(Duration::from_secs(5));
+    p.seed_at(21);
+    let started = Instant::now();
+    loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(150),
+            "\"old\" never came"
+        );
+        let (binding, payload) = bob.event();
+        if binding == "meshDmNotify" && payload["text"] == "old" {
+            break;
+        }
+    }
+    logs.push(bob.quit());
+    p.done(logs, &["old"]);
+}
+
 /// `x` and `y` become friends.
 fn befriend(x: &mut Helper, id_x: &str, y: &mut Helper, id_y: &str) {
     x.expect("friendAdd", &[id_y, ""], "meshSocial");

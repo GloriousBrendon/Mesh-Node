@@ -424,8 +424,9 @@ enum Back {
     /// What the seeds hold for our codes.
     Collected(Vec<Collected>),
     /// What a mail collect found (mailbox), the holders where our claims
-    /// were gone, and whether it was the unlock's (not a refresh's).
-    MailFound(Vec<mail::Found>, Vec<String>, bool),
+    /// were gone, whether it was the unlock's (not a refresh's), and the
+    /// holders that answered all six weeks.
+    MailFound(Vec<mail::Found>, Vec<String>, bool, Vec<String>),
     /// Mail records read: whose, and the sealed records found; with a
     /// time, it was the round's read and a seed answered.
     MailRecords(Vec<(MeshId, Vec<Vec<u8>>)>, Option<u64>),
@@ -1023,6 +1024,9 @@ impl Helper {
                 if ok {
                     if all {
                         self.publish_retry = PUBLISH_RETRY;
+                        // The seeds answer: a holder still owed the unlock's
+                        // weeks is collected now, not at the refresh.
+                        self.mail_seeds_answer();
                     }
                 } else if self.net.is_some() {
                     let (wait, back) = (self.publish_retry, self.back.clone());
@@ -1058,8 +1062,8 @@ impl Helper {
                 }
                 return self.emit_social(None);
             }
-            Back::MailFound(found, wiped, unlock) => {
-                return self.mail_found(found, wiped, unlock);
+            Back::MailFound(found, wiped, unlock, paid) => {
+                return self.mail_found(found, wiped, unlock, paid);
             }
             Back::MailRecords(found, round) => {
                 if let Some(at) = round {
