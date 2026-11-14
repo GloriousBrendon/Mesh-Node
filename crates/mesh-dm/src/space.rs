@@ -73,7 +73,8 @@ pub struct SpaceEvent {
     pub time: u64,
     /// The channel's order, or the chain's for a change (dm D2).
     pub seq: u64,
-    /// The signing device's own count of its events in this Space.
+    /// The signing device's own count of its events in this channel (or
+    /// in the Space's changes), as dm D2's `n` is per chat.
     pub n: u64,
     pub body: SpaceBody,
     /// The signing device's `DeviceCert`, as its bytes.
