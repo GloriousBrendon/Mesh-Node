@@ -29,16 +29,113 @@ pub struct Version {
     pub audience: BTreeMap<EventId, BTreeSet<Person>>,
 }
 
-struct Node {
-    by: Person,
-    after: Option<EventId>,
-    change: Change,
-    at: Position,
+/// A change held in a chain: who made it, what it follows, what it does,
+/// and where it sits in the chat's order.
+pub(crate) struct Node<C> {
+    pub by: Person,
+    pub after: Option<EventId>,
+    pub change: C,
+    pub at: Position,
+}
+
+/// How a fork is settled once every rank level is equal or absent.
+#[derive(Clone, Copy)]
+pub(crate) enum LastTie {
+    /// The lower event ID of the branch's first change (dm D7).
+    Id,
+    /// The lower (`seq`, event ID) of the branch's first change (spaces S7).
+    Position,
+}
+
+/// What `settle` finds: the version after each change that counts, and the
+/// winning line from the root to its newest change.
+pub(crate) struct Settled<S> {
+    pub versions: HashMap<EventId, S>,
+    pub line: Vec<EventId>,
+}
+
+/// Settles a chain (dm D7, spaces S7). Top down, each change counts only if
+/// `apply` allows it in the version it follows. Bottom up, each change's best
+/// continuation: at each rank level from the highest, the branch holding a
+/// change of at least that rank wins, and if both do, the one whose first
+/// such change sits lower; then `last`. `rank` judges a change in the
+/// version it follows. The result depends only on which changes are held.
+pub(crate) fn settle<C, S: Clone>(
+    nodes: &HashMap<EventId, Node<C>>,
+    root: EventId,
+    start: S,
+    apply: impl Fn(&S, EventId, &Node<C>) -> Option<S>,
+    rank: impl Fn(&S, &Node<C>) -> usize,
+    levels: usize,
+    last: LastTie,
+) -> Settled<S> {
+    let mut children: HashMap<EventId, Vec<EventId>> = HashMap::new();
+    for (id, n) in nodes {
+        if let Some(after) = n.after {
+            children.entry(after).or_default().push(*id);
+        }
+    }
+    // Top down: each change's version follows from its one line of
+    // ancestors, so whether it counts is known before any fork is settled.
+    let mut versions = HashMap::from([(root, start)]);
+    let mut order = vec![root];
+    let mut i = 0;
+    while let Some(&id) = order.get(i) {
+        i += 1;
+        for child in children.get(&id).into_iter().flatten() {
+            if let Some(next) = apply(&versions[&id], *child, &nodes[child]) {
+                versions.insert(*child, next);
+                order.push(*child);
+            }
+        }
+    }
+    // Bottom up: each change's best continuation, and the first change of
+    // each rank level on the line it leads.
+    type Best = (Option<EventId>, Vec<Option<Position>>);
+    let mut best: HashMap<EventId, Best> = HashMap::new();
+    for id in order.iter().rev() {
+        let node = &nodes[id];
+        let valid = children.get(id).into_iter().flatten();
+        let next = valid
+            .filter(|c| versions.contains_key(*c))
+            .min_by(|a, b| {
+                for level in (0..levels).rev() {
+                    match (best[*a].1[level], best[*b].1[level]) {
+                        (Some(x), Some(y)) => return x.cmp(&y),
+                        (Some(_), None) => return std::cmp::Ordering::Less,
+                        (None, Some(_)) => return std::cmp::Ordering::Greater,
+                        (None, None) => {}
+                    }
+                }
+                match last {
+                    LastTie::Id => a.cmp(b),
+                    LastTie::Position => nodes[*a].at.cmp(&nodes[*b].at),
+                }
+            })
+            .copied();
+        let before = node.after.map_or(&versions[id], |after| &versions[&after]);
+        let r = rank(before, node);
+        let firsts = (0..levels)
+            .map(|level| {
+                if r > level {
+                    Some(node.at)
+                } else {
+                    next.and_then(|n| best[&n].1[level])
+                }
+            })
+            .collect();
+        best.insert(*id, (next, firsts));
+    }
+    let mut line = vec![root];
+    while let Some(next) = best[line.last().expect("the root")].0 {
+        line.push(next);
+    }
+    Settled { versions, line }
 }
 
 #[derive(Default)]
 pub struct Group {
-    changes: HashMap<EventId, Node>,
+    changes: HashMap<EventId, Node<Change>>,
 }
 
 impl Group {
@@ -89,57 +186,23 @@ impl Group {
         };
         start.members.extend(members.iter().take(MAX_MEMBERS - 1));
         start.joined = start.members.iter().map(|m| (*m, *root)).collect();
-        let mut children: HashMap<EventId, Vec<EventId>> = HashMap::new();
-        for (id, n) in &self.changes {
-            if let Some(after) = n.after {
-                children.entry(after).or_default().push(*id);
-            }
+        let root = *root;
+        let creator_rank = |v: &Version, n: &Node<Change>| usize::from(n.by == v.creator);
+        let Settled { mut versions, line } = settle(
+            &self.changes,
+            root,
+            start,
+            apply,
+            creator_rank,
+            1,
+            LastTie::Id,
+        );
+        let mut audience = BTreeMap::from([(root, versions[&root].members.clone())]);
+        for pair in line.windows(2) {
+            let both = &versions[&pair[0]].members | &versions[&pair[1]].members;
+            audience.insert(pair[1], both);
         }
-        // Top down: each change's version follows from its one line of
-        // ancestors, so whether it counts is known before any fork is settled.
-        let mut versions = HashMap::from([(*root, start)]);
-        let mut order = vec![*root];
-        let mut i = 0;
-        while let Some(&id) = order.get(i) {
-            i += 1;
-            for child in children.get(&id).into_iter().flatten() {
-                let node = &self.changes[child];
-                if let Some(next) = apply(&versions[&id], *child, node) {
-                    versions.insert(*child, next);
-                    order.push(*child);
-                }
-            }
-        }
-        // Bottom up: each change's best continuation, and the first creator
-        // change on the line it leads.
-        let mut best: HashMap<EventId, (Option<EventId>, Option<Position>)> = HashMap::new();
-        for id in order.iter().rev() {
-            let node = &self.changes[id];
-            let valid = children.get(id).into_iter().flatten();
-            let next = valid.filter(|c| versions.contains_key(*c)).min_by(|a, b| {
-                let (fa, fb) = (best[*a].1, best[*b].1);
-                match (fa, fb) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.cmp(b),
-                }
-            });
-            let creator = versions[id].creator;
-            let first = if node.by == creator {
-                Some(node.at)
-            } else {
-                next.and_then(|n| best[n].1)
-            };
-            best.insert(*id, (next.copied(), first));
-        }
-        let mut at = *root;
-        let mut audience = BTreeMap::from([(*root, versions[root].members.clone())]);
-        while let Some(next) = best[&at].0 {
-            let both = &versions[&at].members | &versions[&next].members;
-            audience.insert(next, both);
-            at = next;
-        }
+        let at = *line.last().expect("the root");
         let mut version = versions.remove(&at)?;
         version.head = at;
         version.audience = audience;
@@ -148,7 +211,7 @@ impl Group {
 }
 
 /// The version after `node`, if its sender may make that change in `v`.
-fn apply(v: &Version, id: EventId, node: &Node) -> Option<Version> {
+fn apply(v: &Version, id: EventId, node: &Node<Change>) -> Option<Version> {
     let member = v.members.contains(&node.by);
     let mut next = v.clone();
     match &node.change {

@@ -1060,6 +1060,67 @@ mod tests {
     use crate::store::SEGMENT_EVENTS;
     use std::path::PathBuf;
 
+    /// Group DMs' wire and saved formats, as written before Spaces
+    /// (PLAN-spaces Task 2): a group change event, the friend body that
+    /// carries it, and a chat index holding it. Fixed bytes, so a change
+    /// to any of these layouts fails here.
+    fn group_format_samples() -> (Event, Vec<u8>, Vec<u8>) {
+        let change = GroupChange {
+            after: Some([3; 16]),
+            change: crate::event::Change::Add([4; 32]),
+            signed: Some(crate::event::Signed {
+                author: [1; 32],
+                device: [2; 32],
+                signature: vec![5; 64],
+            }),
+        };
+        let event = Event {
+            version: crate::event::VERSION,
+            id: [6; 16],
+            time: 1_800_000_000_000,
+            seq: 1_800_000_000_001,
+            n: 7,
+            body: Body::Group(change.clone()),
+        };
+        let friend = to_friend(&Where::Group([8; 16]), &event);
+        let index = ChatIndex {
+            read: Some((9, [10; 16])),
+            highs: vec![([11; 32], 12, 13)],
+            group: vec![([6; 16], [1; 32], change, (1_800_000_000_001, [6; 16]))],
+        };
+        (event, friend, postcard::to_stdvec(&index).unwrap())
+    }
+
+    const GROUP_EVENT_HEX: &str = "010606060606060606060606060606060680a0f1c2b13481a0f1c2b1340705010303030303030303030303030303030301040404040404040404040404040404040404040404040404040404040404040401010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202024005050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505";
+    const GROUP_FRIEND_HEX: &str = "010108080808080808080808080808080808d301010606060606060606060606060606060680a0f1c2b13481a0f1c2b1340705010303030303030303030303030303030301040404040404040404040404040404040404040404040404040404040404040401010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202024005050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505";
+    const GROUP_INDEX_HEX: &str = "01090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a010b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c0d0106060606060606060606060606060606010101010101010101010101010101010101010101010101010101010101010101030303030303030303030303030303030104040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202400505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050581a0f1c2b13406060606060606060606060606060606";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn group_formats_are_unchanged() {
+        let (event, friend, index) = group_format_samples();
+        let bytes = event.to_bytes().unwrap();
+        assert_eq!(hex(&bytes), GROUP_EVENT_HEX, "the event");
+        assert_eq!(hex(&friend), GROUP_FRIEND_HEX, "the friend body");
+        assert_eq!(hex(&index), GROUP_INDEX_HEX, "the chat index");
+        // And the old bytes still read.
+        assert_eq!(Event::from_bytes(&unhex(GROUP_EVENT_HEX)).unwrap(), event);
+        let (group, back) = from_friend(&unhex(GROUP_FRIEND_HEX)).unwrap();
+        assert_eq!((group, back), (Some([8; 16]), event));
+        let read: ChatIndex = postcard::from_bytes(&unhex(GROUP_INDEX_HEX)).unwrap();
+        assert_eq!(postcard::to_stdvec(&read).unwrap(), index);
+    }
+
     const NOW: u64 = 1_800_000_000_000;
     const KEY: [u8; 32] = [7; 32];
     const CHAT: Where = Where::Direct([2; 32]);
