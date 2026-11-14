@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat::{Chat, Taken};
 use crate::event::{Body, Event, EventId, VERSION};
-use crate::history::HistoryError;
+use crate::history::{HistoryError, Unread};
 use crate::space::{Chain, ChannelId, SpaceBody, SpaceEvent, SpaceId, SpaceVersion};
 use crate::store::{ChatFiles, Conversation, Store, StoreError};
-use crate::sync::{Entry, Log};
+use crate::sync::{Counters, Entry, Log};
 use crate::{Device, Person, Sender};
+use mesh_identity::{DeviceCert, DeviceKey};
 
 /// The format number in front of everything saved here.
 pub const SPACE_FORMAT: u8 = 1;
@@ -120,12 +121,24 @@ pub struct SpaceHistory {
     channels: HashMap<ChannelId, (ChatFiles, Chat)>,
     /// Deleted events, by channel, so a late copy stays out (dm D3).
     deleted: HashMap<Conversation, HashSet<EventId>>,
+    /// Where each stored event sits, by number (from 1).
+    places: Vec<(Conversation, u32, u32)>,
+    /// What each device has acknowledged (dm D5).
+    counters: Counters,
 }
 
 #[derive(Serialize, Deserialize)]
 enum SpaceLog {
-    Stored(Entry),
-    Deleted { chat: Conversation, id: EventId },
+    /// A stored event, and where it sits in its chat's files.
+    Stored {
+        entry: Entry,
+        segment: u32,
+        position: u32,
+    },
+    Deleted {
+        chat: Conversation,
+        id: EventId,
+    },
 }
 
 impl SpaceHistory {
@@ -147,12 +160,21 @@ impl SpaceHistory {
             chain: Chain::default(),
             channels: HashMap::new(),
             deleted: HashMap::new(),
+            places: Vec::new(),
+            counters: Counters::new(me.person),
         };
         for n in 0..history.log_files.segments() {
             for record in history.log_files.read(n)? {
                 match read("a Space log record", &record)? {
-                    SpaceLog::Stored(entry) => {
-                        history.log.take(entry);
+                    SpaceLog::Stored {
+                        entry,
+                        segment,
+                        position,
+                    } => {
+                        let chat = entry.chat;
+                        if history.log.take(entry).is_some() {
+                            history.places.push((chat, segment, position));
+                        }
                     }
                     SpaceLog::Deleted { chat, id } => {
                         history.deleted.entry(chat).or_default().insert(id);
@@ -161,6 +183,9 @@ impl SpaceHistory {
             }
         }
         read_changes(&mut history.change_files, &mut history.chain)?;
+        if let Some(bytes) = history.log_files.index()? {
+            history.counters = read("the delivery counters", &bytes)?;
+        }
         Ok(history)
     }
 
@@ -212,12 +237,13 @@ impl SpaceHistory {
             })
             .expect("to memory"),
         );
-        let (chat, change, private) = match &event.body {
+        let (chat, change, private, (segment, position)) = match &event.body {
             SpaceBody::Change(change) => {
                 self.chain
                     .add(event.id, from.person, change.clone(), (event.seq, event.id));
+                let place = self.change_files.next_places(1)[0];
                 self.change_files.append(&[stored])?;
-                (CHANGES, true, false)
+                (CHANGES, true, false, place)
             }
             body => {
                 let channel = channel_of(body).expect("not a change");
@@ -228,9 +254,10 @@ impl SpaceHistory {
                 if !matches!(taken, Taken::Shown | Taken::Waiting) {
                     return Ok(taken);
                 }
+                let place = files.next_places(1)[0];
                 files.append(&[stored])?;
                 let private = matches!(body, SpaceBody::Read { .. });
-                (channel_key(&self.space, &channel), false, private)
+                (channel_key(&self.space, &channel), false, private, place)
             }
         };
         let entry = Entry {
@@ -243,7 +270,13 @@ impl SpaceHistory {
             change,
         };
         self.log.take(entry.clone());
-        let record = framed(postcard::to_stdvec(&SpaceLog::Stored(entry)).expect("to memory"));
+        self.places.push((chat, segment, position));
+        let stored = SpaceLog::Stored {
+            entry,
+            segment,
+            position,
+        };
+        let record = framed(postcard::to_stdvec(&stored).expect("to memory"));
         self.log_files.append(&[record])?;
         Ok(Taken::Shown)
     }
@@ -267,6 +300,106 @@ impl SpaceHistory {
             }
         }
         Ok(out)
+    }
+
+    /// A device we'll send this Space's events to (dm D5's counters).
+    pub fn add_device(&mut self, device: Device, person: Person) {
+        self.counters.add_device(device, person);
+    }
+
+    /// What `device` hasn't acknowledged and is meant for it, oldest first
+    /// in each part: (number, who it's from, first received, the event).
+    pub fn outgoing(
+        &mut self,
+        device: &Device,
+        now: u64,
+    ) -> Result<Vec<(u64, Sender, u64, SpaceEvent)>, HistoryError> {
+        let version = self.version();
+        let shares = |e: &Entry, n: u64, p: &Person| shares(version.as_ref(), e, n, p);
+        let out = self.counters.to_send(device, &self.log, shares, now);
+        let mut segments: HashMap<(Conversation, u32), Vec<Vec<u8>>> = HashMap::new();
+        let mut sent = Vec::with_capacity(out.send.len());
+        for number in out.send {
+            let Some(&(chat, segment, position)) = self.places.get(number as usize - 1) else {
+                continue;
+            };
+            if let std::collections::hash_map::Entry::Vacant(slot) = segments.entry((chat, segment))
+            {
+                slot.insert(self.store.open(&chat)?.read(segment)?);
+            }
+            let Some(record) = segments[&(chat, segment)].get(position as usize) else {
+                continue;
+            };
+            let stored: Stored = read("a Space event", record)?;
+            let from = Sender {
+                person: stored.person,
+                device: stored.device,
+            };
+            sent.push((
+                number,
+                from,
+                stored.received,
+                SpaceEvent::from_bytes(&stored.event)?,
+            ));
+        }
+        Ok(sent)
+    }
+
+    /// `device` answered for event `number`.
+    pub fn acked(&mut self, device: &Device, number: u64, ok: bool) {
+        let version = self.version();
+        let shares = |e: &Entry, n: u64, p: &Person| shares(version.as_ref(), e, n, p);
+        self.counters.acked(device, number, ok, &self.log, shares);
+    }
+
+    /// Writes the counters (after a batch of acks).
+    pub fn save_counters(&self) -> Result<(), HistoryError> {
+        let bytes = framed(postcard::to_stdvec(&self.counters).expect("to memory"));
+        Ok(self.log_files.write_index(&bytes)?)
+    }
+
+    /// Signs, stores and returns a new event of ours (dm D2's `seq` and `n`).
+    pub fn send(
+        &mut self,
+        body: SpaceBody,
+        device: &DeviceKey,
+        cert: &DeviceCert,
+        now: u64,
+    ) -> Result<SpaceEvent, HistoryError> {
+        let me = Sender {
+            person: cert.root().to_bytes(),
+            device: device.public().to_bytes(),
+        };
+        let (seq, n) = match &body {
+            SpaceBody::Change(_) => {
+                // dm D2 over the chain: one past the highest held that isn't
+                // ahead of the clock, and past our own last.
+                let held = self.chain.changes();
+                let highest = held.iter().map(|c| c.3.0).filter(|s| *s <= now).max();
+                let ours = (1..=self.log.len())
+                    .filter_map(|i| self.log.get(i))
+                    .filter(|e| e.change && e.from == me.device)
+                    .count() as u64;
+                let own_last = (held.iter())
+                    .filter(|c| c.1 == me.person)
+                    .map(|c| c.3.0)
+                    .max();
+                let seq = highest.max(own_last).map_or(now, |s| s + 1);
+                (seq, ours + 1)
+            }
+            body => {
+                let channel = channel_of(body).expect("not a change");
+                self.load(&channel, now)?;
+                let view = &self.channels[&channel].1;
+                (view.next_seq(&me.device, now), view.next_n(&me.device))
+            }
+        };
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id)
+            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+        let event = SpaceEvent::signed(self.space, id, (now, seq, n), body, device, cert);
+        self.store(&event, me, now, now)?;
+        Ok(event)
     }
 
     /// Channels read into memory so far.
@@ -314,6 +447,101 @@ fn read_changes(files: &mut ChatFiles, chain: &mut Chain) -> Result<(), HistoryE
         }
     }
     Ok(())
+}
+
+/// The first byte of a Space body on the wire: the friend layout's and the
+/// forwarded layout's next version, so an engine without Spaces answers
+/// `failed` and the sender keeps it (PLAN-spaces *Mixed versions*).
+pub const SPACE_LAYOUT: u8 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct ToMember {
+    /// First: `SPACE_LAYOUT`.
+    version: u8,
+    space: SpaceId,
+    event: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ToOwn {
+    /// First: `SPACE_LAYOUT`.
+    version: u8,
+    space: SpaceId,
+    person: Person,
+    device: Device,
+    received: u64,
+    event: Vec<u8>,
+}
+
+/// Whether `bytes` starts with this layout, a newer one, or neither.
+fn layout(bytes: &[u8]) -> Result<(), Unread> {
+    match bytes.first() {
+        Some(&v) if v == SPACE_LAYOUT => Ok(()),
+        Some(&v) if crate::history::is_newer(v, SPACE_LAYOUT) => Err(Unread::Newer),
+        _ => Err(Unread::Garbage),
+    }
+}
+
+fn event_from(bytes: &[u8]) -> Result<SpaceEvent, Unread> {
+    if bytes
+        .first()
+        .is_some_and(|&v| crate::history::is_newer(v, crate::space::SPACE_VERSION))
+    {
+        return Err(Unread::Newer);
+    }
+    SpaceEvent::from_bytes(bytes).map_err(|_| Unread::Garbage)
+}
+
+/// A Space event as it goes to a member's device.
+pub fn to_member(space: &SpaceId, event: &SpaceEvent) -> Vec<u8> {
+    let body = ToMember {
+        version: SPACE_LAYOUT,
+        space: *space,
+        event: event.to_bytes().expect("checked when stored"),
+    };
+    postcard::to_stdvec(&body).expect("to memory")
+}
+
+/// A member's body: the Space and its event.
+pub fn from_member(bytes: &[u8]) -> Result<(SpaceId, SpaceEvent), Unread> {
+    layout(bytes)?;
+    let body: ToMember = postcard::from_bytes(bytes).map_err(|_| Unread::Garbage)?;
+    Ok((body.space, event_from(&body.event)?))
+}
+
+/// A Space event as it goes to another of our devices (dm D8): who it's
+/// from and when it first arrived, so that device stores it as it is here.
+pub fn to_own(space: &SpaceId, from: Sender, received: u64, event: &SpaceEvent) -> Vec<u8> {
+    let body = ToOwn {
+        version: SPACE_LAYOUT,
+        space: *space,
+        person: from.person,
+        device: from.device,
+        received,
+        event: event.to_bytes().expect("checked when stored"),
+    };
+    postcard::to_stdvec(&body).expect("to memory")
+}
+
+/// A forwarded body from another of our devices.
+pub fn from_own(bytes: &[u8]) -> Result<(SpaceId, Sender, u64, SpaceEvent), Unread> {
+    layout(bytes)?;
+    let body: ToOwn = postcard::from_bytes(bytes).map_err(|_| Unread::Garbage)?;
+    let from = Sender {
+        person: body.person,
+        device: body.device,
+    };
+    Ok((body.space, from, body.received, event_from(&body.event)?))
+}
+
+/// Whether event `e` (number `n`) is for `p`: a change, for every member
+/// and for whoever it concerns (an add, a removal); anything else, for the
+/// members now.
+fn shares(version: Option<&SpaceVersion>, e: &Entry, n: u64, p: &Person) -> bool {
+    let _ = n;
+    let Some(v) = version else { return false };
+    v.state.members.contains_key(p)
+        || (e.change && v.audience.get(&e.id).is_some_and(|who| who.contains(p)))
 }
 
 fn channel_of(body: &SpaceBody) -> Option<ChannelId> {
@@ -525,6 +753,97 @@ mod tests {
         let back = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
         assert!(back.version().unwrap().state.channels.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// dm D5's counters over a Space: our own events and every change go to
+    /// each member's device until it acknowledges them; nothing goes to a
+    /// non-member; our own other devices get everything; counters survive.
+    #[test]
+    fn delivery_follows_the_members() {
+        let root = dir("deliver");
+        let m = made();
+        let me = sender(&m.o);
+        let bob = Someone::new();
+        let stranger = Someone::new();
+        let mut h = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        for e in &m.events[..2] {
+            h.store(e, me, NOW, NOW).unwrap();
+        }
+        let add = SpaceBody::Change(SpaceChange {
+            after: Some([2; 16]),
+            change: Change::Add {
+                who: bob.id(),
+                display: "bob".into(),
+            },
+        });
+        h.send(add, &m.o.device, &m.o.cert, NOW).unwrap();
+        let post = |text: &str| SpaceBody::Post {
+            channel: m.general,
+            text: text.into(),
+            reply_to: None,
+            attachments: vec![],
+            mentions: vec![],
+            everyone: false,
+        };
+        let sent = h
+            .send(post("hi bob"), &m.o.device, &m.o.cert, NOW + 1)
+            .unwrap();
+        assert_eq!(sent.author().map(|a| a.person), Some(m.o.id()));
+        let later = h
+            .send(post("again"), &m.o.device, &m.o.cert, NOW + 1)
+            .unwrap();
+        assert!((later.seq, later.n) > (sent.seq, sent.n), "dm D2's order");
+        // Bob's device: the three changes (he joined after two of them) and
+        // both posts.
+        let b_dev = bob.device.public().to_bytes();
+        h.add_device(b_dev, bob.id());
+        let out = h.outgoing(&b_dev, NOW + 2).unwrap();
+        assert_eq!(
+            out.len(),
+            5,
+            "{:?}",
+            out.iter().map(|o| o.3.id).collect::<Vec<_>>()
+        );
+        // A stranger's device gets nothing.
+        let s_dev = stranger.device.public().to_bytes();
+        h.add_device(s_dev, stranger.id());
+        assert!(h.outgoing(&s_dev, NOW + 2).unwrap().is_empty());
+        // Acknowledged, they don't go again, even after a reopen.
+        for (number, ..) in &out {
+            h.acked(&b_dev, *number, true);
+        }
+        h.save_counters().unwrap();
+        drop(h);
+        let mut back = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        back.add_device(b_dev, bob.id());
+        assert!(back.outgoing(&b_dev, NOW + 3).unwrap().is_empty());
+        // Our own other device gets all five, our own included.
+        let mine = Someone::with_root(mesh_identity::RootKey::from_secret_bytes(
+            *m.o.root.secret_bytes(),
+        ));
+        let my_dev = mine.device.public().to_bytes();
+        back.add_device(my_dev, m.o.id());
+        assert_eq!(back.outgoing(&my_dev, NOW + 3).unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_wire_layouts_round_trip_and_read_as_newer_to_dm() {
+        let m = made();
+        let from = sender(&m.o);
+        let e = &m.events[2];
+        let body = to_member(&m.space, e);
+        assert_eq!(body[0], SPACE_LAYOUT);
+        assert_eq!(from_member(&body).unwrap(), (m.space, e.clone()));
+        let own = to_own(&m.space, from, NOW, e);
+        assert_eq!(from_own(&own).unwrap(), (m.space, from, NOW, e.clone()));
+        // An engine without Spaces reads either as "newer": `failed`, kept.
+        assert_eq!(
+            crate::history::from_friend(&body).err(),
+            Some(Unread::Newer)
+        );
+        assert_eq!(crate::history::unforward(&own).err(), Some(Unread::Newer));
+        assert_eq!(from_member(b"junk").err(), Some(Unread::Garbage));
     }
 
     #[test]

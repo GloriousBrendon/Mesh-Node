@@ -11,7 +11,25 @@ use mesh_dm::space::SpaceId;
 use mesh_dm::space_store::{SpaceHistory, SpaceList};
 use mesh_identity::MeshId;
 
-use super::{Back, Helper, Reached, Target, routing, unix_now};
+use mesh_dm::Sender;
+use mesh_dm::chat::Taken;
+use mesh_dm::space::{
+    Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, space_id, would_count,
+};
+use mesh_dm::space_store::{from_member, from_own, to_member, to_own};
+use mesh_e2ee::Kind as NoteKind;
+use mesh_identity::{DeviceCert, DeviceKey};
+use mesh_transport::MeshAddr;
+use serde_json::{Value, json};
+
+use super::{Back, Fail, Helper, Reached, Target, dm, e2ee, emit, parse_id, routing, unix_now};
+
+/// A device's answer to a batch of Space events: who, which device, each
+/// event's Space and number, and the answers (none if it didn't answer).
+pub(super) type Answered = (MeshId, MeshAddr, Vec<(SpaceId, u64)>, Option<Vec<bool>>);
+
+/// Spaces one account may be in (SPEC-spaces *Limits*).
+pub(super) const SPACES_PER_ACCOUNT: usize = 10;
 
 /// Every current member of every Space in `spaces`, from their chains alone.
 /// A Space whose chain doesn't read is left out and said so (counts only).
@@ -153,7 +171,687 @@ impl PeerWire {
     }
 }
 
+/// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse16(text: &str, what: &str) -> Result<[u8; 16], Fail> {
+    let bad = || Fail("bad-args", format!("that isn't a {what} ID"));
+    if text.len() != 32 {
+        return Err(bad());
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+    }
+    Ok(out)
+}
+
+fn role_text(role: Role) -> &'static str {
+    match role {
+        Role::Owner => "owner",
+        Role::Admin => "admin",
+        Role::Member => "member",
+    }
+}
+
+fn locked() -> Fail {
+    Fail("locked", "unlock Mesh first".to_owned())
+}
+
+fn not_found() -> Fail {
+    Fail("not-found", "no such Space here".to_owned())
+}
+
+fn not_allowed() -> Fail {
+    Fail(
+        "not-allowed",
+        "your role in this Space doesn't allow that".to_owned(),
+    )
+}
+
+fn space_fail(e: impl std::fmt::Display) -> Fail {
+    Fail("space", e.to_string())
+}
+
+/// A Space event's body, read from the wire: from a member, or forwarded by
+/// another of our devices with its author and first arrival.
+pub(super) struct SpaceIn {
+    pub frame: usize,
+    pub own: bool,
+    pub body: Vec<u8>,
+}
+
 impl Helper {
+    fn spaces_root(&self) -> std::path::PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).join("dm")
+    }
+
+    fn me_sender(&self) -> Result<Sender, Fail> {
+        let store = self.store.as_ref().ok_or_else(locked)?;
+        Ok(Sender {
+            person: store.id().to_bytes(),
+            device: store.device_key().public().to_bytes(),
+        })
+    }
+
+    /// This device's key and certificate, to sign Space events with (S5).
+    fn signing(&self) -> Result<(DeviceKey, DeviceCert), Fail> {
+        let store = self.store.as_ref().ok_or_else(locked)?;
+        let this = store.device_key().public();
+        let cert = (store.devices().devices().iter())
+            .find(|d| *d.device() == this)
+            .cloned()
+            .ok_or_else(|| space_fail("this device isn't in its own device list"))?;
+        let key = DeviceKey::from_secret_bytes(*store.device_key().secret_bytes());
+        Ok((key, cert))
+    }
+
+    /// A Space's history, opened the first time it's used (S11).
+    fn space_mut(&mut self, space: &SpaceId) -> Result<&mut SpaceHistory, Fail> {
+        if !self.space_open.contains_key(space) {
+            let me = self.me_sender()?;
+            let store = self.store.as_ref().ok_or_else(locked)?;
+            let history = SpaceHistory::open(&self.spaces_root(), store.data_key(), me, *space)
+                .map_err(space_fail)?;
+            self.space_open.insert(*space, history);
+        }
+        Ok(self.space_open.get_mut(space).expect("opened"))
+    }
+
+    fn held_spaces(&self) -> Vec<SpaceId> {
+        self.spaces
+            .as_ref()
+            .map(|l| l.spaces().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// A Space's version: from its opened history, else its chain alone.
+    fn space_version(&self, space: &SpaceId) -> Option<SpaceVersion> {
+        if let Some(h) = self.space_open.get(space) {
+            return h.version();
+        }
+        let store = self.store.as_ref()?;
+        let chain = SpaceHistory::read_chain(&self.spaces_root(), store.data_key(), space).ok()?;
+        chain.version(space)
+    }
+
+    /// Works the peers out again from the Spaces we're a member of, and
+    /// lets in exactly them and the contacts.
+    pub(super) fn refresh_peers(&mut self) {
+        let Some(me) = self.store.as_ref().map(|s| s.id().to_bytes()) else {
+            return;
+        };
+        let mut members = Vec::new();
+        for space in self.held_spaces() {
+            let Some(v) = self.space_version(&space) else {
+                continue;
+            };
+            if !v.state.members.contains_key(&me) {
+                continue;
+            }
+            members.extend(
+                v.state
+                    .members
+                    .keys()
+                    .filter_map(|m| MeshId::from_bytes(m).ok()),
+            );
+        }
+        let before: HashSet<[u8; 32]> = (self.store.iter())
+            .flat_map(|s| s.peers().iter().map(|c| c.id().to_bytes()))
+            .collect();
+        if let Some(store) = self.store.as_mut()
+            && let Err(e) = store.set_peers(members)
+        {
+            eprintln!("mesh-node: the Spaces' members didn't fit: {e}");
+        }
+        self.allow_contacts();
+        // A new peer: our records and claims for them go out now, and we say
+        // hello, so whichever of us speaks first finds the other (S14).
+        let new: Vec<MeshId> = (self.store.iter())
+            .flat_map(|s| s.peers().iter().map(|c| c.id()))
+            .filter(|id| !before.contains(&id.to_bytes()))
+            .collect();
+        let now = Instant::now();
+        for id in &new {
+            self.wire.heard(id, now);
+            self.contacts_changed(Some(id));
+        }
+        self.wire.queue_hello(new);
+    }
+
+    /// `meshSpaces`: every Space held, with its channels and members.
+    pub(super) fn emit_spaces(&self) {
+        let me = self.store.as_ref().map(|s| s.id().to_bytes());
+        let mut spaces = Vec::new();
+        for space in self.held_spaces() {
+            let Some(v) = self.space_version(&space) else {
+                continue;
+            };
+            let st = &v.state;
+            let mut channels: Vec<_> = st.channels.iter().collect();
+            channels.sort_by_key(|(id, c)| (c.category, c.position, **id));
+            let channels: Vec<Value> = (channels.into_iter())
+                .map(|(id, c)| {
+                    json!({
+                        "id": hex16(id),
+                        "name": c.name,
+                        "category": c.category.as_ref().map(hex16),
+                        "adminsPost": c.admins_post,
+                    })
+                })
+                .collect();
+            let members: Vec<Value> = (st.members.iter())
+                .filter_map(|(p, m)| {
+                    let id = MeshId::from_bytes(p).ok()?;
+                    Some(json!({ "id": id.to_string(), "name": m.display, "role": role_text(m.role) }))
+                })
+                .collect();
+            let role = me.and_then(|me| st.role(&me)).map(role_text);
+            spaces.push(json!({
+                "id": hex16(&space),
+                "name": st.name,
+                "role": role,
+                "channels": channels,
+                "members": members,
+            }));
+        }
+        emit("meshSpaces", json!({ "spaces": spaces }));
+    }
+
+    /// `meshSpaceMessages`: a channel as it shows.
+    fn emit_channel(&mut self, space: &SpaceId, channel: &ChannelId) -> Result<(), Fail> {
+        let now = unix_now() * 1000;
+        let history = self.space_mut(space)?;
+        let chat = history.channel(channel, now).map_err(space_fail)?;
+        let events: Vec<Value> = (chat.messages().iter())
+            .filter_map(|m| {
+                let from = MeshId::from_bytes(&m.author).ok()?;
+                Some(json!({ "id": hex16(&m.id), "from": from.to_string(), "text": m.text, "edited": m.edited }))
+            })
+            .collect();
+        self.space_view = Some((*space, *channel));
+        emit(
+            "meshSpaceMessages",
+            json!({ "space": hex16(space), "channel": hex16(channel), "events": events }),
+        );
+        Ok(())
+    }
+
+    /// Signs and stores a change of ours, if our role allows it, and sends
+    /// it to every member.
+    fn space_change(&mut self, space: &SpaceId, change: Change) -> Result<(), Fail> {
+        let me = self.me_sender()?.person;
+        let v = self.space_mut(space)?.version().ok_or_else(not_found)?;
+        if !would_count(space, &v.state, &me, &change) {
+            return Err(not_allowed());
+        }
+        let (key, cert) = self.signing()?;
+        let body = SpaceBody::Change(SpaceChange {
+            after: Some(v.head),
+            change,
+        });
+        let now = unix_now() * 1000;
+        self.space_mut(space)?
+            .send(body, &key, &cert, now)
+            .map_err(space_fail)?;
+        self.space_changed(space);
+        Ok(())
+    }
+
+    /// The chain may have moved: tell Mesh-Voice, work out the peers, and
+    /// pass it on to every member.
+    fn space_changed(&mut self, space: &SpaceId) {
+        let me = self.store.as_ref().map(|s| s.id().to_bytes());
+        let member = self
+            .space_version(space)
+            .is_some_and(|v| me.is_some_and(|me| v.state.members.contains_key(&me)));
+        let held = self.held_spaces().contains(space);
+        if member
+            && !held
+            && let Some(list) = self.spaces.as_mut()
+            && let Err(e) = list.add(*space)
+        {
+            eprintln!("mesh-node: couldn't save the list of Spaces: {e}");
+        }
+        self.refresh_peers();
+        self.emit_spaces();
+        self.space_send_all(space);
+    }
+
+    /// Every member's devices (and our own) get what waits for them in
+    /// `space`: on open connections now; the rest are dialled.
+    fn space_send_all(&mut self, space: &SpaceId) {
+        let Some(v) = self.space_version(space) else {
+            return;
+        };
+        let Some(me) = self.store.as_ref().map(|s| s.id()) else {
+            return;
+        };
+        // Those just removed get the change that removed them too.
+        let mut people: Vec<MeshId> = (v.state.members.keys())
+            .chain(v.audience.get(&v.head).into_iter().flatten())
+            .filter_map(|p| MeshId::from_bytes(p).ok())
+            .collect();
+        people.push(me);
+        people.sort_by_key(|p| p.to_bytes());
+        people.dedup();
+        for id in people {
+            let connected = self
+                .net
+                .as_ref()
+                .map(|n| n.node.connected(&id))
+                .unwrap_or_default();
+            if connected.is_empty() {
+                if id == me {
+                    continue;
+                }
+                if self.is_peer(&id) {
+                    self.dial_peer(&id);
+                } else {
+                    self.dial(&id);
+                }
+                continue;
+            }
+            for addr in connected {
+                self.space_deliver_to(&id, addr);
+            }
+        }
+    }
+
+    /// What each of `id`'s connected devices hasn't taken, in every Space.
+    pub(super) fn space_deliver(&mut self, id: &MeshId) {
+        let Some(net) = &self.net else { return };
+        for addr in net.node.connected(id) {
+            self.space_deliver_to(id, addr);
+        }
+    }
+
+    /// One device's next batch of Space events, if none is in flight to it.
+    fn space_deliver_to(&mut self, id: &MeshId, addr: MeshAddr) {
+        let device = *addr.device.as_bytes();
+        if self.space_flight.contains(&device) || self.net.is_none() {
+            return;
+        }
+        let Some(me) = self.store.as_ref().map(|s| s.id()) else {
+            return;
+        };
+        let own = me == *id;
+        let now = unix_now() * 1000;
+        let mut numbers = Vec::new();
+        let mut bodies = Vec::new();
+        for space in self.held_spaces() {
+            let shared = own
+                || self.space_version(&space).is_some_and(|v| {
+                    v.state.members.contains_key(&id.to_bytes())
+                        || v.audience.values().any(|a| a.contains(&id.to_bytes()))
+                });
+            if !shared {
+                continue;
+            }
+            let Ok(history) = self.space_mut(&space) else {
+                continue;
+            };
+            history.add_device(device, id.to_bytes());
+            let out = match history.outgoing(&device, now) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't read a Space's history: {e}");
+                    continue;
+                }
+            };
+            for (number, from, received, event) in out {
+                if bodies.len() >= e2ee::MAX_FRAMES {
+                    break;
+                }
+                bodies.push(if own {
+                    to_own(&space, from, received, &event)
+                } else {
+                    to_member(&space, &event)
+                });
+                numbers.push((space, number));
+            }
+        }
+        if bodies.is_empty() {
+            return;
+        }
+        let Some(e2ee) = self.e2ee.as_mut() else {
+            return;
+        };
+        let envelopes = match e2ee.encrypt_device_batch(id, &device, NoteKind::Message, &bodies) {
+            Ok(envelopes) => envelopes,
+            Err(e) => {
+                eprintln!("mesh-node: couldn't encrypt for a device: {e}");
+                return;
+            }
+        };
+        self.peer_used(id);
+        let Some(net) = &self.net else { return };
+        self.space_flight.insert(device);
+        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        tokio::spawn(async move {
+            let frames: Vec<Vec<u8>> = (envelopes.iter())
+                .map(|e| [&[dm::ANSWER][..], e].concat())
+                .collect();
+            let answers = match node.open(&addr, e2ee::SERVICE).await {
+                Ok((_, send, recv)) => dm::exchange(send, recv, &frames).await,
+                Err(_) => None,
+            };
+            let _ = back.send(Back::SpaceAnswered(Box::new((id, addr, numbers, answers))));
+        });
+    }
+
+    /// A device answered a batch (or didn't): move its counters, and send
+    /// the next batch if it took this one; else try again at the refresh.
+    pub(super) fn space_answered(
+        &mut self,
+        id: MeshId,
+        addr: MeshAddr,
+        numbers: Vec<(SpaceId, u64)>,
+        answers: Option<Vec<bool>>,
+    ) {
+        let device = *addr.device.as_bytes();
+        self.space_flight.remove(&device);
+        let Some(answers) = answers else {
+            self.space_retry.insert(device, (id, addr));
+            return;
+        };
+        let mut touched = HashSet::new();
+        for ((space, number), ok) in numbers.iter().zip(&answers) {
+            if let Some(h) = self.space_open.get_mut(space) {
+                h.acked(&device, *number, *ok);
+                touched.insert(*space);
+            }
+        }
+        for space in touched {
+            if let Some(h) = self.space_open.get(&space)
+                && let Err(e) = h.save_counters()
+            {
+                eprintln!("mesh-node: couldn't save a Space's counters: {e}");
+            }
+        }
+        if answers.iter().all(|ok| *ok) {
+            self.space_retry.remove(&device);
+            self.space_deliver_to(&id, addr);
+        } else {
+            self.space_retry.insert(device, (id, addr));
+        }
+    }
+
+    /// The refresh: each device that didn't take everything gets another try.
+    pub(super) fn space_retry_all(&mut self) {
+        let waiting: Vec<_> = self.space_retry.values().cloned().collect();
+        for (id, addr) in waiting {
+            self.space_deliver_to(&id, addr);
+        }
+    }
+
+    /// Takes in the Space events of one stream from `id`'s `device` (S5,
+    /// live): each frame's answer is `ok` once stored or dropped, `failed`
+    /// when the sender should keep it (a chain we don't have yet).
+    pub(super) fn space_take(
+        &mut self,
+        id: &MeshId,
+        device: &[u8; 32],
+        events: Vec<SpaceIn>,
+        answers: &mut [u8],
+    ) {
+        let Some(me) = self.store.as_ref().map(|s| s.id()) else {
+            return;
+        };
+        let friend = self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.account().kind(id) == Some(mesh_identity::Kind::Friend));
+        let now = unix_now() * 1000;
+        let mut changed = Vec::new();
+        let mut refused = 0;
+        for SpaceIn { frame, own, body } in events {
+            let read = if own {
+                from_own(&body).map(|(s, from, received, e)| (s, Some((from, received)), e))
+            } else {
+                from_member(&body).map(|(s, e)| (s, None, e))
+            };
+            let (space, synced, event) = match read {
+                Ok(read) => read,
+                Err(mesh_dm::history::Unread::Newer) => {
+                    answers[frame] = dm::FAILED;
+                    continue;
+                }
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            if event.space != space {
+                refused += 1;
+                continue;
+            }
+            let Some(author) = event.author() else {
+                refused += 1;
+                continue;
+            };
+            let is_change = matches!(event.body, SpaceBody::Change(_));
+            let held = self.held_spaces().contains(&space) || self.space_open.contains_key(&space);
+            // A Space we don't hold yet comes only from a friend, who adds us
+            // (S6), or from our own devices.
+            if !held && !(own || (friend && is_change)) {
+                refused += 1;
+                continue;
+            }
+            let (from, received) = match synced {
+                Some(synced) => synced,
+                None => {
+                    // Live: a post comes from its author's own device, which
+                    // the handshake proved; a change may be passed on.
+                    let direct = author.person == id.to_bytes() && author.device == *device;
+                    if !is_change && !direct {
+                        refused += 1;
+                        continue;
+                    }
+                    (author, now)
+                }
+            };
+            if !is_change && !own {
+                let Ok(history) = self.space_mut(&space) else {
+                    answers[frame] = dm::FAILED;
+                    continue;
+                };
+                let Some(v) = history.version() else {
+                    // Its changes haven't come yet: the sender keeps it.
+                    answers[frame] = dm::FAILED;
+                    continue;
+                };
+                let posting = match &event.body {
+                    SpaceBody::Post { channel, .. } | SpaceBody::Edit { channel, .. } => {
+                        Some(channel)
+                    }
+                    _ => None,
+                };
+                let member = v.state.members.contains_key(&author.person);
+                if !member || posting.is_some_and(|c| !v.state.may_post(&author.person, c)) {
+                    answers[frame] = dm::FAILED;
+                    continue;
+                }
+            }
+            let Ok(history) = self.space_mut(&space) else {
+                answers[frame] = dm::FAILED;
+                continue;
+            };
+            match history.store(&event, from, received, now) {
+                Ok(Taken::Shown) => {
+                    if is_change {
+                        changed.push(space);
+                    } else if let SpaceBody::Post { channel, text, .. } = &event.body
+                        && author.person != me.to_bytes()
+                        && let Ok(who) = MeshId::from_bytes(&author.person)
+                    {
+                        emit(
+                            "meshSpaceNotify",
+                            json!({ "space": hex16(&space), "channel": hex16(channel), "from": who.to_string(), "text": text }),
+                        );
+                        if self.space_view == Some((space, *channel)) {
+                            let _ = self.emit_channel(&space, channel);
+                        }
+                    }
+                }
+                Ok(Taken::Refused(_)) => refused += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't store a Space event: {e}");
+                    answers[frame] = dm::FAILED;
+                }
+            }
+        }
+        if refused > 0 {
+            eprintln!("mesh-node: {refused} Space events refused");
+        }
+        changed.sort();
+        changed.dedup();
+        for space in changed {
+            self.space_changed(&space);
+        }
+    }
+
+    /// The `space…` commands.
+    pub(super) fn space_command(&mut self, func: &str, args: &[String]) -> Result<(), Fail> {
+        let arg = |i: usize| {
+            args.get(i)
+                .map(String::as_str)
+                .ok_or_else(|| Fail("bad-args", format!("{func} needs more arguments")))
+        };
+        match func {
+            "spaceList" => self.emit_spaces(),
+            "spaceCreate" => {
+                let name = arg(0)?.trim().to_owned();
+                let store = self.store.as_ref().ok_or_else(locked)?;
+                if self.held_spaces().len() >= SPACES_PER_ACCOUNT {
+                    return Err(Fail(
+                        "too-many",
+                        format!("you can be in at most {SPACES_PER_ACCOUNT} Spaces"),
+                    ));
+                }
+                let display = store.username().to_owned();
+                let me = store.id().to_bytes();
+                let nonce = mesh_dm::space::nonce().ok_or_else(|| space_fail("no randomness"))?;
+                let space = space_id(&me, &nonce);
+                let (key, cert) = self.signing()?;
+                let body = SpaceBody::Change(SpaceChange {
+                    after: None,
+                    change: Change::Create {
+                        name,
+                        nonce,
+                        display,
+                    },
+                });
+                let now = unix_now() * 1000;
+                self.space_mut(&space)?
+                    .send(body, &key, &cert, now)
+                    .map_err(space_fail)?;
+                if let Some(list) = self.spaces.as_mut() {
+                    list.add(space).map_err(space_fail)?;
+                }
+                self.space_changed(&space);
+            }
+            "spaceChannel" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let nonce = mesh_dm::space::nonce().ok_or_else(|| space_fail("no randomness"))?;
+                let admins_post = match arg(2)? {
+                    "admins" => true,
+                    "everyone" => false,
+                    _ => return Err(Fail("bad-args", "who posts: admins or everyone".to_owned())),
+                };
+                let change = Change::ChannelCreate {
+                    nonce,
+                    name: arg(1)?.trim().to_owned(),
+                    category: None,
+                    admins_post,
+                };
+                self.space_change(&space, change)?;
+            }
+            "spaceAdd" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let who = parse_id(arg(1)?)?;
+                let store = self.store.as_ref().ok_or_else(locked)?;
+                let entry = store.account().get(&who);
+                if entry.is_none_or(|e| e.kind != mesh_identity::Kind::Friend) {
+                    return Err(Fail(
+                        "not-a-friend",
+                        "you can add only your friends".to_owned(),
+                    ));
+                }
+                if !store.room_for(&[who]) {
+                    return Err(Fail(
+                        "too-many",
+                        "that would pass the 1,000 people you can reach".to_owned(),
+                    ));
+                }
+                let display = entry
+                    .map(|e| {
+                        if e.name.is_empty() {
+                            e.nick.clone()
+                        } else {
+                            e.name.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                self.space_change(
+                    &space,
+                    Change::Add {
+                        who: who.to_bytes(),
+                        display,
+                    },
+                )?;
+            }
+            "spaceLeave" => {
+                let space = parse16(arg(0)?, "Space")?;
+                self.space_change(&space, Change::Leave)?;
+            }
+            "spaceRole" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let who = parse_id(arg(1)?)?.to_bytes();
+                let change = match arg(2)? {
+                    "admin" => Change::MakeAdmin(who),
+                    "member" => Change::Demote(who),
+                    _ => return Err(Fail("bad-args", "a role: admin or member".to_owned())),
+                };
+                self.space_change(&space, change)?;
+            }
+            "spaceSend" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let me = self.me_sender()?.person;
+                let v = self.space_mut(&space)?.version().ok_or_else(not_found)?;
+                if !v.state.may_post(&me, &channel) {
+                    return Err(not_allowed());
+                }
+                let (key, cert) = self.signing()?;
+                let body = SpaceBody::Post {
+                    channel,
+                    text: arg(2)?.to_owned(),
+                    reply_to: None,
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    everyone: false,
+                };
+                let now = unix_now() * 1000;
+                self.space_mut(&space)?
+                    .send(body, &key, &cert, now)
+                    .map_err(space_fail)?;
+                self.emit_channel(&space, &channel)?;
+                self.space_send_all(&space);
+            }
+            "spaceOpen" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                self.emit_channel(&space, &channel)?;
+            }
+            _ => return Err(Fail("unknown-fn", format!("unknown command {func}"))),
+        }
+        Ok(())
+    }
+
     fn is_peer(&self, id: &MeshId) -> bool {
         (self.store.iter()).any(|s| s.peers().iter().any(|c| c.id() == *id))
     }
@@ -190,7 +888,6 @@ impl Helper {
 
     /// Dials a peer to send them something (S14), unless they were found
     /// away less than `PEER_RETRY` ago: then it waits for mail or a hello.
-    #[expect(dead_code, reason = "Task 7's send path dials peers through this")]
     pub(super) fn dial_peer(&self, id: &MeshId) {
         if self.wire.may_look_up(id, Instant::now()) {
             self.dial_back(id, false);

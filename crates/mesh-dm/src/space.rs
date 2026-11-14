@@ -565,6 +565,18 @@ pub fn to_redo(
     out
 }
 
+/// Whether `by` may make `change` in `v` now and it would change something
+/// (S7): what a device checks before it signs one.
+pub fn would_count(space: &SpaceId, v: &SpaceState, by: &Person, change: &Change) -> bool {
+    let node = Node {
+        by: *by,
+        after: None,
+        change: change.clone(),
+        at: (0, [0; 16]),
+    };
+    apply(space, v, [0; 16], &node).is_some_and(|next| next != *v)
+}
+
 /// The state after `node`, if its sender may make that change in `v` (S7).
 fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> Option<SpaceState> {
     let role = v.role(&node.by)?;

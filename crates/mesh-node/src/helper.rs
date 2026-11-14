@@ -252,6 +252,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
             }
             _ = refresh.tick() => {
                 helper.dm_retry_all();
+                helper.space_retry_all();
                 // Renewals and the daily records round follow the collect.
                 helper.mail_refresh();
                 helper.mail_out_all();
@@ -359,6 +360,14 @@ struct Helper {
     spaces: Option<mesh_dm::space_store::SpaceList>,
     /// Space peers on the wire: idle closes, retries, the hello (S14).
     wire: spaces::PeerWire,
+    /// Spaces opened this unlock (S11), by ID.
+    space_open: HashMap<mesh_dm::space::SpaceId, mesh_dm::space_store::SpaceHistory>,
+    /// Devices with a batch of Space events in flight.
+    space_flight: HashSet<[u8; 32]>,
+    /// Devices that didn't take everything: tried again at the refresh.
+    space_retry: HashMap<[u8; 32], (MeshId, MeshAddr)>,
+    /// The channel Mesh-Voice has open.
+    space_view: Option<(mesh_dm::space::SpaceId, mesh_dm::space::ChannelId)>,
     /// When each device last said it was typing (rate limit, D10).
     typing_last: HashMap<[u8; 32], std::time::Instant>,
     /// A device link in progress (PLAN-link), and which session it is.
@@ -400,6 +409,8 @@ type Answered = (MeshId, MeshAddr, Vec<u64>, Option<Vec<bool>>);
 
 /// What a background request found out.
 enum Back {
+    /// A device answered a batch of Space events (or didn't).
+    SpaceAnswered(Box<spaces::Answered>),
     /// A peer's dial (SPEC-spaces S14) came back: whether it reached them,
     /// and whether it was a hello.
     Hello(MeshId, bool, bool),
@@ -505,6 +516,10 @@ impl Helper {
             dm_open: None,
             spaces: None,
             wire: spaces::PeerWire::new(spaces::PEER_IDLE),
+            space_open: HashMap::new(),
+            space_flight: HashSet::new(),
+            space_retry: HashMap::new(),
+            space_view: None,
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
         };
@@ -808,6 +823,7 @@ impl Helper {
             "deviceRemove" => self.remove_device(arg(0)?)?,
             "linkStart" => self.link_start()?,
             f if f.starts_with("dm") => self.dm_command(f, args)?,
+            f if f.starts_with("space") => self.space_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
             "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
             "linkCancel" => self.link_cancel()?,
@@ -1063,6 +1079,10 @@ impl Helper {
                 return;
             }
             Back::Hello(id, reached, hello) => return self.hello_back(&id, reached, hello),
+            Back::SpaceAnswered(answered) => {
+                let (id, addr, numbers, answers) = *answered;
+                return self.space_answered(id, addr, numbers, answers);
+            }
             Back::Reached(reached) => {
                 let (id, last, list) = *reached;
                 self.peer_used(&id);
@@ -1082,6 +1102,7 @@ impl Helper {
                 self.mail_records_missing(&id);
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
+                self.space_deliver(&id);
                 if promoted {
                     return self.changed(None);
                 }
@@ -1103,6 +1124,7 @@ impl Helper {
                 self.peer_heard(&id);
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
+                self.space_deliver(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
                     // with ours if it's missing something (`Back::Synced`).
@@ -1308,6 +1330,7 @@ impl Helper {
         let mut notes = Vec::new();
         let mut events = Vec::new();
         let mut synced = Vec::new();
+        let mut space_in = Vec::new();
         let (mut unknown, mut fresh) = (false, false);
         let envelopes: Vec<Vec<u8>> = frames.iter().map(|(_, e)| e.clone()).collect();
         // One save for the whole stream (PLAN-dm Task 8).
@@ -1348,6 +1371,16 @@ impl Helper {
                             continue;
                         }
                         if opened.kind == NoteKind::Message {
+                            // A Space event (SPEC-spaces): its own layout.
+                            if opened.body.first() == Some(&mesh_dm::space_store::SPACE_LAYOUT) {
+                                let own = self.store.as_ref().is_some_and(|s| s.id() == id);
+                                space_in.push(spaces::SpaceIn {
+                                    frame: i,
+                                    own,
+                                    body: opened.body,
+                                });
+                                continue;
+                            }
                             // History from another of our devices (dm D8)
                             // carries its chat, author and first arrival.
                             if opened.conversation == Conversation::Direct(id)
@@ -1394,6 +1427,13 @@ impl Helper {
         }
         if !synced.is_empty() {
             self.dm_take_synced(&device, synced, &mut answers);
+        }
+        if !space_in.is_empty() {
+            match mail {
+                // ponytail: Space mail is Task 8; until then the sender keeps it.
+                Some(_) => space_in.iter().for_each(|e| answers[e.frame] = dm::FAILED),
+                None => self.space_take(&id, &device, space_in, &mut answers),
+            }
         }
         if let Some(reply) = reply {
             let _ = reply.send(answers);
