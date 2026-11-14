@@ -121,6 +121,23 @@ fn main() {
             }
         },
     };
+    // Tests shorten how long an idle Space peer's connection stays open
+    // (SPEC-spaces S14).
+    let peer_idle = match args.windows(2).find(|w| w[0] == "--peer-idle") {
+        None => helper::PEER_IDLE,
+        Some(w) => match w[1].parse::<u64>() {
+            Ok(secs) if (1..=helper::PEER_IDLE.as_secs()).contains(&secs) => {
+                std::time::Duration::from_secs(secs)
+            }
+            _ => {
+                eprintln!(
+                    "mesh-node: --peer-idle takes 1 to {} seconds",
+                    helper::PEER_IDLE.as_secs()
+                );
+                std::process::exit(2);
+            }
+        },
+    };
     let relays = Relays::Custom(if relays.is_empty() {
         default_relays()
     } else {
@@ -192,6 +209,7 @@ fn main() {
         }
         let options = helper::Options {
             record_ttl,
+            peer_idle,
             cut,
             holders,
             crash_at_records: args

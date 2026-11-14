@@ -281,6 +281,24 @@ impl Node {
             .collect()
     }
 
+    /// Open connections, to anyone.
+    pub fn open_connections(&self) -> usize {
+        (lock(&self.shared.conns).values())
+            .filter(|(_, conn)| conn.close_reason().is_none())
+            .count()
+    }
+
+    /// Closes every connection with `id`'s devices as idle, not as a
+    /// refusal: they may dial again when they next have something to say.
+    pub fn close_idle(&self, id: &MeshId) {
+        lock(&self.shared.conns).retain(|_, (peer, conn)| {
+            if peer.id == *id {
+                conn.close(IDLE.into(), b"idle");
+            }
+            peer.id != *id
+        });
+    }
+
     /// Closes every connection with `id`'s devices (they were removed).
     pub fn disconnect(&self, id: &MeshId) {
         lock(&self.shared.conns).retain(|_, (peer, conn)| {

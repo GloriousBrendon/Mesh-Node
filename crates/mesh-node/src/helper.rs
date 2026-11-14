@@ -68,6 +68,7 @@ use social::{
     COLLECT_EVERY, Collected, PRESENCE, PRESENCE_SILENCE, Presence, SYNC, SYNC_TIMEOUT,
     push_account,
 };
+pub use spaces::PEER_IDLE;
 
 const KEYSTORE_FILE: &str = "identity.mks";
 /// How long a new home relay must hold before records go out for it.
@@ -183,6 +184,8 @@ pub struct Cut {
 /// The helper's flags beyond its relays and seeds.
 pub struct Options {
     pub record_ttl: u64,
+    /// `--peer-idle`: how long an idle Space peer's connection stays open.
+    pub peer_idle: Duration,
     pub cut: Cut,
     /// `--holder` or `MESH_HOLDERS`: the tickets of who keeps our mail
     /// (SPEC-mailbox), each with its `&mail=` token if it has one.
@@ -196,6 +199,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     let (back, mut answers) = tokio::sync::mpsc::unbounded_channel();
     let mut helper = Helper::new(dir.join(KEYSTORE_FILE), relays, seeds, back);
     helper.record_ttl = options.record_ttl;
+    helper.wire = spaces::PeerWire::new(options.peer_idle);
     helper.holders = options.holders;
     helper.cut_live = options.cut.live;
     helper.crash_at_records = options.crash_at_records;
@@ -224,6 +228,10 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     refresh.tick().await;
     let mut collect = tokio::time::interval(COLLECT_EVERY);
     collect.tick().await;
+    let mut peers = tokio::time::interval(
+        (helper.wire.idle() / 2).clamp(Duration::from_millis(500), spaces::PEER_TICK),
+    );
+    peers.tick().await;
     loop {
         let mut line = tokio::select! {
             line = lines.recv() => match line {
@@ -255,6 +263,10 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
             }
             _ = collect.tick() => {
                 helper.collect();
+                continue;
+            }
+            _ = peers.tick() => {
+                helper.peer_tick();
                 continue;
             }
         };
@@ -345,6 +357,8 @@ struct Helper {
     dm_open: Option<mesh_dm::Where>,
     /// The Spaces this device is in, opened at unlock (SPEC-spaces S11).
     spaces: Option<mesh_dm::space_store::SpaceList>,
+    /// Space peers on the wire: idle closes, retries, the hello (S14).
+    wire: spaces::PeerWire,
     /// When each device last said it was typing (rate limit, D10).
     typing_last: HashMap<[u8; 32], std::time::Instant>,
     /// A device link in progress (PLAN-link), and which session it is.
@@ -386,6 +400,9 @@ type Answered = (MeshId, MeshAddr, Vec<u64>, Option<Vec<bool>>);
 
 /// What a background request found out.
 enum Back {
+    /// A peer's dial (SPEC-spaces S14) came back: whether it reached them,
+    /// and whether it was a hello.
+    Hello(MeshId, bool, bool),
     /// Each code, and the best answer any seed gave (`None`: none answered).
     Held(Vec<(FriendCode, Option<Hold>)>),
     /// The home relay changed (or came up): records go out again.
@@ -487,6 +504,7 @@ impl Helper {
             dm_retry: HashMap::new(),
             dm_open: None,
             spaces: None,
+            wire: spaces::PeerWire::new(spaces::PEER_IDLE),
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
         };
@@ -1044,8 +1062,10 @@ impl Helper {
                 }
                 return;
             }
+            Back::Hello(id, reached, hello) => return self.hello_back(&id, reached, hello),
             Back::Reached(reached) => {
                 let (id, last, list) = *reached;
+                self.peer_used(&id);
                 if let Some(store) = self.store.as_mut()
                     && let Some(last) = last
                     && let Err(e) = store.contact_reached(&id, last, list.as_ref())
@@ -1080,6 +1100,7 @@ impl Helper {
             Back::MailPut(at) => return self.mail.put_at = at,
             Back::MailPutDone(taken) => return self.mail_put_done(taken),
             Back::Connected(id) => {
+                self.peer_heard(&id);
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
