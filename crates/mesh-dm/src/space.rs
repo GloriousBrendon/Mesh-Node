@@ -4,7 +4,7 @@
 //! can tell who wrote it without asking them (history, S10). Its own layout,
 //! not dm's `Event`, so group DMs' formats don't change.
 
-use mesh_identity::{DeviceCert, DeviceKey, verify_device_bytes};
+use mesh_identity::{DeviceCert, DeviceKey, DeviceList, VerifyingKey, verify_device_bytes};
 use serde::{Deserialize, Serialize};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -696,6 +696,68 @@ fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> O
     Some(next)
 }
 
+/// Why a Space event doesn't count (S5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The certificate isn't its author's ID's, or the signature isn't the
+    /// device's.
+    BadSignature,
+    /// Live: the device isn't on its author's current device list.
+    NotCurrentDevice,
+    /// Not a member: now (live), or in any version on the line (history).
+    NotMember,
+    /// May not post in that channel: now (live), or in any version on the
+    /// line (history).
+    MayNotPost,
+}
+
+/// The channel a body posts or edits in: these need the right to post.
+fn posting_in(body: &SpaceBody) -> Option<&ChannelId> {
+    match body {
+        SpaceBody::Post { channel, .. } | SpaceBody::Edit { channel, .. } => Some(channel),
+        _ => None,
+    }
+}
+
+/// An event straight from its author, or by mail (S5, live): the device is
+/// on the author's current list, and the author is a member who may post
+/// there now. A change's own rights are the chain's to judge.
+pub fn check_live(e: &SpaceEvent, list: &DeviceList, v: &SpaceVersion) -> Result<Sender, Refused> {
+    let author = e.author().ok_or(Refused::BadSignature)?;
+    let device = VerifyingKey::from_bytes(&author.device).map_err(|_| Refused::BadSignature)?;
+    if list.root().to_bytes() != author.person || !list.is_current(&device) {
+        return Err(Refused::NotCurrentDevice);
+    }
+    if matches!(e.body, SpaceBody::Change(_)) {
+        return Ok(author);
+    }
+    if !v.state.members.contains_key(&author.person) {
+        return Err(Refused::NotMember);
+    }
+    if posting_in(&e.body).is_some_and(|c| !v.state.may_post(&author.person, c)) {
+        return Err(Refused::MayNotPost);
+    }
+    Ok(author)
+}
+
+/// An event passed on by another member (S5, history): the certificate
+/// and signature check, the author was a member in some version on the
+/// line, and could post in that channel in some version on it.
+pub fn check_history(e: &SpaceEvent, v: &SpaceVersion) -> Result<Sender, Refused> {
+    let author = e.author().ok_or(Refused::BadSignature)?;
+    if matches!(e.body, SpaceBody::Change(_)) {
+        return Ok(author);
+    }
+    if !v.ever_members.contains(&author.person) {
+        return Err(Refused::NotMember);
+    }
+    let could_post = |c: &ChannelId| v.posters.get(c).is_some_and(|p| p.contains(&author.person));
+    if posting_in(&e.body).is_some_and(|c| !could_post(c)) {
+        return Err(Refused::MayNotPost);
+    }
+    Ok(author)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1238,6 +1300,123 @@ pub(crate) mod tests {
                 back.add(id, by, change, at);
             }
             assert_eq!(back.version(&space()), c.version(&space()));
+        }
+    }
+
+    mod checks {
+        use super::super::*;
+        use super::Someone;
+
+        /// O owns a Space with `#general` (open) and `#news` (admins post),
+        /// and has added `m`, a plain member, and `a`, made admin then
+        /// demoted: the line those checks read.
+        fn space(
+            o: &Someone,
+            m: &Someone,
+            a: &Someone,
+        ) -> (SpaceId, ChannelId, ChannelId, SpaceVersion) {
+            let nonce = [7; 16];
+            let id = space_id(&o.id(), &nonce);
+            let (general, news) = (part_id(&id, &[1; 16]), part_id(&id, &[2; 16]));
+            let steps = [
+                Change::Create {
+                    name: "club".into(),
+                    nonce,
+                    display: "o".into(),
+                },
+                Change::ChannelCreate {
+                    nonce: [1; 16],
+                    name: "general".into(),
+                    category: None,
+                    admins_post: false,
+                },
+                Change::ChannelCreate {
+                    nonce: [2; 16],
+                    name: "news".into(),
+                    category: None,
+                    admins_post: true,
+                },
+                Change::Add {
+                    who: m.id(),
+                    display: "m".into(),
+                },
+                Change::Add {
+                    who: a.id(),
+                    display: "a".into(),
+                },
+                Change::MakeAdmin(a.id()),
+                Change::Demote(a.id()),
+            ];
+            let mut chain = Chain::default();
+            for (i, change) in steps.into_iter().enumerate() {
+                let i = i as u8 + 1;
+                let after = (i > 1).then_some([i - 1; 16]);
+                let at = (u64::from(i), [i; 16]);
+                chain.add([i; 16], o.id(), SpaceChange { after, change }, at);
+            }
+            (id, general, news, chain.version(&id).unwrap())
+        }
+
+        fn post(channel: ChannelId, text: &str) -> SpaceBody {
+            SpaceBody::Post {
+                channel,
+                text: text.into(),
+                reply_to: None,
+                attachments: vec![],
+                mentions: vec![],
+                everyone: false,
+            }
+        }
+
+        fn list(who: &Someone) -> DeviceList {
+            DeviceList::first(&who.root, who.cert.clone()).unwrap()
+        }
+
+        /// Test 4: a removed device's lines are refused live but taken in
+        /// history, and so are a departed author's.
+        #[test]
+        fn history_outlives_a_removed_device_and_a_departure() {
+            let (o, m, a) = (Someone::new(), Someone::new(), Someone::new());
+            let (id, general, _, v) = space(&o, &m, &a);
+            let old = m.event(id, 50, 50, post(general, "from the old laptop"));
+            let second = Someone::with_root(mesh_identity::RootKey::from_secret_bytes(
+                *m.root.secret_bytes(),
+            ));
+            let new = second.event(id, 51, 51, post(general, "from the new one"));
+            let both = list(&m).with_device(&m.root, second.cert.clone()).unwrap();
+            let now = both.without_device(&m.root, &m.device.public()).unwrap();
+            assert_eq!(check_live(&old, &now, &v), Err(Refused::NotCurrentDevice));
+            assert_eq!(check_live(&new, &now, &v).map(|s| s.person), Ok(m.id()));
+            assert_eq!(check_history(&old, &v).map(|s| s.person), Ok(m.id()));
+            assert_eq!(check_history(&new, &v).map(|s| s.person), Ok(m.id()));
+            // m leaves: their lines still count in history.
+            let mut left = v.clone();
+            left.state.members.remove(&m.id());
+            assert_eq!(check_live(&new, &now, &left), Err(Refused::NotMember));
+            assert_eq!(check_history(&old, &left).map(|s| s.person), Ok(m.id()));
+        }
+
+        /// Test 5: an altered line, and a never-admin's line in an
+        /// admins-post-only channel, are refused in history.
+        #[test]
+        fn history_cant_be_forged() {
+            let (o, m, a) = (Someone::new(), Someone::new(), Someone::new());
+            let (id, general, news, v) = space(&o, &m, &a);
+            let mut altered = o.event(id, 50, 50, post(general, "hello"));
+            altered.body = post(general, "goodbye");
+            assert_eq!(check_history(&altered, &v), Err(Refused::BadSignature));
+            let forged = m.event(id, 51, 51, post(news, "official"));
+            assert_eq!(check_history(&forged, &v), Err(Refused::MayNotPost));
+            assert_eq!(check_live(&forged, &list(&m), &v), Err(Refused::MayNotPost));
+            // The known limit: once an admin, they could post there, so a
+            // line of theirs dated any time is taken.
+            let once = a.event(id, 52, 52, post(news, "back-dated"));
+            assert_eq!(check_history(&once, &v).map(|s| s.person), Ok(a.id()));
+            assert_eq!(check_live(&once, &list(&a), &v), Err(Refused::MayNotPost));
+            // And a stranger's line is refused either way.
+            let stranger = Someone::new();
+            let theirs = stranger.event(id, 53, 53, post(general, "hi"));
+            assert_eq!(check_history(&theirs, &v), Err(Refused::NotMember));
         }
     }
 }
