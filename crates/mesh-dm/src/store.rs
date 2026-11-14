@@ -128,6 +128,11 @@ impl Store {
 }
 
 impl ChatFiles {
+    /// The folder these files are in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// How many segment files the chat has.
     pub fn segments(&self) -> u32 {
         self.segments

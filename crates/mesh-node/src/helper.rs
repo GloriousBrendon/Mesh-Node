@@ -62,6 +62,8 @@ mod mail;
 mod mailrec;
 #[path = "social.rs"]
 mod social;
+#[path = "spaces.rs"]
+mod spaces;
 use social::{
     COLLECT_EVERY, Collected, PRESENCE, PRESENCE_SILENCE, Presence, SYNC, SYNC_TIMEOUT,
     push_account,
@@ -341,6 +343,8 @@ struct Helper {
     /// The chat open on screen (`dmOpen`), which gets its page again when
     /// it changes; others get a note.
     dm_open: Option<mesh_dm::Where>,
+    /// The Spaces this device is in, opened at unlock (SPEC-spaces S11).
+    spaces: Option<mesh_dm::space_store::SpaceList>,
     /// When each device last said it was typing (rate limit, D10).
     typing_last: HashMap<[u8; 32], std::time::Instant>,
     /// A device link in progress (PLAN-link), and which session it is.
@@ -482,6 +486,7 @@ impl Helper {
             dm_flight: HashSet::new(),
             dm_retry: HashMap::new(),
             dm_open: None,
+            spaces: None,
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
         };
@@ -1410,7 +1415,9 @@ impl Helper {
         let list = if opened.sender == store.id() {
             Some(store.devices().clone())
         } else {
-            store.contact(&opened.sender).and_then(|c| c.devices())
+            store
+                .reachable_contact(&opened.sender)
+                .and_then(|c| c.devices())
         };
         let device = list.and_then(|l| {
             let cert = l.devices().iter().find(|d| *d.device() == opened.device)?;
@@ -1569,6 +1576,7 @@ impl Helper {
             .inspect_err(|e| eprintln!("mesh-node: end-to-end encryption didn't start: {e}"))
             .ok();
         self.open_dm();
+        self.open_spaces();
         let Some(store) = &self.store else { return };
         let this = store.device_key().public();
         let Some(cert) = store
@@ -1690,7 +1698,7 @@ impl Helper {
                 store.id().to_bytes(),
                 revoked(Some(store.devices().clone())),
             ))
-            .chain((store.contacts().iter()).map(|c| (c.id().to_bytes(), revoked(c.devices()))))
+            .chain((store.reachable()).map(|c| (c.id().to_bytes(), revoked(c.devices()))))
         });
         // `--cut live`: our own devices still connect; contacts don't.
         let ids = ids.take(if self.cut_live { 1 } else { usize::MAX });

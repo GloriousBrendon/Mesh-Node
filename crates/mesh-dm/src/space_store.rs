@@ -160,17 +160,22 @@ impl SpaceHistory {
                 }
             }
         }
-        for n in 0..history.change_files.segments() {
-            for record in history.change_files.read(n)? {
-                let stored: Stored = read("a Space change", &record)?;
-                let event = SpaceEvent::from_bytes(&stored.event)?;
-                if let SpaceBody::Change(change) = event.body {
-                    let at = (event.seq, event.id);
-                    history.chain.add(event.id, stored.person, change, at);
-                }
-            }
-        }
+        read_changes(&mut history.change_files, &mut history.chain)?;
         Ok(history)
+    }
+
+    /// A Space's chain alone, without its log or any channel: what unlock
+    /// reads to work out the peers (S2 as changed, plan Task 5).
+    pub fn read_chain(
+        root: &Path,
+        data_key: &[u8; 32],
+        space: &SpaceId,
+    ) -> Result<Chain, HistoryError> {
+        let store = Store::new(&space_dir(root, data_key, space), data_key);
+        let mut files = store.open(&CHANGES)?;
+        let mut chain = Chain::default();
+        read_changes(&mut files, &mut chain)?;
+        Ok(chain)
     }
 
     /// The Space as its winning line leaves it; `None` before its creation.
@@ -295,6 +300,20 @@ impl SpaceHistory {
         self.channels.insert(*channel, (files, view));
         Ok(())
     }
+}
+
+/// Every stored change into `chain`.
+fn read_changes(files: &mut ChatFiles, chain: &mut Chain) -> Result<(), HistoryError> {
+    for n in 0..files.segments() {
+        for record in files.read(n)? {
+            let stored: Stored = read("a Space change", &record)?;
+            let event = SpaceEvent::from_bytes(&stored.event)?;
+            if let SpaceBody::Change(change) = event.body {
+                chain.add(event.id, stored.person, change, (event.seq, event.id));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn channel_of(body: &SpaceBody) -> Option<ChannelId> {
@@ -456,6 +475,34 @@ mod tests {
         assert_eq!(served, m.events[2..]);
         assert!(served.iter().all(|e| e.author().is_some()));
         assert_eq!(back.events(None).unwrap(), m.events[..2]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_chain_reads_without_the_log_or_channels() {
+        let root = dir("chain");
+        let m = made();
+        let me = sender(&m.o);
+        let mut h = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        for e in &m.events {
+            h.store(e, me, NOW, NOW).unwrap();
+        }
+        let version = h.version();
+        drop(h);
+        // Take away the log and the channel: the chain still reads.
+        let store = Store::new(&space_dir(&root, &KEY, &m.space), &KEY);
+        let gone = [
+            store.open_log().unwrap(),
+            store.open(&channel_key(&m.space, &m.general)).unwrap(),
+        ];
+        for files in gone {
+            std::fs::remove_dir_all(files.dir()).unwrap();
+        }
+        let chain = SpaceHistory::read_chain(&root, &KEY, &m.space).unwrap();
+        assert_eq!(chain.version(&m.space), version);
+        // A Space never stored here has an empty chain.
+        let none = SpaceHistory::read_chain(&root, &KEY, &[3; 16]).unwrap();
+        assert_eq!(none.version(&[3; 16]), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

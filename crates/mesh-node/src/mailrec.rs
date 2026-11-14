@@ -242,7 +242,7 @@ impl Helper {
             Ok(field) => field,
             Err(e) => return eprintln!("mesh-node: couldn't make e2ee keys: {e}"),
         };
-        let ids = std::iter::once(store.id()).chain(store.contacts().iter().map(|c| c.id()));
+        let ids = std::iter::once(store.id()).chain(store.reachable().map(|c| c.id()));
         let records: Vec<Vec<u8>> = ids
             .filter(|id| only.is_none_or(|only| only == id))
             .filter_map(|id| {
@@ -301,7 +301,7 @@ impl Helper {
             return;
         };
         // Our own other devices' records too, under the self pair.
-        let ids: Vec<MeshId> = (store.contacts().iter().map(|c| c.id()))
+        let ids: Vec<MeshId> = (store.reachable().map(|c| c.id()))
             .chain([store.id()])
             .filter(|id| only.is_none_or(|only| only == id))
             .filter(|id| !self.mail.reading.contains(id))

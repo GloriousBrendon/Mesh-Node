@@ -404,7 +404,7 @@ impl Helper {
     /// Mails what waits for every contact and our own other devices.
     pub(super) fn mail_out_all(&mut self) {
         let ids: Vec<MeshId> = (self.store.iter())
-            .flat_map(|s| s.contacts().iter().map(|c| c.id()).chain([s.id()]))
+            .flat_map(|s| s.reachable().map(|c| c.id()).chain([s.id()]))
             .collect();
         for id in ids {
             self.mail_out(&id);
@@ -499,7 +499,7 @@ impl Helper {
         };
         let (me, device) = (store.id(), store.device_key().public());
         let ids: Vec<MeshId> = std::iter::once(me)
-            .chain(store.contacts().iter().map(|c| c.id()))
+            .chain(store.reachable().map(|c| c.id()))
             .filter(|id| only.is_none_or(|only| only == id))
             .collect();
         let mut out = Vec::new();
@@ -828,7 +828,7 @@ impl Helper {
             let list = if id == store.id() {
                 Some(store.devices().clone())
             } else {
-                store.contact(&id).and_then(|c| c.devices())
+                store.reachable_contact(&id).and_then(|c| c.devices())
             };
             // Without their list, the devices e2ee holds keys for.
             let known: HashSet<[u8; 32]> = match (&list, &self.e2ee) {
@@ -969,7 +969,7 @@ impl Helper {
         }
         // Now what waited for the collect goes live.
         let ids: Vec<MeshId> = (self.store.iter())
-            .flat_map(|s| std::iter::once(s.id()).chain(s.contacts().iter().map(|c| c.id())))
+            .flat_map(|s| std::iter::once(s.id()).chain(s.reachable().map(|c| c.id())))
             .collect();
         for id in ids {
             self.dm_deliver(&id);

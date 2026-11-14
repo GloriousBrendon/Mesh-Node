@@ -37,6 +37,8 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use std::collections::HashSet;
+
 use crate::account::{Account, Entry, Kind, Status};
 use crate::code::{ActiveCode, CodeError, CodeRevoke, FriendCode, HeldCode};
 use crate::contacts::{Contact, LastAddr, MAX_CONTACTS, clean_name};
@@ -319,6 +321,8 @@ pub struct Keystore {
     codes: Vec<ActiveCode>,
     contacts: Vec<Contact>,
     account: Account,
+    /// Space members who aren't contacts: never saved (SPEC-spaces S2).
+    peers: Vec<Contact>,
 }
 
 impl Keystore {
@@ -381,6 +385,7 @@ impl Keystore {
             devices,
             codes: Vec::new(),
             contacts: Vec::new(),
+            peers: Vec::new(),
             account: Account::default(),
         };
         store.save()?;
@@ -423,6 +428,7 @@ impl Keystore {
             devices,
             codes: contents.codes.clone(),
             contacts,
+            peers: Vec::new(),
             account,
         };
         store.adopt_contacts();
@@ -747,6 +753,68 @@ impl Keystore {
         self.contacts.iter().find(|c| c.id() == *id)
     }
 
+    /// Members of the Spaces held who aren't contacts (SPEC-spaces S2), in
+    /// memory only: the caller works them out again after each unlock.
+    pub fn peers(&self) -> &[Contact] {
+        &self.peers
+    }
+
+    /// A contact or a peer: what routing needs to reach `id`.
+    pub fn reachable_contact(&self, id: &MeshId) -> Option<&Contact> {
+        self.contact(id)
+            .or_else(|| self.peers.iter().find(|c| c.id() == *id))
+    }
+
+    /// Contacts, then peers: who routing, mail and the handshake reach.
+    pub fn reachable(&self) -> impl Iterator<Item = &Contact> {
+        self.contacts.iter().chain(&self.peers)
+    }
+
+    /// Replaces the peers with `ids`, less ourselves, contacts and blocks,
+    /// keeping each one's route if they were already a peer. Refused, and
+    /// nothing changed, past `MAX_CONTACTS` with the contacts.
+    pub fn set_peers(
+        &mut self,
+        ids: impl IntoIterator<Item = MeshId>,
+    ) -> Result<(), KeystoreError> {
+        let mut seen = HashSet::new();
+        let ids: Vec<MeshId> = ids
+            .into_iter()
+            .filter(|id| self.is_peer_candidate(id) && seen.insert(*id))
+            .collect();
+        if self.contacts.len() + ids.len() > MAX_CONTACTS {
+            return Err(KeystoreError::TooManyContacts);
+        }
+        let mut old = std::mem::take(&mut self.peers);
+        self.peers = ids
+            .into_iter()
+            .map(|id| match old.iter().position(|c| c.id() == id) {
+                Some(at) => old.swap_remove(at),
+                None => Contact::new(id, String::new(), unix_now()),
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Whether `ids` fit under `MAX_CONTACTS` with the contacts and peers,
+    /// each person counted once.
+    pub fn room_for(&self, ids: &[MeshId]) -> bool {
+        let known =
+            |id: &MeshId| self.contact(id).is_some() || self.peers.iter().any(|c| c.id() == *id);
+        let mut seen = HashSet::new();
+        let new = ids
+            .iter()
+            .filter(|id| **id != self.id() && !known(id) && seen.insert(**id))
+            .count();
+        self.contacts.len() + self.peers.len() + new <= MAX_CONTACTS
+    }
+
+    fn is_peer_candidate(&self, id: &MeshId) -> bool {
+        *id != self.id()
+            && self.contact(id).is_none()
+            && self.account.kind(id) != Some(Kind::Blocked)
+    }
+
     /// Who you know (SPEC-social D8).
     pub fn account(&self) -> &Account {
         &self.account
@@ -765,7 +833,7 @@ impl Keystore {
             Some(Kind::Incoming) => return self.accept(&id),
             _ => {}
         }
-        if self.contacts.len() >= MAX_CONTACTS {
+        if !self.room_for(&[id]) {
             return Err(KeystoreError::TooManyContacts);
         }
         // A weak key could never be reached; refuse it up front.
@@ -801,7 +869,7 @@ impl Keystore {
         if self.account.kind(id) != Some(Kind::Incoming) {
             return Err(KeystoreError::NoRequest);
         }
-        if self.contacts.len() >= MAX_CONTACTS {
+        if !self.room_for(&[*id]) {
             return Err(KeystoreError::TooManyContacts);
         }
         self.set_kind(id, Kind::Friend, |_| {})
@@ -943,6 +1011,11 @@ impl Keystore {
                 }
             }
         }
+        // A peer who's now a contact, or blocked, isn't a peer. One who stops
+        // being a contact comes back when the caller next sets the peers.
+        let blocked = |id: &MeshId| account.kind(id) == Some(Kind::Blocked);
+        self.peers
+            .retain(|p| !reachable(&p.id()) && !blocked(&p.id()));
     }
 
     /// This device, as the tie-breaker in account stamps.
@@ -958,6 +1031,11 @@ impl Keystore {
         last: LastAddr,
         list: Option<&DeviceList>,
     ) -> Result<(), KeystoreError> {
+        // A peer's route lives in memory only (SPEC-spaces S2).
+        if let Some(peer) = self.peer_mut(id) {
+            peer.reached(last, list, unix_now());
+            return Ok(());
+        }
         self.contact_mut(id)?.reached(last, list, unix_now());
         self.save()
     }
@@ -972,6 +1050,10 @@ impl Keystore {
             .iter_mut()
             .find(|c| c.id() == *id)
             .ok_or(KeystoreError::NotAContact)
+    }
+
+    fn peer_mut(&mut self, id: &MeshId) -> Option<&mut Contact> {
+        self.peers.iter_mut().find(|c| c.id() == *id)
     }
 }
 
@@ -1389,6 +1471,71 @@ mod tests {
         )));
         drop(restored);
         assert!(Keystore::unlock(&laptop, "Brendon", PASSWORD).is_ok());
+    }
+
+    /// Space members (SPEC-spaces S2 as changed 2026-11-14): worked out by
+    /// the caller, held here in memory beside the contacts, never saved.
+    #[test]
+    fn peers_are_worked_out_beside_the_contacts() {
+        let path = temp_path("peers");
+        let mut store = create(&path);
+        let friend = RootKey::generate().unwrap().id();
+        let blocked = RootKey::generate().unwrap().id();
+        let peer = RootKey::generate().unwrap().id();
+        store.add_contact(friend, "Alex").unwrap();
+        store.block(&blocked).unwrap();
+        let me = store.id();
+        store.set_peers([me, friend, blocked, peer, peer]).unwrap();
+        // Less ourselves, contacts and blocks, once each.
+        let peers: Vec<MeshId> = store.peers().iter().map(|c| c.id()).collect();
+        assert_eq!(peers, [peer]);
+        let reachable: Vec<MeshId> = store.reachable().map(|c| c.id()).collect();
+        assert_eq!(reachable, [friend, peer]);
+        // Not a contact, so social sees nothing new.
+        assert!(store.contact(&peer).is_none());
+        assert_eq!(store.account().kind(&peer), None);
+        // Reaching one keeps its route while it stays a peer.
+        let last = LastAddr {
+            device: [9; 32],
+            relay: "https://relay.example/".into(),
+        };
+        store.contact_reached(&peer, last.clone(), None).unwrap();
+        store.set_peers([peer]).unwrap();
+        assert_eq!(store.peers()[0].last, Some(last));
+        // Never saved: after a lock, there are none until worked out again.
+        drop(store);
+        let store = Keystore::unlock(&path, "Brendon", PASSWORD).unwrap();
+        assert!(store.peers().is_empty());
+    }
+
+    /// `MAX_CONTACTS` counts contacts and peers together, once per person.
+    #[test]
+    fn contacts_and_peers_share_one_cap() {
+        let path = temp_path("peer-cap");
+        let mut store = create(&path);
+        let friend = RootKey::generate().unwrap().id();
+        store.add_contact(friend, "").unwrap();
+        let many: Vec<MeshId> = (0..MAX_CONTACTS - 1)
+            .map(|_| RootKey::generate().unwrap().id())
+            .collect();
+        assert!(store.room_for(&many));
+        let one_more = RootKey::generate().unwrap().id();
+        let too_many: Vec<MeshId> = many.iter().copied().chain([one_more]).collect();
+        assert!(!store.room_for(&too_many));
+        // A friend already counted isn't counted twice.
+        let with_friend: Vec<MeshId> = many.iter().copied().chain([friend]).collect();
+        assert!(store.room_for(&with_friend));
+        store.set_peers(many.iter().copied()).unwrap();
+        assert!(matches!(
+            store.set_peers(too_many.iter().copied()),
+            Err(KeystoreError::TooManyContacts)
+        ));
+        assert_eq!(store.peers().len(), MAX_CONTACTS - 1, "kept as it was");
+        // And a new contact can't push past it either.
+        assert!(matches!(
+            store.add_contact(one_more, ""),
+            Err(KeystoreError::TooManyContacts)
+        ));
     }
 
     #[test]

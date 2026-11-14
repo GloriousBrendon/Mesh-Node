@@ -29,7 +29,7 @@ pub fn records(
     only: Option<&MeshId>,
     mut field: impl FnMut(&MeshId) -> Vec<u8>,
 ) -> Vec<Vec<u8>> {
-    let ids = store.contacts().iter().map(|c| c.id());
+    let ids = store.reachable().map(|c| c.id());
     std::iter::once(store.id())
         .chain(ids)
         .filter(|id| only.is_none_or(|only| only == id))
@@ -74,7 +74,7 @@ pub struct Target {
 
 impl Target {
     pub fn of(store: &Keystore, id: &MeshId) -> Option<Self> {
-        let contact = store.contact(id)?;
+        let contact = store.reachable_contact(id)?;
         Some(Self {
             id: *id,
             keys: store.pair_keys(id)?,
