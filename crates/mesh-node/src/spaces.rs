@@ -13,20 +13,33 @@ use mesh_identity::MeshId;
 
 use mesh_dm::Sender;
 use mesh_dm::chat::Taken;
+use mesh_dm::space::SpaceEvent;
 use mesh_dm::space::{
     Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, space_id, would_count,
 };
-use mesh_dm::space_store::{from_member, from_own, to_member, to_own};
+use mesh_dm::space_store::{
+    SPACE_BATCH, from_batch, from_member, from_own, to_batch, to_member, to_own,
+};
 use mesh_e2ee::Kind as NoteKind;
-use mesh_identity::{DeviceCert, DeviceKey};
+use mesh_e2ee::{MAIL, MailHead, seal_mail};
+use mesh_identity::{DeviceCert, DeviceKey, VerifyingKey};
 use mesh_transport::MeshAddr;
 use serde_json::{Value, json};
 
-use super::{Back, Fail, Helper, Reached, Target, dm, e2ee, emit, parse_id, routing, unix_now};
+use super::{
+    Back, Fail, Helper, Reached, Target, dm, e2ee, emit, mail, parse_id, routing, unix_now,
+};
 
 /// A device's answer to a batch of Space events: who, which device, each
 /// event's Space and number, and the answers (none if it didn't answer).
 pub(super) type Answered = (MeshId, MeshAddr, Vec<(SpaceId, u64)>, Option<Vec<bool>>);
+
+/// One piece of Space mail: the reader device and its `mseq`.
+pub(super) type MailPut = ([u8; 32], u64);
+/// One holder list's sealed Space mail, and which pieces they are.
+type HolderPuts = (Vec<Vec<u8>>, Vec<MailPut>);
+/// What each piece of Space mail in flight carries, by `MailPut`.
+pub(super) type MailSent = HashMap<MailPut, Vec<(SpaceId, u64)>>;
 
 /// Spaces one account may be in (SPEC-spaces *Limits*).
 pub(super) const SPACES_PER_ACCOUNT: usize = 10;
@@ -169,6 +182,12 @@ impl PeerWire {
     pub(super) fn idle(&self) -> Duration {
         self.idle
     }
+}
+
+/// Away devices in S9's order at the limit: the one mailed longest ago (or
+/// never) first, so none starves when the seed says `slow-down`.
+fn longest_ago_first(away: &mut [(MeshId, [u8; 32])], mailed: &HashMap<[u8; 32], Instant>) {
+    away.sort_by_key(|(_, d)| mailed.get(d).copied());
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
@@ -607,23 +626,28 @@ impl Helper {
         let now = unix_now() * 1000;
         let mut changed = Vec::new();
         let mut refused = 0;
+        // A mail batch (S9) is one frame with many events: unpacked here,
+        // and answered `failed` if any of them is.
+        let mut unpacked = Vec::new();
         for SpaceIn { frame, own, body } in events {
-            let read = if own {
-                from_own(&body).map(|(s, from, received, e)| (s, Some((from, received)), e))
+            let read = if body.first() == Some(&SPACE_BATCH) {
+                from_batch(&body).map(|events| {
+                    (events.into_iter())
+                        .map(|(s, e)| (s, None, e))
+                        .collect::<Vec<_>>()
+                })
+            } else if own {
+                from_own(&body).map(|(s, from, received, e)| vec![(s, Some((from, received)), e)])
             } else {
-                from_member(&body).map(|(s, e)| (s, None, e))
+                from_member(&body).map(|(s, e)| vec![(s, None, e)])
             };
-            let (space, synced, event) = match read {
-                Ok(read) => read,
-                Err(mesh_dm::history::Unread::Newer) => {
-                    answers[frame] = dm::FAILED;
-                    continue;
-                }
-                Err(_) => {
-                    refused += 1;
-                    continue;
-                }
-            };
+            match read {
+                Ok(read) => unpacked.extend(read.into_iter().map(|r| (frame, own, r))),
+                Err(mesh_dm::history::Unread::Newer) => answers[frame] = dm::FAILED,
+                Err(_) => refused += 1,
+            }
+        }
+        for (frame, own, (space, synced, event)) in unpacked {
             if event.space != space {
                 refused += 1;
                 continue;
@@ -711,6 +735,186 @@ impl Helper {
         changed.dedup();
         for space in changed {
             self.space_changed(&space);
+        }
+    }
+
+    /// Space mail (S9): for each reader device with no open connection, the
+    /// events waiting for it from every Space we share go in one envelope, at
+    /// the refresh and at lock and quit. DMs went first (`mail_out_all`);
+    /// the devices mailed longest ago go first here.
+    pub(super) fn space_mail_out(&mut self) {
+        let (Some(store), Some(net), Some(e2ee)) = (&self.store, &self.net, &self.e2ee) else {
+            return;
+        };
+        if self.cut.is_some() {
+            return;
+        }
+        let me = store.id();
+        let my_device = store.device_key().public().to_bytes();
+        // Everyone we share a Space with, and ourselves.
+        let mut people: Vec<MeshId> = vec![me];
+        let held = self.held_spaces();
+        let versions: Vec<(SpaceId, SpaceVersion)> = (held.iter())
+            .filter_map(|s| Some((*s, self.space_version(s)?)))
+            .filter(|(_, v)| v.state.members.contains_key(&me.to_bytes()))
+            .collect();
+        for (_, v) in &versions {
+            people.extend(
+                v.state
+                    .members
+                    .keys()
+                    .filter_map(|p| MeshId::from_bytes(p).ok()),
+            );
+        }
+        people.sort_by_key(|p| p.to_bytes());
+        people.dedup();
+        let mut away: Vec<(MeshId, [u8; 32])> = Vec::new();
+        for id in &people {
+            let connected: HashSet<[u8; 32]> = (net.node.connected(id).iter())
+                .map(|a| *a.device.as_bytes())
+                .collect();
+            let devices: Vec<[u8; 32]> = if *id == me {
+                (store.devices().devices().iter())
+                    .map(|c| c.device().to_bytes())
+                    .collect()
+            } else {
+                e2ee.device_keys(id)
+            };
+            away.extend(
+                (devices.into_iter())
+                    .filter(|d| !connected.contains(d) && *d != my_device)
+                    .map(|d| (*id, d)),
+            );
+        }
+        longest_ago_first(&mut away, &self.space_mailed);
+        let now = unix_now() * 1000;
+        let anon = net.anon.clone();
+        let mut puts: HashMap<Vec<String>, HolderPuts> = HashMap::new();
+        let mut missing = Vec::new();
+        for (id, device) in away {
+            let holders = self.mail.remembered.holders(&device);
+            if holders.is_empty() {
+                missing.push(id);
+                continue;
+            }
+            let own = id == me;
+            let mut waiting: Vec<(SpaceId, u64, SpaceEvent)> = Vec::new();
+            for (space, v) in &versions {
+                if !own && !v.state.members.contains_key(&id.to_bytes()) {
+                    continue;
+                }
+                let Ok(history) = self.space_mut(space) else {
+                    continue;
+                };
+                history.add_device(device, id.to_bytes());
+                let Ok(out) = history.outgoing(&device, now) else {
+                    continue;
+                };
+                for (number, from, _, event) in out {
+                    // Our own devices get by mail only what this one wrote.
+                    if self.space_marked.contains(&(device, *space, number))
+                        || (own && from.device != my_device)
+                    {
+                        continue;
+                    }
+                    waiting.push((*space, number, event));
+                }
+            }
+            if waiting.is_empty() {
+                continue;
+            }
+            let refs: Vec<(SpaceId, &SpaceEvent)> =
+                waiting.iter().map(|(s, _, e)| (*s, e)).collect();
+            let (body, n) = to_batch(&refs);
+            let (Some(store), Some(e2ee)) = (&self.store, self.e2ee.as_mut()) else {
+                return;
+            };
+            let Some(keys) = store.pair_keys(&id) else {
+                continue;
+            };
+            let Ok(reader) = VerifyingKey::from_bytes(&device) else {
+                continue;
+            };
+            let envelope = match e2ee.encrypt_device_batch(&id, &device, NoteKind::Message, &[body])
+            {
+                Ok(mut envelopes) => envelopes.remove(0),
+                Err(e) => {
+                    eprintln!("mesh-node: couldn't encrypt Space mail: {e}");
+                    continue;
+                }
+            };
+            let mseq = self.mail.next_seq(device);
+            let head = MailHead {
+                sender: my_device,
+                kind: MAIL,
+                mseq,
+            };
+            let at = mail::mail_address(&keys, &id, &reader);
+            let Ok(sealed) = seal_mail(&reader, &at, &head, &keys.mail_tag_key(), &envelope) else {
+                continue;
+            };
+            let carried: Vec<(SpaceId, u64)> =
+                waiting[..n].iter().map(|(s, num, _)| (*s, *num)).collect();
+            for (space, number) in &carried {
+                self.space_marked.insert((device, *space, *number));
+            }
+            self.space_sent.insert((device, mseq), carried);
+            self.space_mailed.insert(device, Instant::now());
+            let (sealed_puts, sent) = puts.entry(holders).or_default();
+            sealed_puts.push(sealed);
+            sent.push((device, mseq));
+        }
+        for id in missing {
+            self.mail_records_missing(&id);
+        }
+        if puts.is_empty() {
+            return;
+        }
+        let count: usize = puts.values().map(|(p, _)| p.len()).sum();
+        eprintln!("mesh-node: mailed {count} Space batches");
+        self.mail.pending.retain(|(h, _)| !h.is_finished());
+        for (holders, (sealed, sent)) in puts {
+            let (anon, back) = (anon.clone(), self.back.clone());
+            let handle = tokio::spawn(async move {
+                let took = mail::put_in_order(&anon, &holders, &sealed).await;
+                let untaken: Vec<([u8; 32], u64)> = (sent.into_iter().zip(took))
+                    .filter(|(_, took)| took.is_none())
+                    .map(|(put, _)| put)
+                    .collect();
+                if !untaken.is_empty() {
+                    let _ = back.send(Back::SpaceMailUntaken(untaken));
+                }
+                mail::Taken::default()
+            });
+            self.mail.pending.push((handle, Vec::new()));
+        }
+    }
+
+    /// Space mail no holder took: unmarked, so the refresh mails it again.
+    pub(super) fn space_mail_untaken(&mut self, untaken: Vec<([u8; 32], u64)>) {
+        for (device, mseq) in untaken {
+            for (space, number) in self.space_sent.remove(&(device, mseq)).unwrap_or_default() {
+                self.space_marked.remove(&(device, space, number));
+            }
+        }
+    }
+
+    /// A receipt's `ok` for Space mail: the events it carried are taken.
+    pub(super) fn space_mail_acked(&mut self, reader: [u8; 32], events: Vec<(SpaceId, u64)>) {
+        let mut touched = HashSet::new();
+        for (space, number) in events {
+            self.space_marked.remove(&(reader, space, number));
+            if let Ok(h) = self.space_mut(&space) {
+                h.acked(&reader, number, true);
+                touched.insert(space);
+            }
+        }
+        for space in touched {
+            if let Some(h) = self.space_open.get(&space)
+                && let Err(e) = h.save_counters()
+            {
+                eprintln!("mesh-node: couldn't save a Space's counters: {e}");
+            }
         }
     }
 
@@ -1110,5 +1314,19 @@ mod tests {
             at += Duration::from_secs(61);
         }
         assert_eq!(seen.len(), people.len());
+    }
+
+    #[test]
+    fn space_mail_goes_to_the_longest_waiting_first() {
+        let t0 = Instant::now();
+        let id = RootKey::generate().unwrap().id();
+        let mut away = vec![(id, [1; 32]), (id, [2; 32]), (id, [3; 32])];
+        let mailed = HashMap::from([
+            ([1; 32], t0 + Duration::from_secs(10)),
+            ([3; 32], t0 + Duration::from_secs(5)),
+        ]);
+        longest_ago_first(&mut away, &mailed);
+        let order: Vec<u8> = away.iter().map(|(_, d)| d[0]).collect();
+        assert_eq!(order, [2, 3, 1], "never mailed, then oldest");
     }
 }

@@ -79,7 +79,7 @@ pub(super) struct Mail {
     pub(super) marked: HashMap<([u8; 32], u64), (String, u64)>,
     /// Puts under way, which lock and quit wait for: whether the seed took
     /// them, and what they put.
-    pending: Vec<(JoinHandle<Taken>, Vec<Put>)>,
+    pub(super) pending: Vec<(JoinHandle<Taken>, Vec<Put>)>,
     /// The saved state is from a newer mesh-node: never write it.
     state_newer: bool,
     /// The unlock's collect hasn't come back: live sending waits for it.
@@ -168,7 +168,7 @@ impl Mail {
 
     /// The next `mseq` for a reader device: always higher than the last,
     /// and than any before a restart, since it starts from the clock.
-    fn next_seq(&mut self, reader: [u8; 32]) -> u64 {
+    pub(super) fn next_seq(&mut self, reader: [u8; 32]) -> u64 {
         let now = unix_now_ms();
         let seq = self.seq.entry(reader).or_insert(0);
         *seq = (*seq + 1).max(now);
@@ -181,7 +181,11 @@ fn unix_now_ms() -> u64 {
 }
 
 /// The box and slot of `reader`'s `device` for the pair `keys`, this week.
-fn mail_address(keys: &PairKeys, reader: &MeshId, device: &VerifyingKey) -> [u8; ADDRESS] {
+pub(super) fn mail_address(
+    keys: &PairKeys,
+    reader: &MeshId,
+    device: &VerifyingKey,
+) -> [u8; ADDRESS] {
     address_in(keys, reader, device, week_of(unix_now()))
 }
 
@@ -453,6 +457,7 @@ impl Helper {
             }
         }
         self.mail_out_all();
+        self.space_mail_out();
         for (put, numbers) in std::mem::take(&mut self.mail.pending) {
             match tokio::time::timeout_at(deadline, put).await {
                 Ok(Ok((taken, untaken))) => self.retake(taken, untaken),
@@ -809,6 +814,7 @@ impl Helper {
         let mut receipts_got = Vec::new();
         // Each sender device's mail, whichever box or week it was in.
         let mut by_sender: BTreeMap<([u8; 32], [u8; 32]), BySender> = BTreeMap::new();
+        let mut unknown_senders: Vec<MeshId> = Vec::new();
         for Found {
             holder,
             id,
@@ -818,8 +824,6 @@ impl Helper {
             sealed,
         } in found
         {
-            let take = [&address[..], &secret[..], &upto.to_be_bytes()].concat();
-            takes.entry(holder).or_default().push(take);
             let Some(store) = &self.store else { return };
             let Some(keys) = store.pair_keys(&id) else {
                 continue;
@@ -835,6 +839,15 @@ impl Helper {
                 (None, Some(e2ee)) => e2ee.device_keys(&id).into_iter().collect(),
                 _ => HashSet::new(),
             };
+            // Nothing known of them yet (a Space member we've never met,
+            // SPEC-spaces S9): the box stays at the holder, untaken, until
+            // their record is read; the next collect opens it.
+            if list.is_none() && known.is_empty() {
+                unknown_senders.push(id);
+                continue;
+            }
+            let take = [&address[..], &secret[..], &upto.to_be_bytes()].concat();
+            takes.entry(holder).or_default().push(take);
             let me = store.device_key().public().to_bytes();
             let mut got_receipts = Vec::new();
             for bytes in &sealed {
@@ -863,6 +876,11 @@ impl Helper {
                     .into_iter()
                     .map(|(head, body)| (id, head, body)),
             );
+        }
+        unknown_senders.sort_by_key(|id| id.to_bytes());
+        unknown_senders.dedup();
+        for id in &unknown_senders {
+            self.mail_records_missing(id);
         }
         // Olm opens each sender device's mail in its `mseq` order (M8); the
         // events wait, to go to dm all together.
@@ -1044,14 +1062,31 @@ impl Helper {
         };
         let (now, reader) = (unix_now(), head.sender);
         let mut moved = false;
+        let mut space_acks = Vec::new();
         for mseq in receipt.ok {
             if let Some(number) = self.mail.sent.remove(&(reader, mseq)) {
                 self.mail.marked.remove(&(reader, number));
                 self.mail.retry.remove(&(reader, number));
                 history.acked(&reader, number, true);
                 moved = true;
+            } else if let Some(events) = self.space_sent.remove(&(reader, mseq)) {
+                space_acks.push(events);
             }
         }
+        // Space mail not taken, or not opened, goes again at the refresh.
+        for mseq in receipt.failed.iter().chain(&receipt.cant_open) {
+            if let Some(events) = self.space_sent.remove(&(reader, *mseq)) {
+                for (space, number) in events {
+                    self.space_marked.remove(&(reader, space, number));
+                }
+            }
+        }
+        for events in space_acks {
+            self.space_mail_acked(reader, events);
+        }
+        let Some(history) = self.dm.as_mut() else {
+            return moved;
+        };
         for mseq in &receipt.failed {
             if let Some(number) = self.mail.sent.remove(&(reader, *mseq)) {
                 self.mail.marked.remove(&(reader, number));
@@ -1155,7 +1190,11 @@ pub(super) type Taken = (Vec<(Put, String)>, Vec<Put>);
 /// Puts each of `sealed` at the first of `holders` that takes it (M10): an
 /// answer other than `ok`, none within `HOLDER_WAIT`, or no connection
 /// moves it to the next. Which holder took each, if one did.
-async fn put_in_order(anon: &Node, holders: &[String], sealed: &[Vec<u8>]) -> Vec<Option<usize>> {
+pub(super) async fn put_in_order(
+    anon: &Node,
+    holders: &[String],
+    sealed: &[Vec<u8>],
+) -> Vec<Option<usize>> {
     let mut took = vec![None; sealed.len()];
     for (h, holder) in holders.iter().enumerate() {
         let left: Vec<usize> = (0..sealed.len()).filter(|i| took[*i].is_none()).collect();

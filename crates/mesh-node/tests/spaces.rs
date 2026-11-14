@@ -111,14 +111,19 @@ struct Club {
     id_c: String,
     space: String,
     general: String,
-    _seed: Seed,
+    seed: Seed,
     _relay: Relay,
 }
 
 fn club(name: &str) -> Club {
+    club_with(name, &[])
+}
+
+/// `club`, with a seed started with `seed_args`.
+fn club_with(name: &str, seed_args: &[&str]) -> Club {
     let dirs = ["seed", "o", "b", "c"].map(|n| temp_dir(&format!("{name}-{n}")));
     let relay = Relay::start();
-    let mut seed = Seed::start(&dirs[0], &relay);
+    let mut seed = Seed::start_with(&dirs[0], &relay, seed_args);
     let ticket = seed.ticket();
     let (mut o, id_o) = helper(&dirs[1], &relay, &ticket, "owen");
     let (mut b, id_b) = helper(&dirs[2], &relay, &ticket, "bea");
@@ -162,7 +167,7 @@ fn club(name: &str) -> Club {
         id_c,
         space: s,
         general,
-        _seed: seed,
+        seed,
         _relay: relay,
     }
 }
@@ -310,4 +315,56 @@ fn a_returning_member_catches_up_live() {
     eprintln!("test 12: the next line reached the returning member in {took:?}");
     assert!(took < Duration::from_secs(5), "took {took:?}");
     let _ = (k.o.quit(), k.b.quit(), k.c.quit(), &k.id_b, &k.id_c);
+}
+
+/// A seed's reported mail counts: the sum of `what` ("puts") over its
+/// report lines.
+fn seed_count(log: &[String], what: &str) -> u64 {
+    (log.iter())
+        .filter_map(|l| l.strip_prefix("mesh-node seed: last hour mail "))
+        .flat_map(|l| l.split([',', ';']))
+        .filter_map(|part| {
+            let mut words = part.split_whitespace();
+            let n = words.next()?.parse::<u64>().ok()?;
+            (words.next()? == what).then_some(n)
+        })
+        .sum()
+}
+
+/// Test 2: C is away; B posts three lines and locks; with nobody else
+/// online, C gets all three by mail, in order. B's three lines cost one put
+/// per away device, not one per line (S9).
+#[test]
+fn away_and_back_by_batched_mail() {
+    let mut k = club_with("spaces-mail", &["--mail", "--report-every", "1"]);
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(&mut k.c, "idLock", &[], "meshIdentity");
+    ask(&mut k.o, "idLock", &[], "meshIdentity");
+    for line in ["one", "two", "three"] {
+        ask(&mut k.b, "spaceSend", &[&s, &g, line], "meshSpaceMessages");
+    }
+    ask(&mut k.b, "idLock", &[], "meshIdentity");
+    k.c.send("idUnlock", &["cal", PASSWORD]);
+    for line in ["one", "two", "three"] {
+        until(&mut k.c, "meshSpaceNotify", |n| n["text"] == line);
+    }
+    let open = ask(&mut k.c, "spaceOpen", &[&s, &g], "meshSpaceMessages");
+    let texts: Vec<&str> = (open["events"].as_array().unwrap().iter())
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["one", "two", "three"]);
+    std::thread::sleep(Duration::from_secs(2));
+    let b_log = k.b.quit();
+    let _ = (k.o.quit(), k.c.quit(), &k.id_o, &k.id_b, &k.id_c);
+    let log = k.seed.stop();
+    let puts = seed_count(&log, "puts");
+    // B's three lines went as one envelope per away device (C and O), not
+    // one per line: two puts where one per line would be six.
+    let batches: Vec<&str> = (b_log.lines())
+        .filter(|l| l.contains("Space batches"))
+        .collect();
+    eprintln!(
+        "test 2: B {batches:?}; {puts} mail puts at the seed in all (receipts, and C passing the changes on, included)"
+    );
+    assert_eq!(batches, ["mesh-node: mailed 2 Space batches"], "{b_log}");
 }

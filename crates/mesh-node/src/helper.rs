@@ -256,6 +256,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
                 // Renewals and the daily records round follow the collect.
                 helper.mail_refresh();
                 helper.mail_out_all();
+                helper.space_mail_out();
                 helper.publish();
                 helper.dial_contacts();
                 helper.sync_own();
@@ -368,6 +369,13 @@ struct Helper {
     space_retry: HashMap<[u8; 32], (MeshId, MeshAddr)>,
     /// The channel Mesh-Voice has open.
     space_view: Option<(mesh_dm::space::SpaceId, mesh_dm::space::ChannelId)>,
+    /// Space mail (S9) in flight, by reader device and `mseq`: the events
+    /// each envelope carries. And what's marked as mailed, so it isn't
+    /// mailed twice; and when each device was last mailed.
+    // ponytail: in memory only; after a restart, unanswered Space mail is mailed again and readers drop the copies by event ID. Save it with the mail state if that's seen to cost.
+    space_sent: spaces::MailSent,
+    space_marked: HashSet<([u8; 32], mesh_dm::space::SpaceId, u64)>,
+    space_mailed: HashMap<[u8; 32], std::time::Instant>,
     /// When each device last said it was typing (rate limit, D10).
     typing_last: HashMap<[u8; 32], std::time::Instant>,
     /// A device link in progress (PLAN-link), and which session it is.
@@ -409,6 +417,8 @@ type Answered = (MeshId, MeshAddr, Vec<u64>, Option<Vec<bool>>);
 
 /// What a background request found out.
 enum Back {
+    /// Space mail none of the holders took: mailed again at the refresh.
+    SpaceMailUntaken(Vec<([u8; 32], u64)>),
     /// A device answered a batch of Space events (or didn't).
     SpaceAnswered(Box<spaces::Answered>),
     /// A peer's dial (SPEC-spaces S14) came back: whether it reached them,
@@ -520,6 +530,9 @@ impl Helper {
             space_flight: HashSet::new(),
             space_retry: HashMap::new(),
             space_view: None,
+            space_sent: HashMap::new(),
+            space_marked: HashSet::new(),
+            space_mailed: HashMap::new(),
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
         };
@@ -1079,6 +1092,7 @@ impl Helper {
                 return;
             }
             Back::Hello(id, reached, hello) => return self.hello_back(&id, reached, hello),
+            Back::SpaceMailUntaken(untaken) => return self.space_mail_untaken(untaken),
             Back::SpaceAnswered(answered) => {
                 let (id, addr, numbers, answers) = *answered;
                 return self.space_answered(id, addr, numbers, answers);
@@ -1372,7 +1386,10 @@ impl Helper {
                         }
                         if opened.kind == NoteKind::Message {
                             // A Space event (SPEC-spaces): its own layout.
-                            if opened.body.first() == Some(&mesh_dm::space_store::SPACE_LAYOUT) {
+                            let first = opened.body.first().copied();
+                            if first == Some(mesh_dm::space_store::SPACE_LAYOUT)
+                                || first == Some(mesh_dm::space_store::SPACE_BATCH)
+                            {
                                 let own = self.store.as_ref().is_some_and(|s| s.id() == id);
                                 space_in.push(spaces::SpaceIn {
                                     frame: i,
@@ -1429,11 +1446,7 @@ impl Helper {
             self.dm_take_synced(&device, synced, &mut answers);
         }
         if !space_in.is_empty() {
-            match mail {
-                // ponytail: Space mail is Task 8; until then the sender keeps it.
-                Some(_) => space_in.iter().for_each(|e| answers[e.frame] = dm::FAILED),
-                None => self.space_take(&id, &device, space_in, &mut answers),
-            }
+            self.space_take(&id, &device, space_in, &mut answers);
         }
         if let Some(reply) = reply {
             let _ = reply.send(answers);

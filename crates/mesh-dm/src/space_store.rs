@@ -492,6 +492,52 @@ fn event_from(bytes: &[u8]) -> Result<SpaceEvent, Unread> {
     SpaceEvent::from_bytes(bytes).map_err(|_| Unread::Garbage)
 }
 
+/// The first byte of a batch of Space events in one envelope (S9), mail's
+/// layout. Also "newer" to an engine without Spaces.
+pub const SPACE_BATCH: u8 = 3;
+/// A batch's bytes at most: under e2ee's 64 KiB envelope with room to spare.
+pub const SPACE_BATCH_MAX: usize = 56 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct Batch {
+    /// First: `SPACE_BATCH`.
+    version: u8,
+    events: Vec<(SpaceId, Vec<u8>)>,
+}
+
+/// Events for one reader device, in one body, as many as fit under
+/// `SPACE_BATCH_MAX`: the body and how many went in (the rest wait).
+pub fn to_batch(events: &[(SpaceId, &SpaceEvent)]) -> (Vec<u8>, usize) {
+    let mut batch = Batch {
+        version: SPACE_BATCH,
+        events: Vec::new(),
+    };
+    let mut size = 8;
+    for (space, event) in events {
+        let bytes = event.to_bytes().expect("checked when stored");
+        if size + bytes.len() + 24 > SPACE_BATCH_MAX && !batch.events.is_empty() {
+            break;
+        }
+        size += bytes.len() + 24;
+        batch.events.push((*space, bytes));
+    }
+    let n = batch.events.len();
+    (postcard::to_stdvec(&batch).expect("to memory"), n)
+}
+
+/// A batch's events.
+pub fn from_batch(bytes: &[u8]) -> Result<Vec<(SpaceId, SpaceEvent)>, Unread> {
+    match bytes.first() {
+        Some(&SPACE_BATCH) => {}
+        Some(&v) if crate::history::is_newer(v, SPACE_BATCH) => return Err(Unread::Newer),
+        _ => return Err(Unread::Garbage),
+    }
+    let batch: Batch = postcard::from_bytes(bytes).map_err(|_| Unread::Garbage)?;
+    (batch.events.iter())
+        .map(|(space, e)| Ok((*space, event_from(e)?)))
+        .collect()
+}
+
 /// A Space event as it goes to a member's device.
 pub fn to_member(space: &SpaceId, event: &SpaceEvent) -> Vec<u8> {
     let body = ToMember {
@@ -844,6 +890,21 @@ mod tests {
         );
         assert_eq!(crate::history::unforward(&own).err(), Some(Unread::Newer));
         assert_eq!(from_member(b"junk").err(), Some(Unread::Garbage));
+        // A batch for mail (S9), which an engine without Spaces also reads
+        // as newer.
+        let refs: Vec<(SpaceId, &SpaceEvent)> = m.events.iter().map(|e| (m.space, e)).collect();
+        let (batch, n) = to_batch(&refs);
+        assert_eq!(n, 4);
+        let back: Vec<SpaceEvent> = from_batch(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(back, m.events);
+        assert_eq!(
+            crate::history::from_friend(&batch).err(),
+            Some(Unread::Newer)
+        );
     }
 
     #[test]
