@@ -9,6 +9,7 @@ pub mod chat;
 pub mod event;
 pub mod group;
 pub mod history;
+pub mod space;
 pub mod store;
 pub mod sync;
 

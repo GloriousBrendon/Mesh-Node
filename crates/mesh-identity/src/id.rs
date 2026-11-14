@@ -146,6 +146,20 @@ pub fn verify_device(
         .is_ok()
 }
 
+/// `verify_device` with the signature as its 64 bytes, for crates that
+/// don't name the signature type.
+pub fn verify_device_bytes(
+    device: &VerifyingKey,
+    domain: &str,
+    body: &[u8],
+    signature: &[u8],
+) -> bool {
+    let Ok(bytes) = <[u8; 64]>::try_from(signature) else {
+        return false;
+    };
+    verify_device(device, domain, body, &Signature::from_bytes(&bytes))
+}
+
 fn random_signing_key() -> Result<SigningKey, getrandom::Error> {
     let mut secret = Zeroizing::new([0u8; 32]);
     getrandom::fill(secret.as_mut())?;
