@@ -10,6 +10,7 @@
 # folder and carry over deploy/.env and any local compose changes; don't
 # unpack over the old tree, which keeps files the new one deleted. The
 # project name (`name: mesh`) keeps the same seed-data volume and ticket.
+# A rented server for a second seed: what it needs is in SERVER.md.
 name: mesh
 
 x-hardened: &hardened
