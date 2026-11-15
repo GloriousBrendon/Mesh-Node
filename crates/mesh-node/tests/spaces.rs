@@ -661,3 +661,271 @@ fn a_line_after_the_add_is_told_even_from_history() {
     assert!(!told.contains(&"old news".to_owned()), "{told:?}");
     let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
 }
+
+/// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
+fn channel_named(v: &Value, name: &str) -> bool {
+    v["spaces"][0]["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == name)
+}
+
+fn changes_held(v: &Value) -> u64 {
+    v["spaces"][0]["changes"].as_u64().unwrap()
+}
+
+fn role_of(v: &Value, id: &str) -> Option<String> {
+    let ms = v["spaces"][0]["members"].as_array().unwrap();
+    (ms.iter().find(|m| m["id"] == id)).map(|m| m["role"].as_str().unwrap().to_owned())
+}
+
+/// Waits until every helper's `meshSpaces` passes `done`.
+fn all_until(hs: &mut [&mut Helper], done: impl Fn(&Value) -> bool) {
+    for h in hs.iter_mut() {
+        h.send("spaceList", &[]);
+        until(h, "meshSpaces", &done);
+    }
+}
+
+/// Test 6, every device's part: a member's forged channel, forged post in
+/// an admins-only channel and an admin's forged kick of another admin
+/// are refused by every other member; an admin's delete of C's line is
+/// gone everywhere.
+#[test]
+fn roles_hold_on_every_device() {
+    let mut k = club("spaces-roles-all");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let made = ask(
+        &mut k.o,
+        "spaceChannel",
+        &[&s, "news", "admins"],
+        "meshSpaces",
+    );
+    let news = channel(space(&made, "club"), "news");
+    all_until(&mut [&mut k.b, &mut k.c], |v| channel_named(v, "news"));
+    let held_before: Vec<u64> = [&mut k.o, &mut k.b]
+        .into_iter()
+        .map(|h| {
+            h.send("spaceList", &[]);
+            changes_held(&until(h, "meshSpaces", |_| true))
+        })
+        .collect();
+    // C, a member, with a client that skips its own checks.
+    ask(&mut k.c, "spaceForge", &["unchecked"], "meshForge");
+    ask(
+        &mut k.c,
+        "spaceChannel",
+        &[&s, "mine", "everyone"],
+        "meshSpaces",
+    );
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &news, "forged news"],
+        "meshSpaceMessages",
+    );
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "after the forgeries"],
+        "meshSpaceMessages",
+    );
+    // Each reaches O and B after the forgeries: held, and refused.
+    for (h, before) in [&mut k.o, &mut k.b].into_iter().zip(held_before) {
+        until(h, "meshSpaceNotify", |n| n["text"] == "after the forgeries");
+        h.send("spaceList", &[]);
+        let v = until(h, "meshSpaces", |_| true);
+        assert_eq!(changes_held(&v), before + 1, "the forged channel came");
+        assert!(!channel_named(&v, "mine"), "{v}");
+        assert!(!channel_texts(h, &s, &news).contains(&"forged news".to_owned()));
+    }
+    // O deletes C's line: gone on B and C too.
+    let open = ask(&mut k.o, "spaceOpen", &[&s, &g], "meshSpaceMessages");
+    let line = (open["events"].as_array().unwrap().iter())
+        .find(|e| e["text"] == "after the forgeries")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ask(
+        &mut k.o,
+        "spaceDelete",
+        &[&s, &g, &line],
+        "meshSpaceMessages",
+    );
+    for h in [&mut k.b, &mut k.c] {
+        let started = Instant::now();
+        while channel_texts(h, &s, &g).contains(&"after the forgeries".to_owned()) {
+            if started.elapsed() > Duration::from_secs(60) {
+                fail("the admin's delete never reached them");
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    // B and C admins; B's forged kick of C, an admin, counts nowhere.
+    ask(&mut k.o, "spaceRole", &[&s, &k.id_b, "admin"], "meshSpaces");
+    ask(&mut k.o, "spaceRole", &[&s, &k.id_c, "admin"], "meshSpaces");
+    let (id_b, id_c) = (k.id_b.clone(), k.id_c.clone());
+    let admins = |v: &Value| {
+        role_of(v, &id_b).as_deref() == Some("admin")
+            && role_of(v, &id_c).as_deref() == Some("admin")
+    };
+    all_until(&mut [&mut k.b, &mut k.c], admins);
+    k.o.send("spaceList", &[]);
+    let o_before = changes_held(&until(&mut k.o, "meshSpaces", |_| true));
+    ask(&mut k.b, "spaceForge", &["unchecked"], "meshForge");
+    ask(&mut k.b, "spaceKick", &[&s, &id_c], "meshSpaces");
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "after the kick"],
+        "meshSpaceMessages",
+    );
+    for h in [&mut k.o, &mut k.c] {
+        until(h, "meshSpaceNotify", |n| n["text"] == "after the kick");
+        h.send("spaceList", &[]);
+        let v = until(h, "meshSpaces", |_| true);
+        assert_eq!(role_of(&v, &id_c).as_deref(), Some("admin"), "{v}");
+    }
+    k.o.send("spaceList", &[]);
+    let v = until(&mut k.o, "meshSpaces", |_| true);
+    assert_eq!(changes_held(&v), o_before + 1, "the forged kick came");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// The club with D, O's friend, added as a member, and B and C made admins.
+fn club_with_admins(name: &str) -> (Club, Helper, String) {
+    let mut k = club(name);
+    let s = k.space.clone();
+    let (mut d, id_d) = newcomer(&mut k, &format!("{name}-dee"));
+    befriend(&mut k.o, &k.id_o, &mut d, &id_d);
+    ask(&mut k.o, "spaceAdd", &[&s, &id_d], "meshSpaces");
+    ask(&mut k.o, "spaceRole", &[&s, &k.id_b, "admin"], "meshSpaces");
+    ask(&mut k.o, "spaceRole", &[&s, &k.id_c, "admin"], "meshSpaces");
+    let (id_b, id_c, dd) = (k.id_b.clone(), k.id_c.clone(), id_d.clone());
+    let ready = move |v: &Value| {
+        role_of(v, &id_b).as_deref() == Some("admin")
+            && role_of(v, &id_c).as_deref() == Some("admin")
+            && role_of(v, &dd).is_some()
+    };
+    all_until(&mut [&mut k.b, &mut k.c, &mut d], ready);
+    (k, d, id_d)
+}
+
+/// Test 7.1: O removes admin C. C, apart, forks from before the removal with
+/// a low event ID and `seq`, kicks B and renames #general. Every device
+/// follows O's branch: C is out, B is in, and the name stands.
+#[test]
+fn an_ex_admin_cant_win() {
+    let mut k = club("spaces-exadmin");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(&mut k.o, "spaceRole", &[&s, &k.id_c, "admin"], "meshSpaces");
+    let id_c = k.id_c.clone();
+    all_until(&mut [&mut k.b, &mut k.c], |v| {
+        role_of(v, &id_c).as_deref() == Some("admin")
+    });
+    ask(&mut k.o, "spaceKick", &[&s, &k.id_c], "meshSpaces");
+    all_until(&mut [&mut k.b, &mut k.c], |v| role_of(v, &id_c).is_none());
+    k.o.send("spaceList", &[]);
+    let before = changes_held(&until(&mut k.o, "meshSpaces", |_| true));
+    ask(
+        &mut k.c,
+        "spaceForge",
+        &["fork", &s, "1", "low"],
+        "meshForge",
+    );
+    ask(&mut k.c, "spaceKick", &[&s, &k.id_b], "meshSpaces");
+    ask(&mut k.c, "spaceRename", &[&s, "hijacked", &g], "meshSpaces");
+    // Both forged changes reach O and B, and lose.
+    let (id_b, id_o) = (k.id_b.clone(), k.id_o.clone());
+    let settled = |v: &Value| {
+        changes_held(v) >= before + 2
+            && role_of(v, &id_b).is_some()
+            && role_of(v, &id_c).is_none()
+            && channel_named(v, "general")
+            && role_of(v, &id_o).as_deref() == Some("owner")
+    };
+    all_until(&mut [&mut k.o, &mut k.b], settled);
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// Test 7.2: two admins apart. B kicks D while C, on a branch from the same
+/// version, renames #general. Every device ends with both changes: the
+/// losing branch's author redoes its change on the winner.
+#[test]
+fn two_admins_apart_both_changes_stand() {
+    let (mut k, d, id_d) = club_with_admins("spaces-apart");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(&mut k.b, "spaceKick", &[&s, &id_d], "meshSpaces");
+    let dd = id_d.clone();
+    all_until(&mut [&mut k.c], |v| role_of(v, &dd).is_none());
+    ask(
+        &mut k.c,
+        "spaceForge",
+        &["fork", &s, "1", "same"],
+        "meshForge",
+    );
+    ask(&mut k.c, "spaceRename", &[&s, "chat", &g], "meshSpaces");
+    let dd = id_d.clone();
+    let both = |v: &Value| role_of(v, &dd).is_none() && channel_named(v, "chat");
+    all_until(&mut [&mut k.o, &mut k.b, &mut k.c], both);
+    let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// Test 7.3: C forks from before B's ban of D, low, so C's branch wins and
+/// drops the ban. B's device sees it dropped and bans D again: every device
+/// ends with D banned, and an add of D is refused.
+#[test]
+fn a_late_fork_undoes_and_the_author_redoes() {
+    let (mut k, d, id_d) = club_with_admins("spaces-late");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(&mut k.b, "spaceBan", &[&s, &id_d], "meshSpaces");
+    let dd = id_d.clone();
+    all_until(&mut [&mut k.c], |v| role_of(v, &dd).is_none());
+    k.o.send("spaceList", &[]);
+    let before = changes_held(&until(&mut k.o, "meshSpaces", |_| true));
+    ask(
+        &mut k.c,
+        "spaceForge",
+        &["fork", &s, "1", "low"],
+        "meshForge",
+    );
+    ask(&mut k.c, "spaceRename", &[&s, "late", &g], "meshSpaces");
+    // The fork, and B's redo of the ban after it: two more changes.
+    let dd = id_d.clone();
+    let banned_again = |v: &Value| {
+        changes_held(v) >= before + 2 && role_of(v, &dd).is_none() && channel_named(v, "late")
+    };
+    all_until(&mut [&mut k.o, &mut k.b, &mut k.c], banned_again);
+    let err = ask(&mut k.o, "spaceAdd", &[&s, &id_d], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// Test 8: O kicks C, and C can be added again. O bans C: an add of C is
+/// refused, C can't post, and C's devices no longer get through B's
+/// handshake; O, C's friend, still lets C in.
+#[test]
+fn kick_and_ban() {
+    let mut k = club("spaces-ban");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let id_c = k.id_c.clone();
+    ask(&mut k.o, "spaceKick", &[&s, &id_c], "meshSpaces");
+    all_until(&mut [&mut k.b], |v| role_of(v, &id_c).is_none());
+    ask(&mut k.o, "spaceAdd", &[&s, &id_c], "meshSpaces");
+    all_until(&mut [&mut k.b, &mut k.c], |v| role_of(v, &id_c).is_some());
+    ask(&mut k.o, "spaceBan", &[&s, &id_c], "meshSpaces");
+    all_until(&mut [&mut k.b, &mut k.c], |v| role_of(v, &id_c).is_none());
+    let err = ask(&mut k.o, "spaceAdd", &[&s, &id_c], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    let err = ask(&mut k.c, "spaceSend", &[&s, &g, "still here?"], "meshError");
+    assert!(
+        ["not-allowed", "not-found"].contains(&err["kind"].as_str().unwrap()),
+        "{err}"
+    );
+    let err = ask(&mut k.b, "netPingId", &[&id_c], "meshError");
+    assert_eq!(err["kind"], "not-a-contact", "{err}");
+    ask(&mut k.o, "netPingId", &[&id_c], "meshPing");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}

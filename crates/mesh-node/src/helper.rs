@@ -377,6 +377,8 @@ struct Helper {
     space_marked: HashSet<([u8; 32], mesh_dm::space::SpaceId, u64)>,
     /// History pulls this unlock (S10).
     space_pulls: HashMap<mesh_dm::space::SpaceId, spaces::Pull>,
+    /// Our changes already redone after a fork dropped them (S7), this unlock.
+    space_redone: HashMap<mesh_dm::space::SpaceId, std::collections::BTreeSet<[u8; 16]>>,
     /// What `spaceForge` set (debug builds only).
     #[cfg(debug_assertions)]
     forge: spaces::Forge,
@@ -544,6 +546,7 @@ impl Helper {
             space_sent: HashMap::new(),
             space_marked: HashSet::new(),
             space_pulls: HashMap::new(),
+            space_redone: HashMap::new(),
             #[cfg(debug_assertions)]
             forge: spaces::Forge::default(),
             space_mailed: HashMap::new(),

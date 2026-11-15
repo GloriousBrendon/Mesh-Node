@@ -15,7 +15,7 @@ use mesh_dm::chat::Taken;
 use mesh_dm::space::SpaceEvent;
 use mesh_dm::space::{
     Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, check_history, space_id,
-    would_count,
+    to_redo, would_count,
 };
 use mesh_dm::space_store::{
     SPACE_BATCH, from_batch, from_member, from_own, to_batch, to_member, to_own,
@@ -366,6 +366,22 @@ pub(super) struct Forge {
     alter: bool,
     /// A post of ours forged into a channel, served as if it belonged there.
     inject: Option<(SpaceId, ChannelId, String)>,
+    /// Our own checks skipped: what we send is for others to refuse.
+    unchecked: bool,
+    /// Our next changes in a Space go on a fork from an older version.
+    fork: Option<Fork>,
+}
+
+/// A forged fork (tests 7): each change follows `after`, the one before,
+/// and with `low`, has a low event ID and `seq` so its branch would win
+/// any tie it can.
+#[cfg(debug_assertions)]
+struct Fork {
+    space: SpaceId,
+    after: mesh_dm::event::EventId,
+    seq: u64,
+    low: bool,
+    made: u8,
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
@@ -559,12 +575,14 @@ impl Helper {
                 })
                 .collect();
             let role = me.and_then(|me| st.role(&me)).map(role_text);
+            let changes = self.space_open.get(&space).map(SpaceHistory::changes_held);
             spaces.push(json!({
                 "id": hex16(&space),
                 "name": st.name,
                 "role": role,
                 "channels": channels,
                 "members": members,
+                "changes": changes,
             }));
         }
         emit("meshSpaces", json!({ "spaces": spaces }));
@@ -594,7 +612,7 @@ impl Helper {
     fn space_change(&mut self, space: &SpaceId, change: Change) -> Result<(), Fail> {
         let me = self.me_sender()?.person;
         let v = self.space_mut(space)?.version().ok_or_else(not_found)?;
-        if !would_count(space, &v.state, &me, &change) {
+        if !would_count(space, &v.state, &me, &change) && !self.unchecked() {
             return Err(not_allowed());
         }
         let (key, cert) = self.signing()?;
@@ -632,6 +650,80 @@ impl Helper {
             self.space_pull(space);
         }
         self.space_send_all(space);
+        if member {
+            self.space_redo(space);
+        }
+    }
+
+    /// Our changes a fork dropped are made again after the winner's newest,
+    /// if they still count and change something (S7); a redo dropped again
+    /// is redone again, since it's a new change.
+    fn space_redo(&mut self, space: &SpaceId) {
+        let (Some(v), Some(me)) = (self.space_version(space), self.store.as_ref()) else {
+            return;
+        };
+        let me = me.id().to_bytes();
+        let done = self.space_redone.entry(*space).or_default();
+        let redo = to_redo(space, &v, &me, done);
+        done.extend(redo.iter().map(|(id, _)| *id));
+        for (_, change) in redo {
+            if let Err(Fail(kind, _)) = self.space_change(space, change) {
+                eprintln!("mesh-node: a Space change to redo didn't go: {kind}");
+            }
+        }
+    }
+
+    /// Debug builds' `spaceForge unchecked`: our own checks skipped.
+    fn unchecked(&self) -> bool {
+        #[cfg(debug_assertions)]
+        return self.forge.unchecked;
+        #[cfg(not(debug_assertions))]
+        false
+    }
+
+    /// A change from a command: on the forged fork if one is set (debug
+    /// builds), else as `space_change` makes it. Redos never fork.
+    fn space_command_change(&mut self, space: &SpaceId, change: Change) -> Result<(), Fail> {
+        #[cfg(debug_assertions)]
+        if self.forge.fork.as_ref().is_some_and(|f| f.space == *space) {
+            return self.space_forked(space, change);
+        }
+        self.space_change(space, change)
+    }
+
+    /// The forged fork's next change, unchecked by us.
+    #[cfg(debug_assertions)]
+    fn space_forked(&mut self, space: &SpaceId, change: Change) -> Result<(), Fail> {
+        let (key, cert) = self.signing()?;
+        let device = key.public().to_bytes();
+        let fork = self.forge.fork.as_mut().expect("checked");
+        fork.made += 1;
+        let (after, made, low) = (fork.after, fork.made, fork.low);
+        let mut id = [0u8; 16];
+        if low {
+            id[15] = made;
+        } else {
+            id = mesh_dm::space::nonce().ok_or_else(|| space_fail("no randomness"))?;
+        }
+        let seq = if low {
+            u64::from(made)
+        } else {
+            fork.seq + u64::from(made)
+        };
+        let body = SpaceBody::Change(SpaceChange {
+            after: Some(after),
+            change,
+        });
+        let history = self.space_mut(space)?;
+        let n = history.next_change_n(&device);
+        history
+            .send_at(body, &key, &cert, now_ms(), id, seq, n)
+            .map_err(space_fail)?;
+        if let Some(f) = self.forge.fork.as_mut() {
+            f.after = id;
+        }
+        self.space_changed(space);
+        Ok(())
     }
 
     /// Every member's devices (and our own) get what waits for them in
@@ -1443,6 +1535,56 @@ impl Helper {
                 let space = parse16(arg(0)?, "Space")?;
                 self.space_change(&space, Change::Leave)?;
             }
+            "spaceKick" | "spaceBan" | "spaceUnban" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let who = parse_id(arg(1)?)?.to_bytes();
+                let change = match func {
+                    "spaceKick" => Change::Kick(who),
+                    "spaceBan" => Change::Ban(who),
+                    _ => Change::Unban(who),
+                };
+                self.space_command_change(&space, change)?;
+            }
+            "spaceRename" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let name = arg(1)?.trim().to_owned();
+                let change = match args.get(2) {
+                    Some(channel) => Change::ChannelRename {
+                        channel: parse16(channel, "channel")?,
+                        name,
+                    },
+                    None => Change::Rename(name),
+                };
+                self.space_command_change(&space, change)?;
+            }
+            "spaceDelete" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let target = parse16(arg(2)?, "message")?;
+                let me = self.me_sender()?.person;
+                let v = self.space_mut(&space)?.version().ok_or_else(not_found)?;
+                let now = now_ms();
+                let chat = self
+                    .space_mut(&space)?
+                    .channel(&channel, now)
+                    .map_err(space_fail)?;
+                let author = (chat.messages().iter())
+                    .find(|m| m.id == target)
+                    .map(|m| m.author)
+                    .ok_or_else(not_found)?;
+                // The author's own, or an admin's (S8).
+                let admin = v.state.role(&me).is_some_and(|r| r >= Role::Admin);
+                if author != me && !admin && !self.unchecked() {
+                    return Err(not_allowed());
+                }
+                let (key, cert) = self.signing()?;
+                let body = SpaceBody::Delete { channel, target };
+                self.space_mut(&space)?
+                    .send(body, &key, &cert, now)
+                    .map_err(space_fail)?;
+                self.emit_channel(&space, &channel)?;
+                self.space_send_all(&space);
+            }
             "spaceRole" => {
                 let space = parse16(arg(0)?, "Space")?;
                 let who = parse_id(arg(1)?)?.to_bytes();
@@ -1451,14 +1593,14 @@ impl Helper {
                     "member" => Change::Demote(who),
                     _ => return Err(Fail("bad-args", "a role: admin or member".to_owned())),
                 };
-                self.space_change(&space, change)?;
+                self.space_command_change(&space, change)?;
             }
             "spaceSend" => {
                 let space = parse16(arg(0)?, "Space")?;
                 let channel = parse16(arg(1)?, "channel")?;
                 let me = self.me_sender()?.person;
                 let v = self.space_mut(&space)?.version().ok_or_else(not_found)?;
-                if !v.state.may_post(&me, &channel) {
+                if !v.state.may_post(&me, &channel) && !self.unchecked() {
                     return Err(not_allowed());
                 }
                 let (key, cert) = self.signing()?;
@@ -1485,6 +1627,31 @@ impl Helper {
                         let space = parse16(arg(1)?, "Space")?;
                         let channel = parse16(arg(2)?, "channel")?;
                         self.forge.inject = Some((space, channel, arg(3)?.to_owned()));
+                    }
+                    "unchecked" => self.forge.unchecked = true,
+                    // fork <space> <back> <low|same>: our next changes follow
+                    // the change `back` steps behind the newest on the line.
+                    "fork" => {
+                        let space = parse16(arg(1)?, "Space")?;
+                        let back: usize = (arg(2)?.parse())
+                            .map_err(|_| Fail("bad-args", "how far back".to_owned()))?;
+                        let low = arg(3)? == "low";
+                        let history = self.space_mut(&space)?;
+                        let v = history.version().ok_or_else(not_found)?;
+                        let changes = history.read_changes();
+                        let mut at = v.head;
+                        for _ in 0..back {
+                            at = (changes.get(&at).copied().flatten())
+                                .ok_or_else(|| Fail("bad-args", "not that far back".to_owned()))?;
+                        }
+                        let seq = history.change_seq(&at).unwrap_or(0);
+                        self.forge.fork = Some(Fork {
+                            space,
+                            after: at,
+                            seq,
+                            low,
+                            made: 0,
+                        });
                     }
                     _ => self.forge = Forge::default(),
                 }

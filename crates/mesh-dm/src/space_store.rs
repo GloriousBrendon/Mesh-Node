@@ -470,9 +470,57 @@ impl SpaceHistory {
         let mut id = [0u8; 16];
         getrandom::fill(&mut id)
             .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+        self.send_at(body, device, cert, now, id, seq, n)
+    }
+
+    /// `send` with the event ID, `seq` and `n` given: a test client's
+    /// forged fork (spaceForge), or `send`'s own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_at(
+        &mut self,
+        body: SpaceBody,
+        device: &DeviceKey,
+        cert: &DeviceCert,
+        now: u64,
+        id: EventId,
+        seq: u64,
+        n: u64,
+    ) -> Result<SpaceEvent, HistoryError> {
+        let me = Sender {
+            person: cert.root().to_bytes(),
+            device: device.public().to_bytes(),
+        };
         let event = SpaceEvent::signed(self.space, id, (now, seq, n), body, device, cert);
         self.store(&event, me, now, now)?;
         Ok(event)
+    }
+
+    /// Each change held, with the one it follows.
+    pub fn read_changes(&self) -> HashMap<EventId, Option<EventId>> {
+        (self.chain.changes().into_iter())
+            .map(|(id, _, c, _)| (id, c.after))
+            .collect()
+    }
+
+    /// A held change's `seq`.
+    pub fn change_seq(&self, id: &EventId) -> Option<u64> {
+        (self.chain.changes().into_iter())
+            .find(|(c, ..)| c == id)
+            .map(|(.., at)| at.0)
+    }
+
+    /// How many changes are held, on the winning line or not.
+    pub fn changes_held(&self) -> usize {
+        self.chain.changes().len()
+    }
+
+    /// The next `n` for one of our changes (dm D2 over the chain).
+    pub fn next_change_n(&self, device: &Device) -> u64 {
+        let ours = (1..=self.log.len())
+            .filter_map(|i| self.log.get(i))
+            .filter(|e| e.change && e.from == *device)
+            .count() as u64;
+        ours + 1
     }
 
     /// Channels read into memory so far.
