@@ -79,6 +79,8 @@ struct Counts {
     revokes: AtomicU64,
     puts: AtomicU64,
     gets: AtomicU64,
+    /// Address gets refused for the caller's per-minute limit.
+    gets_slowed: AtomicU64,
     knock_puts: AtomicU64,
     knock_gets: AtomicU64,
     mail_claims: AtomicU64,
@@ -316,11 +318,7 @@ async fn serve(node: Arc<Node>, stores: Stores, counts: Arc<Counts>) {
                 vec![lock(&stores.addrs).put(caller, request, now).byte()]
             })),
             ADDR_GET => tokio::spawn(answer_batch(stream, move |caller, request, now| {
-                count(&counts.gets);
-                match <[u8; 16]>::try_from(request) {
-                    Ok(lookup) => lock(&stores.addrs).get(caller, &lookup, now).to_bytes(),
-                    Err(_) => vec![addrs::Put::Bad.byte()],
-                }
+                address_get(&stores.addrs, &counts, caller, request, now)
             })),
             KNOCK_PUT => tokio::spawn(answer_batch(stream, move |caller, request, now| {
                 count(&counts.knock_puts);
@@ -518,6 +516,25 @@ fn save<S: Saved>(store: &Mutex<S>) {
     }
 }
 
+/// One address get, counted, and counted again when refused.
+fn address_get(
+    addrs: &Mutex<addrs::Store>,
+    counts: &Counts,
+    caller: &Caller,
+    request: &[u8],
+    now: u64,
+) -> Vec<u8> {
+    counts.gets.fetch_add(1, Ordering::Relaxed);
+    let Ok(lookup) = <[u8; 16]>::try_from(request) else {
+        return vec![addrs::Put::Bad.byte()];
+    };
+    let got = lock(addrs).get(caller, &lookup, now);
+    if got == addrs::Get::SlowDown {
+        counts.gets_slowed.fetch_add(1, Ordering::Relaxed);
+    }
+    got.to_bytes()
+}
+
 async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
     loop {
         tokio::time::sleep(every).await;
@@ -545,7 +562,7 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
             beyond,
         } = lock(&counts.callers).take();
         eprintln!(
-            "mesh-node seed: last hour {} holds, {} lookups ({} found, {} slowed), {} revokes, {} address puts, {} address gets, {} request puts, {} request gets; {held} held, {records} address records, {requests} requests; callers {direct} direct, {relayed} relayed, {both} both ways, {beyond} requests from callers not told apart",
+            "mesh-node seed: last hour {} holds, {} lookups ({} found, {} slowed), {} revokes, {} address puts, {} address gets ({} slowed), {} request puts, {} request gets; {held} held, {records} address records, {requests} requests; callers {direct} direct, {relayed} relayed, {both} both ways, {beyond} requests from callers not told apart",
             take(&counts.holds),
             take(&counts.lookups),
             take(&counts.found),
@@ -553,6 +570,7 @@ async fn sweep_hourly(stores: Stores, counts: Arc<Counts>, every: Duration) {
             take(&counts.revokes),
             take(&counts.puts),
             take(&counts.gets),
+            take(&counts.gets_slowed),
             take(&counts.knock_puts),
             take(&counts.knock_gets),
         );
@@ -675,6 +693,24 @@ fn lock<S>(store: &Mutex<S>) -> std::sync::MutexGuard<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_address_get_is_counted() {
+        let dir = std::env::temp_dir().join(format!("mesh-seed-gets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let addrs = Mutex::new(addrs::Store::load(&dir.join("addrs.bin")).unwrap());
+        let counts = Counts::default();
+        let caller = Caller {
+            device: [1; 32],
+            network: None,
+        };
+        for _ in 0..addrs::GETS_PER_DEVICE + 3 {
+            address_get(&addrs, &counts, &caller, &[2; 16], 1_000);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(counts.gets.load(Ordering::Relaxed), 123);
+        assert_eq!(counts.gets_slowed.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn callers_are_counted_by_how_they_arrived() {

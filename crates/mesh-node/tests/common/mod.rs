@@ -307,12 +307,16 @@ impl Seed {
         let mut child = command.spawn().unwrap();
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let (tx, lines) = mpsc::channel();
+        // Its log goes in a timeout's dump too (counts only, D10).
+        let err = Arc::new(Mutex::new(String::new()));
+        let to = err.clone();
         std::thread::spawn(move || {
-            stderr
-                .lines()
-                .map_while(Result::ok)
-                .for_each(|l| drop(tx.send(l)))
+            stderr.lines().map_while(Result::ok).for_each(|l| {
+                to.lock().unwrap().push_str(&format!("{l}\n"));
+                drop(tx.send(l))
+            })
         });
+        STARTED.with_borrow_mut(|all| all.push(("seed".to_owned(), err)));
         Self {
             child,
             lines,

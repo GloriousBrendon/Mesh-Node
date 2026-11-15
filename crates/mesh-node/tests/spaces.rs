@@ -346,6 +346,20 @@ fn a_returning_member_catches_up_live() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit(), &k.id_b, &k.id_c);
 }
 
+/// The address gets a seed's report lines say it refused.
+fn gets_slowed(log: &[String]) -> u64 {
+    (log.iter())
+        .filter_map(|l| {
+            l.split(" address gets (")
+                .nth(1)?
+                .split(' ')
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .sum()
+}
+
 /// A seed's reported mail counts: the sum of `what` ("puts") over its
 /// report lines.
 fn seed_count(log: &[String], what: &str) -> u64 {
@@ -1134,7 +1148,9 @@ fn measure_fifty_members() {
     let mut hs: Vec<(Helper, String)> = (0..N)
         .map(|i| {
             let dir = temp_dir(&format!("spaces-fifty-{i}"));
-            helper(&dir, &relay, &ticket, &format!("m{i}"))
+            // The real refresh: a 30 s one puts all 50 over the seed's
+            // per-network put limit, which a real club never shares.
+            helper_ttl(&dir, &relay, &ticket, &format!("m{i}"), None)
         })
         .collect();
     let ids: Vec<String> = hs.iter().map(|(_, id)| id.clone()).collect();
@@ -1181,7 +1197,11 @@ fn measure_fifty_members() {
         h.send("spaceList", &[]);
         until_for(h, "meshSpaces", Duration::from_secs(600), full);
     }
-    eprintln!("fifty: set up in {:?}", started.elapsed());
+    eprintln!(
+        "fifty: set up in {:?}, seed refused {} address gets",
+        started.elapsed(),
+        gets_slowed(&seed.drain())
+    );
     let s = spaces[0].clone();
     let line_to_all = |hs: &mut Vec<(Helper, String)>, from: usize, text: &str| -> Duration {
         let t = Instant::now();
