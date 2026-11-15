@@ -32,49 +32,120 @@ const SLOWED_AGAIN: Duration = Duration::from_secs(10);
 const SLOWED_TRIES: u32 = 3;
 
 /// One budget for every address get a helper makes (S14): a sliding
-/// minute, so it holds whenever the seed's own minute starts. A cheap clone
-/// shares it.
+/// minute, so it holds whenever the seed's own minute starts. Waiters take
+/// their turn in the order they came, the hello's apart from the rest. A
+/// cheap clone shares it.
 #[derive(Clone, Default)]
 pub struct Gets {
-    sent: Arc<Mutex<VecDeque<Instant>>>,
+    window: Arc<Mutex<Window>>,
     /// Left free for others: `spare`'s takes stop this short.
     keep: usize,
+}
+
+#[derive(Default)]
+struct Window {
+    sent: VecDeque<Instant>,
+    /// Waiting turns, oldest first: the rest's, then the hello's.
+    queue: [VecDeque<u64>; 2],
+    next: u64,
+}
+
+/// A place in the queue; leaves it when dropped (its task ended).
+pub struct Turn {
+    window: Arc<Mutex<Window>>,
+    class: usize,
+    id: u64,
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let mut w = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        w.queue[self.class].retain(|id| *id != self.id);
+    }
+}
+
+/// How often a waiter that isn't first looks again.
+const TURN_AGAIN: Duration = Duration::from_millis(100);
+
+impl Window {
+    /// Takes `n` gets now leaving `keep` free, or says how long until
+    /// they'd fit.
+    fn fit(&mut self, n: usize, keep: usize, now: Instant) -> Option<Duration> {
+        let minute = Duration::from_secs(60);
+        while (self.sent.front()).is_some_and(|t| now.saturating_duration_since(*t) >= minute) {
+            self.sent.pop_front();
+        }
+        let n = n.min(GETS_A_MINUTE - keep);
+        let over = (self.sent.len() + n + keep).saturating_sub(GETS_A_MINUTE);
+        if over == 0 {
+            self.sent.extend(std::iter::repeat_n(now, n));
+            return None;
+        }
+        // The `over`th oldest leaving frees enough.
+        Some((self.sent[over - 1] + minute).saturating_duration_since(now))
+    }
 }
 
 impl Gets {
     /// The same budget, taking only what leaves `SPARE_KEEPS` free.
     pub fn spare(&self) -> Gets {
         Gets {
-            sent: self.sent.clone(),
+            window: self.window.clone(),
             keep: SPARE_KEEPS,
         }
     }
 
-    /// Takes `n` gets now, or says how long until they'd fit.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Window> {
+        self.window.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn class(&self) -> usize {
+        usize::from(self.keep > 0)
+    }
+
+    /// Takes `n` gets now if nobody waits ahead, or says how long to wait.
     pub fn try_take(&self, n: usize, now: Instant) -> Option<Duration> {
-        let minute = Duration::from_secs(60);
-        let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-        while sent
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) >= minute)
-        {
-            sent.pop_front();
+        let mut w = self.lock();
+        if !w.queue[self.class()].is_empty() {
+            return Some(TURN_AGAIN);
         }
-        let n = n.min(GETS_A_MINUTE - self.keep);
-        let over = (sent.len() + n + self.keep).saturating_sub(GETS_A_MINUTE);
-        if over == 0 {
-            sent.extend(std::iter::repeat_n(now, n));
-            return None;
+        w.fit(n, self.keep, now)
+    }
+
+    /// A place at the back of the queue.
+    pub fn join(&self) -> Turn {
+        let mut w = self.lock();
+        let id = w.next;
+        w.next += 1;
+        w.queue[self.class()].push_back(id);
+        Turn {
+            window: self.window.clone(),
+            class: self.class(),
+            id,
         }
-        // The `over`th oldest leaving frees enough.
-        Some((sent[over - 1] + minute).saturating_duration_since(now))
+    }
+
+    /// Takes `n` gets for `turn` if it's first and they fit (it then
+    /// leaves the queue), or says how long to wait.
+    pub fn turn(&self, turn: &Turn, n: usize, now: Instant) -> Option<Duration> {
+        let mut w = self.lock();
+        if w.queue[turn.class].front() != Some(&turn.id) {
+            return Some(TURN_AGAIN);
+        }
+        let wait = w.fit(n, self.keep, now);
+        if wait.is_none() {
+            w.queue[turn.class].pop_front();
+        }
+        wait
     }
 
     /// Takes `n` gets, waiting its turn.
-    // ponytail: waiters wake on their own timers, not in order; a queue if
-    // one starves.
     pub async fn take(&self, n: usize) {
-        while let Some(wait) = self.try_take(n, Instant::now()) {
+        if self.try_take(n, Instant::now()).is_none() {
+            return;
+        }
+        let turn = self.join();
+        while let Some(wait) = self.turn(&turn, n, Instant::now()) {
             tokio::time::sleep(wait.max(Duration::from_millis(50))).await;
         }
     }
@@ -345,6 +416,41 @@ mod tests {
     /// Every address get a helper makes fits the seed's limit in any
     /// minute, however the seed's minute falls; what doesn't fit waits.
     /// The spare side (the hello) leaves `SPARE_KEEPS` for the rest.
+    /// Waiters go in the order they came: one that's waiting gets the next
+    /// room, not a newcomer that asks just as it frees (a ping starved
+    /// behind refreshes asking every 2 s). A waiter given up leaves.
+    #[test]
+    fn address_gets_wait_in_turn() {
+        let t0 = Instant::now();
+        let gets = Gets::default();
+        while gets.try_take(GETS_PER_FIND, t0).is_none() {}
+        let first = gets.join();
+        assert!(gets.turn(&first, GETS_PER_FIND, t0).is_some(), "full");
+        let later = t0 + Duration::from_secs(61);
+        assert!(
+            gets.try_take(GETS_PER_FIND, later).is_some(),
+            "a newcomer waits behind it"
+        );
+        let second = gets.join();
+        assert!(
+            gets.turn(&second, GETS_PER_FIND, later).is_some(),
+            "not its turn"
+        );
+        assert!(gets.turn(&first, GETS_PER_FIND, later).is_none());
+        assert!(
+            gets.turn(&second, GETS_PER_FIND, later).is_none(),
+            "then its own"
+        );
+        // A waiter whose task ended doesn't hold up the rest.
+        let gone = gets.join();
+        drop(gone);
+        assert!(gets.try_take(GETS_PER_FIND, later).is_none());
+        // The hello's queue is its own: sends never wait behind it.
+        let hello = gets.spare().join();
+        assert!(gets.try_take(GETS_PER_FIND, later).is_none());
+        drop(hello);
+    }
+
     #[test]
     fn address_gets_keep_under_the_seeds_limit() {
         let t0 = Instant::now();
