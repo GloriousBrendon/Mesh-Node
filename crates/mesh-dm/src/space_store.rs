@@ -1195,14 +1195,21 @@ mod tests {
         let empty = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/space-measure-empty");
         let _ = std::fs::remove_dir_all(&empty);
         SpaceList::open(&empty, &KEY).unwrap().add([3; 16]).unwrap();
+        // What unlock reads (mesh-node's open_spaces): the list, then each
+        // Space's chain, to work out the peers.
         for (what, at) in [
             ("with a 100,000-event Space", &root),
             ("with an empty one", &empty),
         ] {
             let t = std::time::Instant::now();
             let list = SpaceList::open(at, &KEY).unwrap();
+            let mut members = 0;
+            for space in list.spaces() {
+                let chain = SpaceHistory::read_chain(at, &KEY, space).unwrap();
+                members += chain.version(space).map_or(0, |v| v.state.members.len());
+            }
             eprintln!(
-                "unlock {what}: {:?} ({} Space)",
+                "unlock {what}, peers worked out: {:?} ({} Space, {members} members)",
                 t.elapsed(),
                 list.spaces().len()
             );
