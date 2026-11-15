@@ -11,7 +11,6 @@ use mesh_dm::space::SpaceId;
 use mesh_dm::space_store::{SpaceHistory, SpaceList};
 use mesh_identity::MeshId;
 
-use mesh_dm::Sender;
 use mesh_dm::chat::Taken;
 use mesh_dm::space::SpaceEvent;
 use mesh_dm::space::{
@@ -21,6 +20,7 @@ use mesh_dm::space::{
 use mesh_dm::space_store::{
     SPACE_BATCH, from_batch, from_member, from_own, to_batch, to_member, to_own,
 };
+use mesh_dm::{Person, Sender};
 use mesh_e2ee::Kind as NoteKind;
 use mesh_e2ee::{MAIL, MailHead, seal_mail};
 use mesh_identity::{DeviceCert, DeviceKey, VerifyingKey};
@@ -323,6 +323,9 @@ pub(super) struct Pull {
     refused: usize,
     under_way: bool,
     settled: bool,
+    /// When the change that added us was made: a post in history after it
+    /// is news, told as a live one is.
+    joined_at: Option<u64>,
 }
 
 /// What `spaceForge` makes this helper do when serving history (the
@@ -337,6 +340,16 @@ pub(super) struct Forge {
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
+/// `meshSpaceNotify`: someone else's post, new to us.
+fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str) {
+    if let Ok(who) = MeshId::from_bytes(author) {
+        emit(
+            "meshSpaceNotify",
+            json!({ "space": hex16(space), "channel": hex16(channel), "from": who.to_string(), "text": text }),
+        );
+    }
+}
+
 fn hex16(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -866,12 +879,8 @@ impl Helper {
                         changed.push(space);
                     } else if let SpaceBody::Post { channel, text, .. } = &event.body
                         && author.person != me.to_bytes()
-                        && let Ok(who) = MeshId::from_bytes(&author.person)
                     {
-                        emit(
-                            "meshSpaceNotify",
-                            json!({ "space": hex16(&space), "channel": hex16(channel), "from": who.to_string(), "text": text }),
-                        );
+                        notify_post(&space, channel, &author.person, text);
                         if self.space_view == Some((space, *channel)) {
                             let _ = self.emit_channel(&space, channel);
                         }
@@ -1231,11 +1240,31 @@ impl Helper {
         let changes = good
             .iter()
             .any(|(e, _)| matches!(e.body, SpaceBody::Change(_)));
+        let joined_at = self.joined_at(&space);
+        let me = self.store.as_ref().map(|s| s.id().to_bytes());
+        // Posts written after our add, by others: news, however it came.
+        let news: Vec<Option<(ChannelId, Person, String)>> = (good.iter())
+            .map(|(e, author)| match &e.body {
+                SpaceBody::Post { channel, text, .. }
+                    if Some(author.person) != me && joined_at.is_some_and(|t| e.time >= t) =>
+                {
+                    Some((*channel, author.person, text.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         let Ok(history) = self.space_mut(&space) else {
             return;
         };
-        if let Err(e) = history.store_batch(good, now, now) {
-            eprintln!("mesh-node: couldn't store a Space's history: {e}");
+        match history.store_batch(good, now, now) {
+            Ok(taken) => {
+                for (taken, news) in taken.iter().zip(news) {
+                    if let (Taken::Shown, Some((channel, author, text))) = (taken, news) {
+                        notify_post(&space, &channel, &author, &text);
+                    }
+                }
+            }
+            Err(e) => eprintln!("mesh-node: couldn't store a Space's history: {e}"),
         }
         if changes {
             self.refresh_peers();
@@ -1246,6 +1275,20 @@ impl Helper {
         {
             let _ = self.emit_channel(&s, &channel);
         }
+    }
+
+    /// When the change that added us to `space` was made (its author's
+    /// clock), read once per pull.
+    fn joined_at(&mut self, space: &SpaceId) -> Option<u64> {
+        if let Some(at) = self.space_pulls.get(space).and_then(|p| p.joined_at) {
+            return Some(at);
+        }
+        let me = self.store.as_ref()?.id().to_bytes();
+        let add = self.space_version(space)?.state.members.get(&me)?.joined;
+        let changes = self.space_mut(space).ok()?.events(None).ok()?;
+        let at = changes.iter().find(|e| e.id == add)?.time;
+        self.space_pulls.entry(*space).or_default().joined_at = Some(at);
+        Some(at)
     }
 
     /// A pull ended: if anything came back refused, the next member's

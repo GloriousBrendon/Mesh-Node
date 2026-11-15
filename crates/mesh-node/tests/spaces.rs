@@ -36,7 +36,7 @@ fn has(social: &Value, list: &str, id: &str) -> bool {
 /// The next `binding` event that `done` accepts; other events are skipped.
 // It reads every line itself, `meshNet` included, so the 60 s limit holds
 // even while the network keeps reporting.
-fn until(h: &mut Helper, binding: &str, done: impl Fn(&Value) -> bool) -> Value {
+fn until(h: &mut Helper, binding: &str, mut done: impl FnMut(&Value) -> bool) -> Value {
     let started = Instant::now();
     loop {
         if started.elapsed() > Duration::from_secs(60) {
@@ -544,4 +544,46 @@ fn history_cant_be_forged() {
     let d_log = d.quit();
     assert!(d_log.contains("history events refused"), "{d_log}");
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// A line written after someone was added is news to them however it comes:
+/// D is added while locked, B posts and locks, and D, back, gets B's line
+/// only in O's history. D is told of it, and not of what was said before.
+#[test]
+fn a_line_after_the_add_is_told_even_from_history() {
+    let mut k = club("spaces-told");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "old news"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.o, "meshSpaceNotify", |n| n["text"] == "old news");
+    let (mut d, id_d) = newcomer(&mut k, "dot");
+    befriend(&mut k.o, &k.id_o, &mut d, &id_d);
+    ask(&mut d, "idLock", &[], "meshIdentity");
+    ask(&mut k.o, "spaceAdd", &[&s, &id_d], "meshSpaces");
+    until(&mut k.b, "meshSpaces", |v| {
+        members(&v["spaces"][0]).contains(&id_d)
+    });
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "while you joined"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.o, "meshSpaceNotify", |n| {
+        n["text"] == "while you joined"
+    });
+    ask(&mut k.b, "idLock", &[], "meshIdentity");
+    ask(&mut k.c, "idLock", &[], "meshIdentity");
+    d.send("idUnlock", &["dot", PASSWORD]);
+    let mut told = Vec::new();
+    until(&mut d, "meshSpaceNotify", |n| {
+        told.push(n["text"].as_str().unwrap().to_owned());
+        n["text"] == "while you joined"
+    });
+    assert!(!told.contains(&"old news".to_owned()), "{told:?}");
+    let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
 }
