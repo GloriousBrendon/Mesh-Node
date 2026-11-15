@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::chat::{Chat, Taken};
 use crate::event::{Body, Event, EventId, VERSION};
 use crate::history::{HistoryError, Unread};
-use crate::space::{Chain, ChannelId, SpaceBody, SpaceEvent, SpaceId, SpaceVersion};
+use crate::space::{Chain, ChannelId, Role, SpaceBody, SpaceEvent, SpaceId, SpaceVersion};
 use crate::store::{ChatFiles, Conversation, Store, StoreError};
 use crate::sync::{Counters, Entry, Log};
 use crate::{Device, Person, Sender};
@@ -241,6 +241,9 @@ impl SpaceHistory {
         // Each file's new records, in order, and the log's entries.
         let mut records: HashMap<Conversation, Vec<Vec<u8>>> = HashMap::new();
         let mut entries: Vec<Entry> = Vec::new();
+        // A change may make or unmake an admin: the loaded channels learn
+        // who moderates before the next message is judged (S8).
+        let mut moderators_stale = false;
         for (event, from) in events {
             if self.log.number_of(&event.id).is_some() || !seen.insert(event.id) {
                 taken.push(Taken::Duplicate);
@@ -260,11 +263,15 @@ impl SpaceHistory {
                 SpaceBody::Change(change) => {
                     self.chain
                         .add(event.id, from.person, change.clone(), (event.seq, event.id));
+                    moderators_stale = true;
                     (CHANGES, true, false)
                 }
                 body => {
                     let channel = channel_of(body).expect("not a change");
                     let dm = to_dm(&event).expect("not a change");
+                    if std::mem::take(&mut moderators_stale) {
+                        self.refresh_moderators();
+                    }
                     self.load(&channel, now)?;
                     let (_, view) = self.channels.get_mut(&channel).expect("loaded");
                     let t = view.take_received(from, dm, now, received);
@@ -311,7 +318,17 @@ impl SpaceHistory {
             log_records.push(framed(postcard::to_stdvec(&stored).expect("to memory")));
         }
         self.log_files.append(&log_records)?;
+        if moderators_stale {
+            self.refresh_moderators();
+        }
         Ok(taken)
+    }
+
+    fn refresh_moderators(&mut self) {
+        let who = self.moderators();
+        for (_, view) in self.channels.values_mut() {
+            view.set_moderators(who.clone());
+        }
     }
 
     /// The files a chat's records go to: the changes', or a loaded channel's.
@@ -324,6 +341,17 @@ impl SpaceHistory {
             .find(|(c, _)| channel_key(&space, c) == *chat)
             .map(|(_, (files, _))| files);
         channel.ok_or_else(|| StoreError::Damaged.into())
+    }
+
+    /// The owner and admins in force: who deletes anyone's message (S8).
+    fn moderators(&self) -> HashSet<Person> {
+        let Some(v) = self.version() else {
+            return HashSet::new();
+        };
+        (v.state.members.iter())
+            .filter(|(_, m)| m.role >= Role::Admin)
+            .map(|(p, _)| *p)
+            .collect()
     }
 
     /// A channel as it shows: its newest segment, read the first time.
@@ -459,6 +487,7 @@ impl SpaceHistory {
         let key = channel_key(&self.space, channel);
         let mut files = self.store.open(&key)?;
         let mut view = Chat::new(self.me.person);
+        view.set_moderators(self.moderators());
         for id in self.deleted.get(&key).into_iter().flatten() {
             view.was_deleted(*id);
         }
@@ -794,6 +823,56 @@ mod tests {
         assert_eq!(served, m.events[2..]);
         assert!(served.iter().all(|e| e.author().is_some()));
         assert_eq!(back.events(None).unwrap(), m.events[..2]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S8: an admin deletes anyone's message, as the role in force says; a
+    /// member deletes only their own.
+    #[test]
+    fn an_admin_deletes_anyones_message_a_member_only_their_own() {
+        let root = dir("delete");
+        let m = made();
+        let (a, b) = (Someone::new(), Someone::new());
+        let mut h = SpaceHistory::open(&root, &KEY, sender(&m.o), m.space).unwrap();
+        for e in &m.events {
+            h.store(e, sender(&m.o), NOW, NOW).unwrap();
+        }
+        let change = |after: u8, change| {
+            SpaceBody::Change(SpaceChange {
+                after: Some([after; 16]),
+                change,
+            })
+        };
+        let add = |who: &Someone| Change::Add {
+            who: who.id(),
+            display: "x".into(),
+        };
+        for e in [
+            m.o.event(m.space, 5, NOW, change(2, add(&a))),
+            m.o.event(m.space, 6, NOW + 1, change(5, add(&b))),
+            m.o.event(m.space, 7, NOW + 2, change(6, Change::MakeAdmin(a.id()))),
+        ] {
+            h.store(&e, sender(&m.o), NOW, NOW).unwrap();
+        }
+        let delete = |who: &Someone, id: u8, target: u8| {
+            let body = SpaceBody::Delete {
+                channel: m.general,
+                target: [target; 16],
+            };
+            who.event(m.space, id, NOW + 10, body)
+        };
+        let later = NOW + 10;
+        h.store(&delete(&b, 20, 3), sender(&b), later, later)
+            .unwrap();
+        h.store(&delete(&a, 21, 4), sender(&a), later, later)
+            .unwrap();
+        let chat = h.channel(&m.general, later).unwrap();
+        let texts: Vec<String> = chat.messages().iter().map(|m| m.text.to_owned()).collect();
+        assert_eq!(
+            texts,
+            ["one"],
+            "the admin's delete stands; the member's doesn't"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

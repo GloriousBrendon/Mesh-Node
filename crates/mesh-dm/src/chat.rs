@@ -107,6 +107,9 @@ pub struct Chat {
     scrub: Vec<EventId>,
     /// A group's changes (D7).
     group: Group,
+    /// Who else may delete anyone's message for everyone: a Space's owner
+    /// and admins in force (SPEC-spaces S8). Empty in a DM.
+    moderators: HashSet<Person>,
 }
 
 #[derive(Default)]
@@ -136,7 +139,13 @@ impl Chat {
             newly_deleted: Vec::new(),
             scrub: Vec::new(),
             group: Group::default(),
+            moderators: HashSet::new(),
         }
+    }
+
+    /// Those who may delete anyone's message from here on (SPEC-spaces S8).
+    pub fn set_moderators(&mut self, who: HashSet<Person>) {
+        self.moderators = who;
     }
 
     /// The `seq` for `device`'s next event: one more than the highest held
@@ -242,11 +251,11 @@ impl Chat {
         }
     }
 
-    /// Only the author deletes for everyone; "delete for me" comes only from
-    /// our own devices (D3).
+    /// Only the author (or, in a Space, a moderator) deletes for everyone;
+    /// "delete for me" comes only from our own devices (D3).
     fn may_delete(&self, by: &Sender, author: Person, everyone: bool) -> bool {
         if everyone {
-            by.person == author
+            by.person == author || self.moderators.contains(&by.person)
         } else {
             by.person == self.me
         }
