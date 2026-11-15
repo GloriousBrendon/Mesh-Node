@@ -207,10 +207,8 @@ fn strangers_in_one_space() {
     // Spec test 1's "under 1 s" is a figure for an idle machine: Task 11
     // records it. Here, both lines came live.
     eprintln!("test 1: the first line {first:?} (with its dial), the reply {back:?}");
-    let open = ask(&mut k.o, "spaceOpen", &[&s, &g], "meshSpaceMessages");
-    let texts: Vec<&str> = (open["events"].as_array().unwrap().iter())
-        .map(|e| e["text"].as_str().unwrap())
-        .collect();
+    // O, a member too, holds both, in order (C's may still be on its way).
+    let texts = texts_until(&mut k.o, &s, &g, &["hi from bea", "hi from cal"]);
     assert_eq!(texts, ["hi from bea", "hi from cal"]);
 
     // Still strangers: a DM between them is refused, since they aren't
