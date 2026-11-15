@@ -155,7 +155,11 @@ impl Helper {
 
     /// The next event other than `meshNet` or a `meshSocial` nobody asked for.
     pub fn event(&mut self) -> (String, Value) {
+        let started = std::time::Instant::now();
         loop {
+            if started.elapsed() > LINE_TIMEOUT {
+                fail("only meshNet, meshSocial and meshNote came");
+            }
             match self.line() {
                 (binding, payload) if binding == "meshNet" => self.net = Some(payload),
                 (binding, payload) if binding == "meshSocial" && payload["fn"].is_null() => {
@@ -271,7 +275,18 @@ impl Helper {
             ..
         } = self;
         drop(stdin);
-        assert!(child.wait().unwrap().success());
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > LINE_TIMEOUT {
+                let _ = child.kill();
+                fail("it didn't exit when told to quit");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success());
         all_stderr(err_reader, &err)
     }
 }
