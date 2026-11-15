@@ -694,19 +694,16 @@ fn a_line_after_the_add_is_told_even_from_history() {
 
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
-    v["spaces"][0]["channels"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == name)
+    (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)
 }
 
 fn changes_held(v: &Value) -> u64 {
-    v["spaces"][0]["changes"].as_u64().unwrap()
+    v["spaces"][0]["changes"].as_u64().unwrap_or(0)
 }
 
+/// `id`'s role in the club, if they're in it (a list with no Space yet: no).
 fn role_of(v: &Value, id: &str) -> Option<String> {
-    let ms = v["spaces"][0]["members"].as_array().unwrap();
+    let ms = v["spaces"][0]["members"].as_array()?;
     (ms.iter().find(|m| m["id"] == id)).map(|m| m["role"].as_str().unwrap().to_owned())
 }
 
