@@ -170,7 +170,11 @@ impl Helper {
     /// Waits for a `meshSocial` that satisfies `done`; it may already have
     /// come. Codes lists that come meanwhile are skipped.
     pub fn social_until(&mut self, done: impl Fn(&Value) -> bool) -> Value {
+        let started = std::time::Instant::now();
         loop {
+            if started.elapsed() > LINE_TIMEOUT {
+                fail("waited too long for a matching event");
+            }
             if let Some(social) = self.social.as_ref().filter(|s| done(s)) {
                 return social.clone();
             }
@@ -186,7 +190,11 @@ impl Helper {
 
     /// Waits for a `meshNet` that satisfies `done`; it may already have come.
     pub fn net(&mut self, done: impl Fn(&Value) -> bool) -> Value {
+        let started = std::time::Instant::now();
         loop {
+            if started.elapsed() > LINE_TIMEOUT {
+                fail("waited too long for a matching event");
+            }
             if let Some(net) = self.net.as_ref().filter(|n| done(n)) {
                 return net.clone();
             }
