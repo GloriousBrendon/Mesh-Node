@@ -1040,6 +1040,17 @@ impl Keystore {
         self.save()
     }
 
+    /// A handshake over a connection `id` opened (or one already open): seen
+    /// now, with no address to keep.
+    pub fn contact_seen(&mut self, id: &MeshId) -> Result<(), KeystoreError> {
+        if let Some(peer) = self.peer_mut(id) {
+            peer.seen = Some(unix_now());
+            return Ok(());
+        }
+        self.contact_mut(id)?.seen = Some(unix_now());
+        self.save()
+    }
+
     /// The keys this identity shares with `id` (routing's pair keys).
     pub fn pair_keys(&self, id: &MeshId) -> Option<PairKeys> {
         PairKeys::new(&self.root, id)
@@ -1536,6 +1547,23 @@ mod tests {
             store.add_contact(one_more, ""),
             Err(KeystoreError::TooManyContacts)
         ));
+    }
+
+    /// Seen over a connection they opened (or one already open): no
+    /// address to keep, but a handshake all the same (SPEC-routing `seen`).
+    #[test]
+    fn a_contact_is_seen_over_an_open_connection() {
+        let path = temp_path("seen");
+        let mut store = create(&path);
+        let kim = RootKey::generate().unwrap().id();
+        store.add_contact(kim, "Kim").unwrap();
+        assert!(store.contact(&kim).unwrap().seen.is_none());
+        store.contact_seen(&kim).unwrap();
+        drop(store);
+        let store = Keystore::unlock(&path, "Brendon", PASSWORD).unwrap();
+        let k = store.contact(&kim).unwrap();
+        assert!(k.seen.is_some() && k.last.is_none());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

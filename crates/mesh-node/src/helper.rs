@@ -1139,10 +1139,16 @@ impl Helper {
             Back::Reached(reached) => {
                 let (id, last, list) = *reached;
                 self.peer_used(&id);
-                if let Some(store) = self.store.as_mut()
-                    && let Some(last) = last
-                    && let Err(e) = store.contact_reached(&id, last, list.as_ref())
-                {
+                // Over an open connection there's no address to keep, but
+                // it's a handshake: seen (SPEC-routing `seen`).
+                let saved = (self.store.as_mut()).map(|store| match last {
+                    Some(last) => store.contact_reached(&id, last, list.as_ref()),
+                    None => match store.contact_seen(&id) {
+                        Err(mesh_identity::KeystoreError::NotAContact) => Ok(()),
+                        seen => seen,
+                    },
+                });
+                if let Some(Err(e)) = saved {
                     eprintln!("mesh-node: couldn't save a contact's address: {e}");
                 }
                 if list.is_some() {
