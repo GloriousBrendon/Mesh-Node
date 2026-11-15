@@ -2,10 +2,12 @@
 //! helper as Mesh-Voice uses it.
 #![allow(dead_code)] // each test file uses part of it
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -51,6 +53,31 @@ pub struct Helper {
     pub social: Option<Value>,
     /// Every `meshNote` so far: they come whenever a note arrives.
     pub notes: Vec<Value>,
+    /// stderr so far, read on its own thread: a wait that times out can
+    /// print it, and a full pipe never blocks the helper.
+    err: Arc<Mutex<String>>,
+    err_reader: JoinHandle<()>,
+}
+
+thread_local! {
+    /// Each helper this test thread started: its data folder's name and stderr.
+    static STARTED: RefCell<Vec<(String, Arc<Mutex<String>>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Every helper's stderr so far (counts only), for a test that timed out.
+pub fn stderr_dump() -> String {
+    STARTED.with_borrow(|all| {
+        all.iter()
+            .map(|(name, err)| format!("--- {name} ---\n{}", err.lock().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// Fails the test, printing every helper's stderr first.
+pub fn fail(why: &str) -> ! {
+    eprintln!("{}", stderr_dump());
+    panic!("{why}");
 }
 
 impl Helper {
@@ -79,6 +106,18 @@ impl Helper {
                 .map_while(Result::ok)
                 .for_each(|l| drop(tx.send(l)))
         });
+        let err = Arc::new(Mutex::new(String::new()));
+        let mut from = BufReader::new(child.stderr.take().unwrap());
+        let to = err.clone();
+        let err_reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            while from.read_line(&mut line).is_ok_and(|n| n > 0) {
+                to.lock().unwrap().push_str(&line);
+                line.clear();
+            }
+        });
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        STARTED.with_borrow_mut(|all| all.push((name, err.clone())));
         Self {
             child,
             stdin,
@@ -86,7 +125,14 @@ impl Helper {
             net: None,
             social: None,
             notes: Vec::new(),
+            err,
+            err_reader,
         }
+    }
+
+    /// stderr so far, while it runs.
+    pub fn stderr_so_far(&self) -> String {
+        self.err.lock().unwrap().clone()
     }
 
     /// The helper's process ID (a measurement reads its CPU time).
@@ -98,8 +144,8 @@ impl Helper {
     pub fn line(&mut self) -> (String, Value) {
         let line = match self.stdout.recv_timeout(LINE_TIMEOUT) {
             Ok(line) => line,
-            Err(mpsc::RecvTimeoutError::Timeout) => panic!("mesh-node went quiet"),
-            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("mesh-node exited"),
+            Err(mpsc::RecvTimeoutError::Timeout) => fail("mesh-node went quiet"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => fail("mesh-node exited"),
         };
         let frame: Value = serde_json::from_str(&line).unwrap();
         let payload = serde_json::from_str(frame["payload"].as_str().unwrap()).unwrap();
@@ -203,25 +249,28 @@ impl Helper {
     /// Returns its stderr.
     pub fn crashed(mut self) -> String {
         assert!(!self.child.wait().unwrap().success(), "it crashed");
-        let mut err = String::new();
-        let stderr = self.child.stderr.take().unwrap();
-        BufReader::new(stderr).read_to_string(&mut err).unwrap();
-        err
+        all_stderr(self.err_reader, &self.err)
     }
 
     /// Closes stdin (Mesh quitting); the helper must exit. Returns its stderr.
-    pub fn quit(mut self) -> String {
-        drop(self.stdin);
-        assert!(self.child.wait().unwrap().success());
-        let mut err = String::new();
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
-        err
+    pub fn quit(self) -> String {
+        let Self {
+            mut child,
+            stdin,
+            err,
+            err_reader,
+            ..
+        } = self;
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        all_stderr(err_reader, &err)
     }
+}
+
+/// stderr once the helper has exited: every line, none lost.
+fn all_stderr(reader: JoinHandle<()>, err: &Mutex<String>) -> String {
+    reader.join().unwrap();
+    err.lock().unwrap().clone()
 }
 
 pub fn temp_dir(name: &str) -> std::path::PathBuf {

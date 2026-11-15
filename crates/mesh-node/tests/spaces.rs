@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{Helper, Relay, Seed, temp_dir};
+use common::{Helper, Relay, Seed, fail, temp_dir};
 
 const PASSWORD: &str = "correct horse battery staple";
 /// Short records, so refreshes come every 2 s.
@@ -39,10 +39,9 @@ fn has(social: &Value, list: &str, id: &str) -> bool {
 fn until(h: &mut Helper, binding: &str, done: impl Fn(&Value) -> bool) -> Value {
     let started = Instant::now();
     loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "no {binding} came"
-        );
+        if started.elapsed() > Duration::from_secs(60) {
+            fail(&format!("no {binding} came"));
+        }
         let (got, payload) = h.line();
         if got == binding && done(&payload) {
             return payload;
@@ -55,10 +54,9 @@ fn ask(h: &mut Helper, func: &str, args: &[&str], binding: &str) -> Value {
     h.send(func, args);
     let started = Instant::now();
     loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "{func}: no {binding}"
-        );
+        if started.elapsed() > Duration::from_secs(60) {
+            fail(&format!("{func}: no {binding}"));
+        }
         let (got, payload) = h.event();
         if got == binding || got == "meshError" {
             assert_eq!(got, binding, "{func} answered {payload}");
