@@ -559,6 +559,69 @@ fn history_cant_be_forged() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// Own-device sync (dm D8, SPEC-spaces D8 unchanged): B links a laptop. The
+/// laptop gets the club with what was said, works out the same peers, hears
+/// C live, and what it posts reaches B's desk and C.
+#[test]
+fn a_linked_device_gets_the_spaces() {
+    let mut k = club("spaces-own");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "before the laptop"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.b, "meshSpaceNotify", |n| {
+        n["text"] == "before the laptop"
+    });
+
+    let dir = temp_dir(&format!("spaces-own-laptop-{s}"));
+    let args = ["--seed", &k.ticket, "--record-ttl", TTL, "--peer-idle", "3"];
+    let mut laptop = Helper::start_with(&dir, &k._relay, &args);
+    assert_eq!(laptop.event().0, "meshIdentity");
+    let shown = ask(&mut k.b, "linkStart", &[], "meshLink");
+    let code = shown["code"].as_str().unwrap().to_owned();
+    laptop.send("linkJoin", &[&code, "laptop"]);
+    until(&mut k.b, "meshLinkConfirm", |_| true);
+    ask(&mut k.b, "linkConfirm", &["true"], "meshLinkDone");
+    until(&mut laptop, "meshLinkReceived", |_| true);
+    ask(
+        &mut laptop,
+        "linkFinish",
+        &["bea", PASSWORD],
+        "meshIdentity",
+    );
+
+    // The club and its past, from B's desk.
+    let texts = history_until(&mut laptop, &s, &g, &["before the laptop"]);
+    assert_eq!(texts, ["before the laptop"]);
+    // C, a stranger to B, is the laptop's peer too: C's next line comes live.
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "hello laptop"],
+        "meshSpaceMessages",
+    );
+    until(&mut laptop, "meshSpaceNotify", |n| {
+        n["text"] == "hello laptop"
+    });
+    // What the laptop says reaches C, and B's desk shows it as B's.
+    ask(
+        &mut laptop,
+        "spaceSend",
+        &[&s, &g, "from the laptop"],
+        "meshSpaceMessages",
+    );
+    let told = until(&mut k.c, "meshSpaceNotify", |n| {
+        n["text"] == "from the laptop"
+    });
+    assert_eq!(told["from"], k.id_b.as_str());
+    let desk = texts_until(&mut k.b, &s, &g, &["from the laptop"]);
+    assert!(desk.contains(&"hello laptop".to_owned()), "{desk:?}");
+    let _ = (laptop.quit(), k.o.quit(), k.b.quit(), k.c.quit(), &k.id_o);
+}
+
 /// A line written after someone was added is news to them however it comes:
 /// D is added while locked, B posts and locks, and D, back, gets B's line
 /// only in O's history. D is told of it, and not of what was said before.
