@@ -13,7 +13,22 @@ const PASSWORD: &str = "correct horse battery staple";
 const TTL: &str = "8";
 
 fn helper(dir: &std::path::Path, relay: &Relay, seed: &str, name: &str) -> (Helper, String) {
-    let args = ["--seed", seed, "--record-ttl", TTL, "--peer-idle", "3"];
+    helper_ttl(dir, relay, seed, name, Some(TTL))
+}
+
+/// `helper`, with its records' life: `None` is the real one, and so the
+/// real refresh (every 30 minutes).
+fn helper_ttl(
+    dir: &std::path::Path,
+    relay: &Relay,
+    seed: &str,
+    name: &str,
+    ttl: Option<&str>,
+) -> (Helper, String) {
+    let mut args = vec!["--seed", seed, "--peer-idle", "3"];
+    if let Some(ttl) = ttl {
+        args.extend(["--record-ttl", ttl]);
+    }
     let mut h = Helper::start_with(dir, relay, &args);
     assert_eq!(h.event().0, "meshIdentity");
     let id = h.expect("idCreate", &[name, PASSWORD], "meshIdentity")["id"]
@@ -36,10 +51,20 @@ fn has(social: &Value, list: &str, id: &str) -> bool {
 /// The next `binding` event that `done` accepts; other events are skipped.
 // It reads every line itself, `meshNet` included, so the 60 s limit holds
 // even while the network keeps reporting.
-fn until(h: &mut Helper, binding: &str, mut done: impl FnMut(&Value) -> bool) -> Value {
+fn until(h: &mut Helper, binding: &str, done: impl FnMut(&Value) -> bool) -> Value {
+    until_for(h, binding, Duration::from_secs(60), done)
+}
+
+/// `until`, waiting at most `limit`.
+fn until_for(
+    h: &mut Helper,
+    binding: &str,
+    limit: Duration,
+    mut done: impl FnMut(&Value) -> bool,
+) -> Value {
     let started = Instant::now();
     loop {
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > limit {
             fail(&format!("no {binding} came"));
         }
         let (got, payload) = h.line();
@@ -120,13 +145,18 @@ fn club(name: &str) -> Club {
 
 /// `club`, with a seed started with `seed_args`.
 fn club_with(name: &str, seed_args: &[&str]) -> Club {
+    club_ttl(name, seed_args, Some(TTL))
+}
+
+/// `club_with`, everyone's records lasting `ttl` (`None`: the real life).
+fn club_ttl(name: &str, seed_args: &[&str], ttl: Option<&str>) -> Club {
     let dirs = ["seed", "o", "b", "c"].map(|n| temp_dir(&format!("{name}-{n}")));
     let relay = Relay::start();
     let mut seed = Seed::start_with(&dirs[0], &relay, seed_args);
     let ticket = seed.ticket();
-    let (mut o, id_o) = helper(&dirs[1], &relay, &ticket, "owen");
-    let (mut b, id_b) = helper(&dirs[2], &relay, &ticket, "bea");
-    let (mut c, id_c) = helper(&dirs[3], &relay, &ticket, "cal");
+    let (mut o, id_o) = helper_ttl(&dirs[1], &relay, &ticket, "owen", ttl);
+    let (mut b, id_b) = helper_ttl(&dirs[2], &relay, &ticket, "bea", ttl);
+    let (mut c, id_c) = helper_ttl(&dirs[3], &relay, &ticket, "cal", ttl);
     befriend(&mut o, &id_o, &mut b, &id_b);
     befriend(&mut o, &id_o, &mut c, &id_c);
 
@@ -996,4 +1026,261 @@ fn read_all(dir: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// PLAN-spaces Task 11 (your review, 2026-11-15): a join with the real
+/// refresh (every 30 minutes). From O's add of D, how long until D and
+/// each old member see a line from the other.
+#[test]
+#[ignore]
+fn measure_a_join_with_the_real_refresh() {
+    let mut k = club_ttl("spaces-join-real", &[], None);
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let dir = temp_dir(&format!("spaces-join-real-dee-{s}"));
+    let (mut d, id_d) = helper_ttl(&dir, &k._relay, &k.ticket, "dee", None);
+    befriend(&mut k.o, &k.id_o, &mut d, &id_d);
+    let long = Duration::from_secs(40 * 60);
+    let added = Instant::now();
+    ask(&mut k.o, "spaceAdd", &[&s, &id_d], "meshSpaces");
+    until_for(&mut d, "meshSpaces", long, |v| {
+        v["spaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sp| sp["id"] == s)
+    });
+    let holds = added.elapsed();
+    ask(
+        &mut d,
+        "spaceSend",
+        &[&s, &g, "from dee"],
+        "meshSpaceMessages",
+    );
+    until_for(&mut k.b, "meshSpaceNotify", long, |n| {
+        n["text"] == "from dee"
+    });
+    let to_b = added.elapsed();
+    until_for(&mut k.c, "meshSpaceNotify", long, |n| {
+        n["text"] == "from dee"
+    });
+    let to_c = added.elapsed();
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "from bea"],
+        "meshSpaceMessages",
+    );
+    until_for(&mut d, "meshSpaceNotify", long, |n| n["text"] == "from bea");
+    let from_b = added.elapsed();
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "from cal"],
+        "meshSpaceMessages",
+    );
+    until_for(&mut d, "meshSpaceNotify", long, |n| n["text"] == "from cal");
+    let from_c = added.elapsed();
+    eprintln!(
+        "join, real refresh, from the add: D holds the Space {holds:?}; D's line at B {to_b:?}, at C {to_c:?}; B's line at D {from_b:?}; C's line at D {from_c:?}"
+    );
+    let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// A seed's reported address counts: the sum of `what` ("lookups",
+/// "address puts") over its report lines.
+fn seed_address(lines: &[String], what: &str) -> u64 {
+    (lines.iter())
+        .filter_map(|l| l.strip_prefix("mesh-node seed: last hour "))
+        .filter(|l| !l.starts_with("mail "))
+        .flat_map(|l| l.split([',', ';', '(']))
+        .filter_map(|part| {
+            let (n, label) = part.trim().split_once(' ')?;
+            (label == what).then(|| n.parse::<u64>().ok()).flatten()
+        })
+        .sum()
+}
+
+/// A process's CPU time in clock ticks, and the bytes it has written
+/// through syscalls (sockets included), from /proc.
+fn cpu_and_written(pid: u32) -> (u64, u64) {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let f: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    let tick = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_default();
+    let written = (io.lines())
+        .find_map(|l| l.strip_prefix("wchar: "))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    (tick(11) + tick(12), written)
+}
+
+/// Test 9 (an `--ignored` measurement, recorded in PLAN-spaces): a Space of
+/// 50, one device each. A line to all 49; for one line, the sender's CPU,
+/// bytes, connections and the seed's puts; unlock with 5 such Spaces; ten
+/// minutes with 45 away (one line a minute) and the seed's lookups; and a
+/// returning device's hello: its lookups and its time to reach everyone
+/// online.
+#[test]
+#[ignore]
+fn measure_fifty_members() {
+    const N: usize = 50;
+    let relay = Relay::start();
+    let seed_dir = temp_dir("spaces-fifty-seed");
+    let mut seed = Seed::start_with(&seed_dir, &relay, &["--report-every", "1"]);
+    let ticket = seed.ticket();
+    let started = Instant::now();
+    let mut hs: Vec<(Helper, String)> = (0..N)
+        .map(|i| {
+            let dir = temp_dir(&format!("spaces-fifty-{i}"));
+            helper(&dir, &relay, &ticket, &format!("m{i}"))
+        })
+        .collect();
+    let ids: Vec<String> = hs.iter().map(|(_, id)| id.clone()).collect();
+    let (o, rest) = hs.split_first_mut().unwrap();
+    for (h, id) in rest.iter_mut() {
+        befriend(&mut o.0, &ids[0], h, id);
+    }
+    // Five Spaces of all 50; the first with #general.
+    let mut spaces = Vec::new();
+    for n in 0..5 {
+        let made = ask(
+            &mut o.0,
+            "spaceCreate",
+            &[&format!("fifty{n}")],
+            "meshSpaces",
+        );
+        spaces.push(
+            space(&made, &format!("fifty{n}"))["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let made = ask(
+        &mut o.0,
+        "spaceChannel",
+        &[&spaces[0], "general", "everyone"],
+        "meshSpaces",
+    );
+    let g = channel(space(&made, "fifty0"), "general");
+    for s in &spaces {
+        for id in &ids[1..] {
+            ask(&mut o.0, "spaceAdd", &[s, id], "meshSpaces");
+        }
+    }
+    let full = |v: &Value| {
+        let held = v["spaces"].as_array().unwrap();
+        held.len() == 5
+            && held
+                .iter()
+                .all(|s| s["members"].as_array().unwrap().len() == N)
+    };
+    for (h, _) in hs.iter_mut().skip(1) {
+        h.send("spaceList", &[]);
+        until_for(h, "meshSpaces", Duration::from_secs(600), full);
+    }
+    eprintln!("fifty: set up in {:?}", started.elapsed());
+    let s = spaces[0].clone();
+    let line_to_all = |hs: &mut Vec<(Helper, String)>, from: usize, text: &str| -> Duration {
+        let t = Instant::now();
+        ask(
+            &mut hs[from].0,
+            "spaceSend",
+            &[&s, &g, text],
+            "meshSpaceMessages",
+        );
+        for (i, (h, _)) in hs.iter_mut().enumerate() {
+            if i != from {
+                until_for(h, "meshSpaceNotify", Duration::from_secs(300), |n| {
+                    n["text"] == text
+                });
+            }
+        }
+        t.elapsed()
+    };
+    // B (m1) has met none of the other 48: the first line dials them.
+    let first = line_to_all(&mut hs, 1, "first");
+    std::thread::sleep(Duration::from_secs(2));
+    seed.drain();
+    let pid = hs[1].0.pid();
+    let (cpu0, w0) = cpu_and_written(pid);
+    let second = line_to_all(&mut hs, 1, "second");
+    let (cpu1, w1) = cpu_and_written(pid);
+    std::thread::sleep(Duration::from_secs(2));
+    let lines = seed.drain();
+    let connections = ask(&mut hs[1].0, "netStatus", &[], "meshNet")["connections"].clone();
+    eprintln!(
+        "fifty: a line to all 49: first {first:?} (with its dials), second {second:?}; for the second, B's CPU {} ticks, {} bytes written, {connections} connections open, seed {} address puts, {} lookups",
+        cpu1 - cpu0,
+        w1 - w0,
+        seed_address(&lines, "address puts"),
+        seed_address(&lines, "lookups"),
+    );
+    // O's unlock with 5 such Spaces.
+    ask(&mut hs[0].0, "idLock", &[], "meshIdentity");
+    let t = Instant::now();
+    hs[0].0.send("idUnlock", &["m0", PASSWORD]);
+    until(&mut hs[0].0, "meshIdentity", |i| i["state"] == "unlocked");
+    let unlocked = t.elapsed();
+    until(&mut hs[0].0, "meshNet", |n| n["state"] == "online");
+    let online = t.elapsed();
+    hs[0].0.send("spaceList", &[]);
+    until(&mut hs[0].0, "meshSpaces", full);
+    let listed = t.elapsed();
+    eprintln!(
+        "fifty: O's unlock with 5 Spaces of 50: unlocked {unlocked:?}, online {online:?}, Spaces listed {listed:?} ({:?} after online)",
+        listed - online
+    );
+    // 45 away (m5 to m49); B says a line a minute for ten minutes.
+    for (h, _) in hs.iter_mut().skip(5) {
+        ask(h, "idLock", &[], "meshIdentity");
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    seed.drain();
+    for minute in 0..10 {
+        let text = format!("minute {minute}");
+        ask(
+            &mut hs[1].0,
+            "spaceSend",
+            &[&s, &g, &text],
+            "meshSpaceMessages",
+        );
+        std::thread::sleep(Duration::from_secs(60));
+    }
+    let lines = seed.drain();
+    eprintln!(
+        "fifty: ten minutes, 45 away, a line a minute from B: seed {} lookups, {} address puts",
+        seed_address(&lines, "lookups"),
+        seed_address(&lines, "address puts"),
+    );
+    // m49 comes back: its hello's lookups, and its time to reach the 5 online.
+    let t = Instant::now();
+    hs[49].0.send("idUnlock", &["m49", PASSWORD]);
+    until(&mut hs[49].0, "meshNet", |n| n["state"] == "online");
+    ask(
+        &mut hs[49].0,
+        "spaceSend",
+        &[&s, &g, "back"],
+        "meshSpaceMessages",
+    );
+    for (h, _) in hs.iter_mut().take(5) {
+        until_for(h, "meshSpaceNotify", Duration::from_secs(300), |n| {
+            n["text"] == "back"
+        });
+    }
+    let reached = t.elapsed();
+    std::thread::sleep(Duration::from_secs(60));
+    let lines = seed.drain();
+    eprintln!(
+        "fifty: a returning device: its line reached the 5 online {reached:?} after unlock; seed lookups in that minute {}",
+        seed_address(&lines, "lookups"),
+    );
+    for (h, _) in hs {
+        let _ = h.quit();
+    }
 }

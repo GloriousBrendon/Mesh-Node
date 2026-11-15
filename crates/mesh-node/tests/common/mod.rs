@@ -348,6 +348,13 @@ impl Seed {
         }
     }
 
+    /// The log lines that have come since the last look, without waiting.
+    pub fn drain(&mut self) -> Vec<String> {
+        let lines: Vec<String> = self.lines.try_iter().collect();
+        self.log.extend(lines.iter().cloned());
+        lines
+    }
+
     /// SIGTERM, as Docker and systemd stop it (Ctrl-Break on Windows);
     /// returns the whole log.
     pub fn stop(mut self) -> Vec<String> {
