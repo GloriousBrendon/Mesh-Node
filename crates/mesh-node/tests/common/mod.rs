@@ -60,6 +60,7 @@ pub struct Helper {
 }
 
 thread_local! {
+    static FOLDERS: Folders = Folders::default();
     /// Each helper this test thread started: its data folder's name and stderr.
     static STARTED: RefCell<Vec<(String, Arc<Mutex<String>>)>> = const { RefCell::new(Vec::new()) };
 }
@@ -276,7 +277,40 @@ fn all_stderr(reader: JoinHandle<()>, err: &Mutex<String>) -> String {
 pub fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("mesh-node-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = FOLDERS.try_with(|f| f.failed.set(true));
+            default(info)
+        }));
+    });
+    FOLDERS.with(|f| f.made.borrow_mut().push(dir.clone()));
     dir
+}
+
+/// The folders this test thread made: removed as it ends, if it passed.
+#[derive(Default)]
+struct Folders {
+    made: RefCell<Vec<std::path::PathBuf>>,
+    failed: std::cell::Cell<bool>,
+}
+
+impl Drop for Folders {
+    fn drop(&mut self) {
+        if self.failed.get() {
+            return;
+        }
+        for dir in self.made.take() {
+            // Helpers told to quit may still be writing as they exit.
+            for _ in 0..10 {
+                if std::fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
 /// A `mesh-node seed` process on the test relay.

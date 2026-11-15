@@ -231,7 +231,40 @@ pub fn move_aside(path: &Path) -> std::io::Result<()> {
 pub(crate) fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mesh-maillog-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = FOLDERS.try_with(|f| f.failed.set(true));
+            default(info)
+        }));
+    });
+    FOLDERS.with(|f| f.made.borrow_mut().push(dir.clone()));
     dir
+}
+
+#[cfg(test)]
+thread_local! {
+    static FOLDERS: Folders = Folders::default();
+}
+
+/// The folders this test thread made: removed as it ends, if it passed.
+#[cfg(test)]
+#[derive(Default)]
+struct Folders {
+    made: std::cell::RefCell<Vec<PathBuf>>,
+    failed: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl Drop for Folders {
+    fn drop(&mut self) {
+        if !self.failed.get() {
+            for dir in self.made.take() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +275,29 @@ pub(crate) fn tests_contain(hay: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test that passes leaves no folder behind (the mail store's grow to
+    /// 54 MB); one that fails keeps its own.
+    #[test]
+    fn a_passing_test_leaves_no_folder() {
+        let made = |name: &'static str, fails: bool| {
+            std::thread::spawn(move || {
+                let dir = temp(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("log"), b"x").unwrap();
+                assert!(!fails, "a failing test");
+                dir
+            })
+            .join()
+        };
+        let passed = made("folder-pass", false).unwrap();
+        assert!(!passed.exists(), "{passed:?} is still there");
+        assert!(made("folder-fail", true).is_err());
+        let failed =
+            std::env::temp_dir().join(format!("mesh-maillog-{}-folder-fail", std::process::id()));
+        assert!(failed.exists(), "a failed test's folder is kept");
+        std::fs::remove_dir_all(failed).unwrap();
+    }
 
     fn all(path: &Path) -> Result<Vec<Vec<u8>>, LogError> {
         let mut got = Vec::new();

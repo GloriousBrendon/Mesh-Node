@@ -1301,3 +1301,26 @@ fn measure_fifty_members() {
         let _ = h.quit();
     }
 }
+
+/// A test that passes leaves no folders behind; one that fails keeps its
+/// own, to look at (each test runs on its own thread).
+#[test]
+fn a_passing_test_leaves_no_folders() {
+    let made = |name: &'static str, fails: bool| {
+        std::thread::spawn(move || {
+            let dir = temp_dir(name);
+            std::fs::create_dir_all(dir.join("inner")).unwrap();
+            std::fs::write(dir.join("inner/file"), b"x").unwrap();
+            assert!(!fails, "a failing test");
+            dir
+        })
+        .join()
+    };
+    let passed = made("folders-pass", false).unwrap();
+    assert!(!passed.exists(), "{passed:?} is still there");
+    assert!(made("folders-fail", true).is_err());
+    let failed =
+        std::env::temp_dir().join(format!("mesh-node-folders-fail-{}", std::process::id()));
+    assert!(failed.exists(), "a failed test's folder is kept");
+    std::fs::remove_dir_all(failed).unwrap();
+}
