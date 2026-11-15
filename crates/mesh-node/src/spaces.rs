@@ -28,7 +28,8 @@ use mesh_transport::MeshAddr;
 use serde_json::{Value, json};
 
 use super::{
-    Back, Fail, Helper, Reached, Target, dm, e2ee, emit, mail, parse_id, routing, unix_now,
+    Back, Fail, Helper, ReachError, Reached, Target, dm, e2ee, emit, mail, parse_id, routing,
+    unix_now,
 };
 
 /// A device's answer to a batch of Space events: who, which device, each
@@ -75,19 +76,26 @@ pub const PEER_IDLE: Duration = Duration::from_secs(60);
 pub(super) const PEER_RETRY: Duration = Duration::from_secs(30 * 60);
 /// How often idle peers are closed and the hello paced, at most.
 pub(super) const PEER_TICK: Duration = Duration::from_secs(5);
-/// Hello lookups a minute: under the seed's `GETS_PER_DEVICE` (S14).
-pub(super) const HELLO_LOOKUPS: u32 = 100;
 /// Hello dials under way at once (S14).
 pub(super) const HELLO_DIALS: usize = 32;
 /// Hello pauses while more connections than this are open (S14): three
 /// quarters of transport's 256.
 pub(super) const HELLO_ROOM: usize = 192;
-const _: () = assert!(HELLO_LOOKUPS < crate::addrs::GETS_PER_DEVICE);
 /// A hello that found nobody (their record may not be at the seed yet, as
 /// when both sides were just added) is tried again after this, at most
 /// `HELLO_TRIES` times in all. It doesn't start `PEER_RETRY`.
 pub(super) const HELLO_AGAIN: Duration = Duration::from_secs(10);
 pub(super) const HELLO_TRIES: u32 = 3;
+
+/// How a dial came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialled {
+    Reached,
+    /// No record, or no device answered.
+    Away,
+    /// The seed refused the lookup for its limit.
+    Slowed,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum PeerDial {
@@ -102,8 +110,6 @@ pub(super) struct PeerWire {
     used: HashMap<[u8; 32], Instant>,
     retry: HashMap<[u8; 32], Instant>,
     hello: VecDeque<MeshId>,
-    /// The minute the hello's lookups are counted in, and how many so far.
-    minute: Option<(Instant, u32)>,
     dialling: usize,
     /// Hellos that found nobody: how many tries each has had, and those
     /// due again.
@@ -118,7 +124,6 @@ impl PeerWire {
             used: HashMap::new(),
             retry: HashMap::new(),
             hello: VecDeque::new(),
-            minute: None,
             dialling: 0,
             hello_tries: HashMap::new(),
             hello_later: Vec::new(),
@@ -162,14 +167,17 @@ impl PeerWire {
 
     /// A dial of `who` came back: reached, their retry clears (as when they
     /// reach us); a send's miss starts it; a hello's miss tries again soon.
-    pub(super) fn dialled(&mut self, who: &MeshId, reached: bool, hello: bool, now: Instant) {
+    /// A lookup the seed refused is no miss: dialled again soon, no try
+    /// counted.
+    pub(super) fn dialled(&mut self, who: &MeshId, how: Dialled, hello: bool, now: Instant) {
         if hello {
             self.hello_done();
         }
-        match (reached, hello) {
-            (true, _) => self.heard(who, now),
-            (false, true) => self.hello_missed(who, now),
-            (false, false) => self.missed(who, now),
+        match (how, hello) {
+            (Dialled::Reached, _) => self.heard(who, now),
+            (Dialled::Slowed, _) => self.hello_later.push((now + HELLO_AGAIN, *who)),
+            (Dialled::Away, true) => self.hello_missed(who, now),
+            (Dialled::Away, false) => self.missed(who, now),
         }
     }
 
@@ -194,24 +202,18 @@ impl PeerWire {
         }
     }
 
-    /// The next hellos to dial: at most `HELLO_LOOKUPS` a minute and
-    /// `HELLO_DIALS` under way, none while `open` is above `HELLO_ROOM`.
-    pub(super) fn next_hellos(&mut self, now: Instant, open: usize) -> Vec<MeshId> {
+    /// The next hellos to dial: `HELLO_DIALS` under way at most, none
+    /// while `open` is above `HELLO_ROOM`. Their lookups wait their turn
+    /// in the address-get budget's spare (`routing::Gets::spare`).
+    pub(super) fn next_hellos(&mut self, _now: Instant, open: usize) -> Vec<MeshId> {
         if open > HELLO_ROOM {
             return Vec::new();
         }
-        let minute = Duration::from_secs(60);
-        let (start, count) = match self.minute {
-            Some((start, count)) if now.saturating_duration_since(start) < minute => (start, count),
-            _ => (now, 0),
-        };
-        let room = (HELLO_LOOKUPS - count) as usize;
-        let take = room
-            .min(HELLO_DIALS.saturating_sub(self.dialling))
+        let take = HELLO_DIALS
+            .saturating_sub(self.dialling)
             .min(self.hello.len());
         let out: Vec<MeshId> = self.hello.drain(..take).collect();
         self.dialling += out.len();
-        self.minute = Some((start, count + out.len() as u32));
         out
     }
 
@@ -1724,7 +1726,7 @@ impl Helper {
         tokio::spawn(async move {
             if let Some(Reached { last, list, .. }) = routing::reach_known(&node, &target).await {
                 let _ = back.send(Back::Reached(Box::new((id, last, list))));
-                let _ = back.send(Back::Hello(id, true, false));
+                let _ = back.send(Back::Hello(id, Dialled::Reached, false));
             }
         });
     }
@@ -1736,23 +1738,33 @@ impl Helper {
         };
         let back = self.back.clone();
         let Some(target) = Target::of(store, id) else {
-            let _ = back.send(Back::Hello(*id, false, hello));
+            let _ = back.send(Back::Hello(*id, Dialled::Away, hello));
             return;
         };
         let (node, anon) = (net.node.clone(), net.anon.clone());
+        // The hello takes only spare gets: sends and key lookups go first.
+        let gets = if hello {
+            net.gets.spare()
+        } else {
+            net.gets.clone()
+        };
         let (seeds, id) = (self.seeds.clone(), *id);
         tokio::spawn(async move {
-            let reached = routing::reach(node, &anon, &seeds, target, unix_now()).await;
-            let ok = reached.is_ok();
-            if let Ok(Reached { last, list, .. }) = reached {
-                let _ = back.send(Back::Reached(Box::new((id, last, list))));
-            }
-            let _ = back.send(Back::Hello(id, ok, hello));
+            let reached = routing::reach(node, &anon, &gets, &seeds, target, unix_now()).await;
+            let how = match reached {
+                Ok(Reached { last, list, .. }) => {
+                    let _ = back.send(Back::Reached(Box::new((id, last, list))));
+                    Dialled::Reached
+                }
+                Err(ReachError::Slowed) => Dialled::Slowed,
+                Err(_) => Dialled::Away,
+            };
+            let _ = back.send(Back::Hello(id, how, hello));
         });
     }
 
-    pub(super) fn hello_back(&mut self, id: &MeshId, reached: bool, hello: bool) {
-        self.wire.dialled(id, reached, hello, Instant::now());
+    pub(super) fn hello_back(&mut self, id: &MeshId, how: Dialled, hello: bool) {
+        self.wire.dialled(id, how, hello, Instant::now());
     }
 
     /// Opens the list of Spaces and works out the peers, as networking
@@ -1892,17 +1904,39 @@ mod tests {
         let mut wire = PeerWire::new(PEER_IDLE);
         let [a] = ids(1).try_into().unwrap();
         assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
-        wire.dialled(&a, false, false, t0);
+        wire.dialled(&a, Dialled::Away, false, t0);
         assert_eq!(wire.dial_kind(&a, t0), PeerDial::LastOnly);
         // A send's dial to their last address got through.
-        wire.dialled(&a, true, false, t0);
+        wire.dialled(&a, Dialled::Reached, false, t0);
         assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
         // So does a hello that reaches them; one that misses starts no retry.
-        wire.dialled(&a, false, false, t0);
-        wire.dialled(&a, true, true, t0);
+        wire.dialled(&a, Dialled::Away, false, t0);
+        wire.dialled(&a, Dialled::Reached, true, t0);
         assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
-        wire.dialled(&a, false, true, t0);
+        wire.dialled(&a, Dialled::Away, true, t0);
         assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
+    }
+
+    /// A lookup the seed refused for its limit isn't "away": no retry
+    /// starts, and they're dialled again soon, however often it happens
+    /// (it costs no hello try).
+    #[test]
+    fn a_slowed_lookup_is_not_away() {
+        let t0 = Instant::now();
+        let mut wire = PeerWire::new(PEER_IDLE);
+        let [a, b] = ids(2).try_into().unwrap();
+        wire.dialled(&a, Dialled::Slowed, false, t0);
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp, "no PEER_RETRY");
+        let mut at = t0;
+        for _ in 0..HELLO_TRIES + 2 {
+            at += HELLO_AGAIN;
+            wire.hellos_due(at);
+            let next = wire.next_hellos(at, 0);
+            assert_eq!(next, [a], "dialled again soon");
+            wire.dialled(&a, Dialled::Slowed, true, at);
+        }
+        wire.dialled(&b, Dialled::Away, false, t0);
+        assert_eq!(wire.dial_kind(&b, t0), PeerDial::LastOnly);
     }
 
     #[test]
@@ -1918,28 +1952,10 @@ mod tests {
         for _ in 0..HELLO_DIALS {
             wire.hello_done();
         }
-        // At most HELLO_LOOKUPS in a minute, whatever comes back.
-        let mut this_minute = first.len();
-        loop {
-            let next = wire.next_hellos(t0 + Duration::from_secs(1), 0);
-            if next.is_empty() {
-                break;
-            }
-            this_minute += next.len();
-            for _ in 0..next.len() {
-                wire.hello_done();
-            }
-        }
-        assert_eq!(this_minute, HELLO_LOOKUPS as usize);
-        // A new minute goes on, but not while connections are near the cap.
-        assert!(
-            wire.next_hellos(t0 + Duration::from_secs(61), HELLO_ROOM + 1)
-                .is_empty()
-        );
-        assert_eq!(
-            wire.next_hellos(t0 + Duration::from_secs(61), 0).len(),
-            HELLO_DIALS
-        );
+        // The pace a minute is the address-get budget's (routing::Gets);
+        // none while connections are near the cap.
+        assert!(wire.next_hellos(t0, HELLO_ROOM + 1).is_empty());
+        assert_eq!(wire.next_hellos(t0, 0).len(), HELLO_DIALS);
         // Each person once, however often queued.
         let mut all = first;
         let mut seen: HashSet<[u8; 32]> = all.iter().map(|m| m.to_bytes()).collect();

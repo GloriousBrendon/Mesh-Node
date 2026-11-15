@@ -64,13 +64,14 @@ pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 // ponytail: one seed stream per contact; batch them when contact lists grow.
 pub async fn fetch(
     anon: &Node,
+    gets: &routing::Gets,
     seeds: &[MeshAddr],
     targets: Vec<Target>,
     now: u64,
 ) -> Vec<(MeshId, Vec<AddrRecord>)> {
     let mut found = Vec::new();
     for target in targets {
-        if let Ok((records, _)) = routing::find(anon, seeds, &target, now).await {
+        if let Ok((records, _)) = routing::find(anon, gets, seeds, &target, now).await {
             found.push((target.id, records));
         }
     }

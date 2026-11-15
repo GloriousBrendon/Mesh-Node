@@ -4,7 +4,9 @@
 //! for them (D8). Seed requests go from the throwaway node (seed D7b).
 
 use std::cmp::Reverse;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::addrs::{Get, Put};
 use crate::seed;
@@ -17,6 +19,66 @@ use mesh_transport::{MeshAddr, Node, Pong, RelayUrl};
 pub const RECORD_TTL: u64 = 2 * 3600;
 /// How often records are refreshed, at most (D4).
 pub const REFRESH_EVERY: u64 = 30 * 60;
+
+/// Address gets this device makes in any 60 s, at most: under the seed's
+/// `GETS_PER_DEVICE` with room for clocks and the link's own (S14).
+pub const GETS_A_MINUTE: usize = 110;
+/// Gets one `find` costs a seed: today's lookup and yesterday's.
+pub const GETS_PER_FIND: usize = 2;
+/// Gets the spare side (the hello) leaves for sends and key lookups.
+pub const SPARE_KEEPS: usize = 20;
+/// A get the seed refused anyway is asked again after this, this many times.
+const SLOWED_AGAIN: Duration = Duration::from_secs(10);
+const SLOWED_TRIES: u32 = 3;
+
+/// One budget for every address get a helper makes (S14): a sliding
+/// minute, so it holds whenever the seed's own minute starts. A cheap clone
+/// shares it.
+#[derive(Clone, Default)]
+pub struct Gets {
+    sent: Arc<Mutex<VecDeque<Instant>>>,
+    /// Left free for others: `spare`'s takes stop this short.
+    keep: usize,
+}
+
+impl Gets {
+    /// The same budget, taking only what leaves `SPARE_KEEPS` free.
+    pub fn spare(&self) -> Gets {
+        Gets {
+            sent: self.sent.clone(),
+            keep: SPARE_KEEPS,
+        }
+    }
+
+    /// Takes `n` gets now, or says how long until they'd fit.
+    pub fn try_take(&self, n: usize, now: Instant) -> Option<Duration> {
+        let minute = Duration::from_secs(60);
+        let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        while sent
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= minute)
+        {
+            sent.pop_front();
+        }
+        let n = n.min(GETS_A_MINUTE - self.keep);
+        let over = (sent.len() + n + self.keep).saturating_sub(GETS_A_MINUTE);
+        if over == 0 {
+            sent.extend(std::iter::repeat_n(now, n));
+            return None;
+        }
+        // The `over`th oldest leaving frees enough.
+        Some((sent[over - 1] + minute).saturating_duration_since(now))
+    }
+
+    /// Takes `n` gets, waiting its turn.
+    // ponytail: waiters wake on their own timers, not in order; a queue if
+    // one starves.
+    pub async fn take(&self, n: usize) {
+        while let Some(wait) = self.try_take(n, Instant::now()) {
+            tokio::time::sleep(wait.max(Duration::from_millis(50))).await;
+        }
+    }
+}
 
 /// This device's record for each contact, and one under the self pair for
 /// our other devices (SPEC-social D11), on `relay`. `field` gives each one's
@@ -106,6 +168,8 @@ pub struct Reached {
 pub enum ReachError {
     /// No record, or no device answered.
     Unreachable,
+    /// The seed refused the lookup for its limit: not away, ask again soon.
+    Slowed,
     /// Records came back, but only for devices their newest list removed.
     RevokedDevice,
 }
@@ -149,6 +213,7 @@ pub async fn reach_known(node: &Node, target: &Target) -> Option<Reached> {
 pub async fn reach(
     node: Arc<Node>,
     anon: &Node,
+    gets: &Gets,
     seeds: &[MeshAddr],
     target: Target,
     now: u64,
@@ -156,7 +221,7 @@ pub async fn reach(
     if let Some(reached) = reach_known(&node, &target).await {
         return Ok(reached);
     }
-    let (records, newest) = find(anon, seeds, &target, now).await?;
+    let (records, newest) = find(anon, gets, seeds, &target, now).await?;
     let mut pings = tokio::task::JoinSet::new();
     for record in records {
         let device = *record.device.as_bytes();
@@ -190,12 +255,13 @@ pub async fn reach(
 /// counting this one.
 pub async fn own_devices(
     anon: &Node,
+    gets: &Gets,
     seeds: &[MeshAddr],
     own: &Target,
     this: &[u8; 32],
     now: u64,
 ) -> Vec<MeshAddr> {
-    let Ok((records, _)) = find(anon, seeds, own, now).await else {
+    let Ok((records, _)) = find(anon, gets, seeds, own, now).await else {
         return Vec::new();
     };
     records
@@ -210,6 +276,7 @@ pub async fn own_devices(
 /// only devices their newest known list still has. Also that list.
 pub async fn find(
     anon: &Node,
+    gets: &Gets,
     seeds: &[MeshAddr],
     target: &Target,
     now: u64,
@@ -218,20 +285,33 @@ pub async fn find(
     let lookups =
         [today, today.saturating_sub(1)].map(|day| target.keys.lookup(&target.id, day).to_vec());
     let mut found: Vec<AddrRecord> = Vec::new();
-    for addr in seeds {
-        let Ok(answers) = seed::ask_many(anon, addr, seed::ADDR_GET, &lookups).await else {
-            continue;
-        };
-        for answer in answers {
-            if let Some(Get::Found(sealed)) = Get::from_bytes(&answer) {
-                // Anything that doesn't open is someone else's, or junk.
-                found.extend(
-                    sealed
-                        .iter()
-                        .filter_map(|r| open_addr(&target.keys, &target.id, r, now).ok()),
-                );
+    for tried in 1..=SLOWED_TRIES {
+        let mut slowed = false;
+        for addr in seeds {
+            gets.take(GETS_PER_FIND).await;
+            let Ok(answers) = seed::ask_many(anon, addr, seed::ADDR_GET, &lookups).await else {
+                continue;
+            };
+            for answer in answers {
+                match Get::from_bytes(&answer) {
+                    // Anything that doesn't open is someone else's, or junk.
+                    Some(Get::Found(sealed)) => found.extend(
+                        sealed
+                            .iter()
+                            .filter_map(|r| open_addr(&target.keys, &target.id, r, now).ok()),
+                    ),
+                    Some(Get::SlowDown) => slowed = true,
+                    None => {}
+                }
             }
         }
+        if !found.is_empty() || !slowed {
+            break;
+        }
+        if tried == SLOWED_TRIES {
+            return Err(ReachError::Slowed);
+        }
+        tokio::time::sleep(SLOWED_AGAIN).await;
     }
     if found.is_empty() {
         return Err(ReachError::Unreachable);
@@ -260,6 +340,47 @@ pub async fn find(
 mod tests {
     use super::*;
     use mesh_identity::RootKey;
+    use std::time::Instant;
+
+    /// Every address get a helper makes fits the seed's limit in any
+    /// minute, however the seed's minute falls; what doesn't fit waits.
+    /// The spare side (the hello) leaves `SPARE_KEEPS` for the rest.
+    #[test]
+    fn address_gets_keep_under_the_seeds_limit() {
+        let t0 = Instant::now();
+        let gets = Gets::default();
+        let mut at = t0;
+        let mut taken = Vec::new();
+        // Asking every second for three minutes.
+        while at < t0 + Duration::from_secs(180) {
+            while gets.try_take(GETS_PER_FIND, at).is_none() {
+                taken.push(at);
+            }
+            at += Duration::from_secs(1);
+        }
+        for start in &taken {
+            let in_minute = (taken.iter())
+                .filter(|t| **t >= *start && **t < *start + Duration::from_secs(60))
+                .count();
+            assert!(in_minute * GETS_PER_FIND <= GETS_A_MINUTE);
+        }
+        const _: () = assert!(GETS_A_MINUTE < crate::addrs::GETS_PER_DEVICE as usize);
+        assert_eq!(taken.len() * GETS_PER_FIND, 3 * GETS_A_MINUTE);
+        let wait = (gets.try_take(GETS_PER_FIND, t0 + Duration::from_secs(150))).unwrap();
+        assert!(wait > Duration::ZERO && wait <= Duration::from_secs(60));
+
+        let gets = Gets::default();
+        let spare = gets.spare();
+        let mut people = 0;
+        while spare.try_take(GETS_PER_FIND, t0).is_none() {
+            people += 1;
+        }
+        assert_eq!(people * GETS_PER_FIND, GETS_A_MINUTE - SPARE_KEEPS);
+        assert!(
+            gets.try_take(GETS_PER_FIND, t0).is_none(),
+            "a send still fits"
+        );
+    }
 
     /// A change to one contact puts only their record, not everyone's
     /// (audit finding 9); a refresh still puts them all, and ours.

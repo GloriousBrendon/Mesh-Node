@@ -378,8 +378,9 @@ impl Helper {
         let this = *store.device_key().public().as_bytes();
         let account = store.account().to_bytes();
         let (node, anon, seeds) = (net.node.clone(), net.anon.clone(), self.seeds.clone());
+        let gets = net.gets.clone();
         tokio::spawn(async move {
-            for addr in routing::own_devices(&anon, &seeds, &own, &this, unix_now()).await {
+            for addr in routing::own_devices(&anon, &gets, &seeds, &own, &this, unix_now()).await {
                 push_account(node.clone(), addr, account.clone());
             }
         });

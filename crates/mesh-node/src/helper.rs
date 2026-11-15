@@ -396,6 +396,8 @@ struct Net {
     node: Arc<Node>,
     /// The throwaway identity's node, for seeds only (D7b).
     anon: Arc<Node>,
+    /// Its address gets' budget, shared by every lookup (S14).
+    gets: routing::Gets,
     /// Reports the node's state as it changes.
     watch: tokio::task::JoinHandle<()>,
     /// Reports who connected to us.
@@ -434,9 +436,9 @@ enum Back {
     SpaceMailUntaken(Vec<([u8; 32], u64)>),
     /// A device answered a batch of Space events (or didn't).
     SpaceAnswered(Box<spaces::Answered>),
-    /// A peer's dial (SPEC-spaces S14) came back: whether it reached them,
+    /// A peer's dial (SPEC-spaces S14) came back: how it went,
     /// and whether it was a hello.
-    Hello(MeshId, bool, bool),
+    Hello(MeshId, spaces::Dialled, bool),
     /// Each code, and the best answer any seed gave (`None`: none answered).
     Held(Vec<(FriendCode, Option<Hold>)>),
     /// The home relay changed (or came up): records go out again.
@@ -822,12 +824,17 @@ impl Helper {
                     Fail("not-a-contact", "add them as a friend first".to_owned())
                 })?;
                 let (node, anon) = (self.node()?, self.anon()?);
+                let gets = self
+                    .net
+                    .as_ref()
+                    .map(|n| n.gets.clone())
+                    .unwrap_or_default();
                 if !node.status().online {
                     return Err(Fail("offline", "not connected to a relay yet".to_owned()));
                 }
                 let (seeds, back) = (self.seeds.clone(), self.back.clone());
                 tokio::spawn(async move {
-                    match routing::reach(node, &anon, &seeds, target, unix_now()).await {
+                    match routing::reach(node, &anon, &gets, &seeds, target, unix_now()).await {
                         Ok(Reached { pong, last, list }) => {
                             emit_pong(&pong);
                             let _ = back.send(Back::Reached(Box::new((id, last, list))));
@@ -837,6 +844,10 @@ impl Helper {
                                 ReachError::Unreachable => {
                                     ("unreachable", "couldn't reach any of their devices")
                                 }
+                                ReachError::Slowed => (
+                                    "slow-down",
+                                    "the seed asked us to slow down; try again soon",
+                                ),
                                 ReachError::RevokedDevice => {
                                     ("revoked-device", "only devices they've removed answered")
                                 }
@@ -974,11 +985,11 @@ impl Helper {
         let Some(target) = Target::of(store, id) else {
             return;
         };
-        let (node, anon) = (net.node.clone(), net.anon.clone());
+        let (node, anon, gets) = (net.node.clone(), net.anon.clone(), net.gets.clone());
         let (seeds, back, id) = (self.seeds.clone(), self.back.clone(), *id);
         tokio::spawn(async move {
             if let Ok(Reached { last, list, .. }) =
-                routing::reach(node, &anon, &seeds, target, unix_now()).await
+                routing::reach(node, &anon, &gets, &seeds, target, unix_now()).await
             {
                 let _ = back.send(Back::Reached(Box::new((id, last, list))));
             }
@@ -1113,7 +1124,7 @@ impl Helper {
                 }
                 return;
             }
-            Back::Hello(id, reached, hello) => return self.hello_back(&id, reached, hello),
+            Back::Hello(id, how, hello) => return self.hello_back(&id, how, hello),
             Back::SpaceMailUntaken(untaken) => return self.space_mail_untaken(untaken),
             Back::HistoryAsk(asked) => return self.history_asked(*asked),
             Back::HistoryBatch(batch) => {
@@ -1284,8 +1295,9 @@ impl Helper {
             targets.extend(Target::own(store));
         }
         let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+        let gets = net.gets.clone();
         tokio::spawn(async move {
-            let found = e2ee::fetch(&anon, &seeds, targets, unix_now()).await;
+            let found = e2ee::fetch(&anon, &gets, &seeds, targets, unix_now()).await;
             let _ = back.send(Back::Records(found));
         });
     }
@@ -1752,6 +1764,7 @@ impl Helper {
                 self.net = Some(Net {
                     node,
                     anon: Arc::new(anon),
+                    gets: routing::Gets::default(),
                     watch,
                     peers,
                     streams,
