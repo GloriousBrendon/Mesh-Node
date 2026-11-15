@@ -960,7 +960,23 @@ fn kick_and_ban() {
     all_until(&mut [&mut k.b, &mut k.c], |v| role_of(v, &id_c).is_none());
     let err = ask(&mut k.o, "spaceAdd", &[&s, &id_c], "meshError");
     assert_eq!(err["kind"], "not-allowed", "{err}");
-    let err = ask(&mut k.c, "spaceSend", &[&s, &g, "still here?"], "meshError");
+    // C hears of the ban in its own time (a list from before it can still
+    // be waiting): once it has, its sends are refused.
+    let started = Instant::now();
+    let err = loop {
+        k.c.send("spaceSend", &[&s, &g, "still here?"]);
+        let (got, answer) = loop {
+            let (got, answer) = k.c.event();
+            if got == "meshError" || got == "meshSpaceMessages" {
+                break (got, answer);
+            }
+        };
+        if got == "meshError" {
+            break answer;
+        }
+        assert!(started.elapsed() < Duration::from_secs(60), "C still posts");
+        std::thread::sleep(Duration::from_millis(500));
+    };
     assert!(
         ["not-allowed", "not-found"].contains(&err["kind"].as_str().unwrap()),
         "{err}"
