@@ -929,3 +929,71 @@ fn kick_and_ban() {
     ask(&mut k.o, "netPingId", &[&id_c], "meshPing");
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
+
+/// Test 11: the seed's files and log, and every helper's stderr, hold no
+/// Space ID, channel ID or name, member ID or message text.
+#[test]
+fn nothing_identifying_is_logged() {
+    let name = "spaces-quiet";
+    let mut k = club_with(name, &["--mail", "--report-every", "1"]);
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let made = ask(
+        &mut k.o,
+        "spaceChannel",
+        &[&s, "hidden-room", "everyone"],
+        "meshSpaces",
+    );
+    let hidden = channel(space(&made, "club"), "hidden-room");
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "a secret line"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.c, "meshSpaceNotify", |n| {
+        n["text"] == "a secret line"
+    });
+    // C away: what B says next goes by mail, through the seed.
+    ask(&mut k.c, "idLock", &[], "meshIdentity");
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "a mailed secret"],
+        "meshSpaceMessages",
+    );
+    ask(&mut k.b, "idLock", &[], "meshIdentity");
+    let stderr = [k.o, k.b, k.c].map(Helper::quit).concat();
+    let log = k.seed.stop().join("\n");
+    let seed_dir =
+        std::env::temp_dir().join(format!("mesh-node-{name}-seed-{}", std::process::id()));
+    let files = read_all(&seed_dir);
+    for secret in [
+        s.as_str(),
+        g.as_str(),
+        hidden.as_str(),
+        "hidden-room",
+        "a secret line",
+        "a mailed secret",
+        &k.id_o,
+        &k.id_b,
+        &k.id_c,
+    ] {
+        assert!(!stderr.contains(secret), "a helper logged {secret:?}");
+        assert!(!log.contains(secret), "the seed logged {secret:?}");
+        assert!(!files.contains(secret), "the seed's files hold {secret:?}");
+    }
+}
+
+/// Every file under `dir`, as text (lossy), one after another.
+fn read_all(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out += &read_all(&path);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out += &String::from_utf8_lossy(&bytes);
+        }
+    }
+    out
+}
