@@ -15,7 +15,8 @@ use mesh_dm::Sender;
 use mesh_dm::chat::Taken;
 use mesh_dm::space::SpaceEvent;
 use mesh_dm::space::{
-    Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, space_id, would_count,
+    Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, check_history, space_id,
+    would_count,
 };
 use mesh_dm::space_store::{
     SPACE_BATCH, from_batch, from_member, from_own, to_batch, to_member, to_own,
@@ -82,6 +83,11 @@ pub(super) const HELLO_DIALS: usize = 32;
 /// quarters of transport's 256.
 pub(super) const HELLO_ROOM: usize = 192;
 const _: () = assert!(HELLO_LOOKUPS < crate::addrs::GETS_PER_DEVICE);
+/// A hello that found nobody (their record may not be at the seed yet, as
+/// when both sides were just added) is tried again after this, at most
+/// `HELLO_TRIES` times in all. It doesn't start `PEER_RETRY`.
+pub(super) const HELLO_AGAIN: Duration = Duration::from_secs(10);
+pub(super) const HELLO_TRIES: u32 = 3;
 
 /// Peers on the wire (S14): when each was last used, who may be looked up
 /// again when, and the hello's queue and pace. Times are passed in.
@@ -93,6 +99,10 @@ pub(super) struct PeerWire {
     /// The minute the hello's lookups are counted in, and how many so far.
     minute: Option<(Instant, u32)>,
     dialling: usize,
+    /// Hellos that found nobody: how many tries each has had, and those
+    /// due again.
+    hello_tries: HashMap<[u8; 32], u32>,
+    hello_later: Vec<(Instant, MeshId)>,
 }
 
 impl PeerWire {
@@ -104,6 +114,8 @@ impl PeerWire {
             hello: VecDeque::new(),
             minute: None,
             dialling: 0,
+            hello_tries: HashMap::new(),
+            hello_later: Vec::new(),
         }
     }
 
@@ -179,6 +191,25 @@ impl PeerWire {
         self.dialling = self.dialling.saturating_sub(1);
     }
 
+    /// A hello found nobody: queued again after `HELLO_AGAIN`, up to
+    /// `HELLO_TRIES` tries in all.
+    pub(super) fn hello_missed(&mut self, who: &MeshId, now: Instant) {
+        let tries = self.hello_tries.entry(who.to_bytes()).or_insert(0);
+        *tries += 1;
+        if *tries < HELLO_TRIES {
+            self.hello_later.push((now + HELLO_AGAIN, *who));
+        }
+    }
+
+    /// Hellos due again by `now`, back in the queue.
+    pub(super) fn hellos_due(&mut self, now: Instant) {
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.hello_later)
+            .into_iter()
+            .partition(|(at, _)| *at <= now);
+        self.hello_later = later;
+        self.queue_hello(due.into_iter().map(|(_, id)| id));
+    }
+
     pub(super) fn idle(&self) -> Duration {
         self.idle
     }
@@ -188,6 +219,98 @@ impl PeerWire {
 /// never) first, so none starves when the seed says `slow-down`.
 fn longest_ago_first(away: &mut [(MeshId, [u8; 32])], mailed: &HashMap<[u8; 32], Instant>) {
     away.sort_by_key(|(_, d)| mailed.get(d).copied());
+}
+
+/// The clock in real milliseconds, for Space events' `seq` and `time`
+/// (dm D2): two lines a few ms apart then order by time, not by ID.
+fn now_ms() -> u64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The stream new members pull a Space's history on (S10).
+pub(super) const SPACE_HISTORY: &str = "space-history";
+/// Events in one history frame (S10, dm D8's batch).
+pub(super) const HISTORY_BATCH: usize = 200;
+/// How long either side of a history stream waits for the other.
+const HISTORY_WAIT: Duration = Duration::from_secs(10);
+
+/// A history request: one part of one Space (`None`: its changes).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryAsk {
+    version: u8,
+    space: SpaceId,
+    part: Option<ChannelId>,
+}
+
+/// What the loop is asked by a history stream: who, which part, and where
+/// to answer (`None`: not theirs to have).
+pub(super) type HistoryAsked = (
+    MeshId,
+    SpaceId,
+    Option<ChannelId>,
+    tokio::sync::oneshot::Sender<Option<Vec<Vec<u8>>>>,
+);
+
+/// Answers a `space-history` stream: one request per part, each answered
+/// newest first in frames of `HISTORY_BATCH` events, then an empty frame.
+// ponytail: a part's whole history is read into memory to serve it (about 30 MB at 100,000 events); stream it by segment if Spaces grow past that.
+pub(super) async fn serve_history(
+    mut stream: mesh_transport::ServiceStream,
+    back: tokio::sync::mpsc::UnboundedSender<Back>,
+) {
+    loop {
+        let read = mesh_transport::frame::read_frame(&mut stream.recv);
+        let Ok(Ok(Some(frame))) = tokio::time::timeout(HISTORY_WAIT, read).await else {
+            break;
+        };
+        let Ok(ask) = postcard::from_bytes::<HistoryAsk>(&frame) else {
+            break;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let asked = (stream.peer.id, ask.space, ask.part, tx);
+        let _ = back.send(Back::HistoryAsk(Box::new(asked)));
+        let events = rx.await.ok().flatten().unwrap_or_default();
+        for batch in events.chunks(HISTORY_BATCH) {
+            let frame = postcard::to_stdvec(&batch.to_vec()).expect("to memory");
+            if mesh_transport::frame::write_frame(&mut stream.send, &frame)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let end = postcard::to_stdvec(&Vec::<Vec<u8>>::new()).expect("to memory");
+        if mesh_transport::frame::write_frame(&mut stream.send, &end)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = stream.send.finish();
+}
+
+/// A history pull in this unlock: which devices were asked, how many
+/// events came back refused (then the next member is asked, S10), and
+/// whether it's settled.
+#[derive(Default)]
+pub(super) struct Pull {
+    asked: HashSet<[u8; 32]>,
+    refused: usize,
+    under_way: bool,
+    settled: bool,
+}
+
+/// What `spaceForge` makes this helper do when serving history (the
+/// dishonest member of tests 5 and 7). Debug builds only.
+#[cfg(debug_assertions)]
+#[derive(Default)]
+pub(super) struct Forge {
+    /// Others' posts served with their text altered (bad signatures).
+    alter: bool,
+    /// A post of ours forged into a channel, served as if it belonged there.
+    inject: Option<(SpaceId, ChannelId, String)>,
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
@@ -381,7 +504,7 @@ impl Helper {
 
     /// `meshSpaceMessages`: a channel as it shows.
     fn emit_channel(&mut self, space: &SpaceId, channel: &ChannelId) -> Result<(), Fail> {
-        let now = unix_now() * 1000;
+        let now = now_ms();
         let history = self.space_mut(space)?;
         let chat = history.channel(channel, now).map_err(space_fail)?;
         let events: Vec<Value> = (chat.messages().iter())
@@ -411,7 +534,7 @@ impl Helper {
             after: Some(v.head),
             change,
         });
-        let now = unix_now() * 1000;
+        let now = now_ms();
         self.space_mut(space)?
             .send(body, &key, &cert, now)
             .map_err(space_fail)?;
@@ -427,8 +550,8 @@ impl Helper {
             .space_version(space)
             .is_some_and(|v| me.is_some_and(|me| v.state.members.contains_key(&me)));
         let held = self.held_spaces().contains(space);
-        if member
-            && !held
+        let joined = member && !held;
+        if joined
             && let Some(list) = self.spaces.as_mut()
             && let Err(e) = list.add(*space)
         {
@@ -436,6 +559,10 @@ impl Helper {
         }
         self.refresh_peers();
         self.emit_spaces();
+        if joined {
+            // Just joined: what was said before comes from a member (S10).
+            self.space_pull(space);
+        }
         self.space_send_all(space);
     }
 
@@ -497,7 +624,7 @@ impl Helper {
             return;
         };
         let own = me == *id;
-        let now = unix_now() * 1000;
+        let now = now_ms();
         let mut numbers = Vec::new();
         let mut bodies = Vec::new();
         for space in self.held_spaces() {
@@ -542,6 +669,10 @@ impl Helper {
             Ok(envelopes) => envelopes,
             Err(e) => {
                 eprintln!("mesh-node: couldn't encrypt for a device: {e}");
+                // No keys for them yet: look, and send once they come; the
+                // refresh tries again if their record wasn't there yet.
+                self.keys_for(id);
+                self.space_retry.insert(device, (*id, addr));
                 return;
             }
         };
@@ -623,7 +754,7 @@ impl Helper {
             .store
             .as_ref()
             .is_some_and(|s| s.account().kind(id) == Some(mesh_identity::Kind::Friend));
-        let now = unix_now() * 1000;
+        let now = now_ms();
         let mut changed = Vec::new();
         let mut refused = 0;
         // A mail batch (S9) is one frame with many events: unpacked here,
@@ -787,7 +918,7 @@ impl Helper {
             );
         }
         longest_ago_first(&mut away, &self.space_mailed);
-        let now = unix_now() * 1000;
+        let now = now_ms();
         let anon = net.anon.clone();
         let mut puts: HashMap<Vec<String>, HolderPuts> = HashMap::new();
         let mut missing = Vec::new();
@@ -918,6 +1049,210 @@ impl Helper {
         }
     }
 
+    /// Starts a history pull of `space` from one of its members' connected
+    /// devices not asked yet (S10): on joining, and again after a pull that
+    /// came back with refused events.
+    pub(super) fn space_pull(&mut self, space: &SpaceId) {
+        let Some(me) = self.store.as_ref().map(|s| s.id()) else {
+            return;
+        };
+        let Some(v) = self.space_version(space) else {
+            return;
+        };
+        let Some(net) = &self.net else { return };
+        let pull = self.space_pulls.entry(*space).or_default();
+        if pull.under_way || pull.settled {
+            return;
+        }
+        let candidates: Vec<MeshAddr> = (v.state.members.keys())
+            .filter_map(|p| MeshId::from_bytes(p).ok())
+            .filter(|p| *p != me)
+            .flat_map(|p| net.node.connected(&p))
+            .collect();
+        let Some(addr) =
+            (candidates.into_iter()).find(|a| !pull.asked.contains(a.device.as_bytes()))
+        else {
+            return;
+        };
+        pull.asked.insert(*addr.device.as_bytes());
+        pull.under_way = true;
+        let mut parts: Vec<Option<ChannelId>> = vec![None];
+        parts.extend(v.state.channels.keys().copied().map(Some));
+        let (node, back, space) = (net.node.clone(), self.back.clone(), *space);
+        tokio::spawn(async move {
+            if let Ok((_, mut send, mut recv)) = node.open(&addr, SPACE_HISTORY).await {
+                'parts: for part in parts {
+                    let ask = HistoryAsk {
+                        version: 1,
+                        space,
+                        part,
+                    };
+                    let ask = postcard::to_stdvec(&ask).expect("to memory");
+                    if mesh_transport::frame::write_frame(&mut send, &ask)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    loop {
+                        let read = mesh_transport::frame::read_frame(&mut recv);
+                        let Ok(Ok(Some(frame))) = tokio::time::timeout(HISTORY_WAIT, read).await
+                        else {
+                            break 'parts;
+                        };
+                        let Ok(batch) = postcard::from_bytes::<Vec<Vec<u8>>>(&frame) else {
+                            break 'parts;
+                        };
+                        if batch.is_empty() {
+                            break;
+                        }
+                        let _ = back.send(Back::HistoryBatch(Box::new((space, batch))));
+                    }
+                }
+                let _ = send.finish();
+            }
+            let _ = back.send(Back::HistoryDone(space));
+        });
+    }
+
+    /// A history request from `id` (S10): only a current member gets a
+    /// Space's events, as this device stored them, newest first.
+    pub(super) fn history_asked(&mut self, asked: HistoryAsked) {
+        let (id, space, part, tx) = asked;
+        let member = self
+            .space_version(&space)
+            .is_some_and(|v| v.state.members.contains_key(&id.to_bytes()));
+        if !member {
+            let _ = tx.send(None);
+            return;
+        }
+        let events = self
+            .space_mut(&space)
+            .ok()
+            .and_then(|h| h.events(part.as_ref()).ok());
+        let Some(mut events) = events else {
+            let _ = tx.send(None);
+            return;
+        };
+        events.reverse();
+        #[cfg(debug_assertions)]
+        self.forge_history(&space, part.as_ref(), &mut events);
+        let bytes = (events.iter()).filter_map(|e| e.to_bytes().ok()).collect();
+        let _ = tx.send(Some(bytes));
+    }
+
+    /// The dishonest member of tests 5 and 7 (debug builds only).
+    #[cfg(debug_assertions)]
+    fn forge_history(
+        &mut self,
+        space: &SpaceId,
+        part: Option<&ChannelId>,
+        events: &mut Vec<SpaceEvent>,
+    ) {
+        let me = self.store.as_ref().map(|s| s.id().to_bytes());
+        if self.forge.alter {
+            for e in events.iter_mut() {
+                let theirs = e.author().map(|a| a.person) != me;
+                if let SpaceBody::Post { text, .. } = &mut e.body
+                    && theirs
+                {
+                    *text = format!("{text} (altered)");
+                }
+            }
+        }
+        if let Some((s, channel, text)) = self.forge.inject.clone()
+            && s == *space
+            && part == Some(&channel)
+            && let Ok((key, cert)) = self.signing()
+            && let Some(id) = mesh_dm::space::nonce()
+        {
+            let body = SpaceBody::Post {
+                channel,
+                text,
+                reply_to: None,
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                everyone: false,
+            };
+            let now = now_ms();
+            let forged = SpaceEvent::signed(*space, id, (now, now, 1_000_000), body, &key, &cert);
+            events.insert(0, forged);
+        }
+    }
+
+    /// One frame of a history pull: each event checked by its certificate,
+    /// membership and post right in the chain held (S5), then stored in one
+    /// batch.
+    pub(super) fn history_batch(&mut self, space: SpaceId, batch: Vec<Vec<u8>>) {
+        let now = now_ms();
+        let Some(v) = self.space_version(&space) else {
+            return;
+        };
+        let mut good = Vec::new();
+        let mut refused = 0;
+        for bytes in batch {
+            let Ok(e) = SpaceEvent::from_bytes(&bytes) else {
+                refused += 1;
+                continue;
+            };
+            match check_history(&e, &v) {
+                Ok(author) if e.space == space => good.push((e, author)),
+                _ => refused += 1,
+            }
+        }
+        if refused > 0 {
+            eprintln!("mesh-node: {refused} history events refused");
+            self.space_pulls.entry(space).or_default().refused += refused;
+        }
+        let changes = good
+            .iter()
+            .any(|(e, _)| matches!(e.body, SpaceBody::Change(_)));
+        let Ok(history) = self.space_mut(&space) else {
+            return;
+        };
+        if let Err(e) = history.store_batch(good, now, now) {
+            eprintln!("mesh-node: couldn't store a Space's history: {e}");
+        }
+        if changes {
+            self.refresh_peers();
+            self.emit_spaces();
+        }
+        if let Some((s, channel)) = self.space_view
+            && s == space
+        {
+            let _ = self.emit_channel(&s, &channel);
+        }
+    }
+
+    /// A pull ended: if anything came back refused, the next member's
+    /// device is asked too (now, or when one connects); else it's settled.
+    pub(super) fn history_done(&mut self, space: SpaceId) {
+        let pull = self.space_pulls.entry(space).or_default();
+        pull.under_way = false;
+        if pull.refused > 0 {
+            pull.refused = 0;
+            self.space_pull(&space);
+        } else {
+            pull.settled = true;
+        }
+    }
+
+    /// A member connected: a Space whose last pull had refusals asks them.
+    pub(super) fn history_again(&mut self, id: &MeshId) {
+        let waiting: Vec<SpaceId> = (self.space_pulls.iter())
+            .filter(|(_, p)| !p.under_way && !p.settled)
+            .map(|(s, _)| *s)
+            .collect();
+        for space in waiting {
+            let member = self
+                .space_version(&space)
+                .is_some_and(|v| v.state.members.contains_key(&id.to_bytes()));
+            if member {
+                self.space_pull(&space);
+            }
+        }
+    }
+
     /// The `space…` commands.
     pub(super) fn space_command(&mut self, func: &str, args: &[String]) -> Result<(), Fail> {
         let arg = |i: usize| {
@@ -949,7 +1284,7 @@ impl Helper {
                         display,
                     },
                 });
-                let now = unix_now() * 1000;
+                let now = now_ms();
                 self.space_mut(&space)?
                     .send(body, &key, &cert, now)
                     .map_err(space_fail)?;
@@ -1039,12 +1374,25 @@ impl Helper {
                     mentions: Vec::new(),
                     everyone: false,
                 };
-                let now = unix_now() * 1000;
+                let now = now_ms();
                 self.space_mut(&space)?
                     .send(body, &key, &cert, now)
                     .map_err(space_fail)?;
                 self.emit_channel(&space, &channel)?;
                 self.space_send_all(&space);
+            }
+            #[cfg(debug_assertions)]
+            "spaceForge" => {
+                match arg(0)? {
+                    "alter" => self.forge.alter = true,
+                    "inject" => {
+                        let space = parse16(arg(1)?, "Space")?;
+                        let channel = parse16(arg(2)?, "channel")?;
+                        self.forge.inject = Some((space, channel, arg(3)?.to_owned()));
+                    }
+                    _ => self.forge = Forge::default(),
+                }
+                emit("meshForge", json!({}));
             }
             "spaceOpen" => {
                 let space = parse16(arg(0)?, "Space")?;
@@ -1084,6 +1432,7 @@ impl Helper {
                 net.node.close_idle(&id);
             }
         }
+        self.wire.hellos_due(now);
         let open = net.node.open_connections();
         for id in self.wire.next_hellos(now, open) {
             self.dial_back(&id, true);
@@ -1121,11 +1470,16 @@ impl Helper {
     }
 
     pub(super) fn hello_back(&mut self, id: &MeshId, reached: bool, hello: bool) {
+        let now = Instant::now();
         if hello {
             self.wire.hello_done();
-        }
-        if !reached {
-            self.wire.missed(id, Instant::now());
+            // Their record may not be at the seed yet: again soon, a few
+            // times; a hello's miss starts no `PEER_RETRY`.
+            if !reached {
+                self.wire.hello_missed(id, now);
+            }
+        } else if !reached {
+            self.wire.missed(id, now);
         }
     }
 
@@ -1328,5 +1682,26 @@ mod tests {
         longest_ago_first(&mut away, &mailed);
         let order: Vec<u8> = away.iter().map(|(_, d)| d[0]).collect();
         assert_eq!(order, [2, 3, 1], "never mailed, then oldest");
+    }
+
+    #[test]
+    fn a_hello_that_finds_nobody_tries_again_a_few_times() {
+        let t0 = Instant::now();
+        let mut wire = PeerWire::new(PEER_IDLE);
+        let [a] = ids(1).try_into().unwrap();
+        wire.queue_hello([a]);
+        let mut tries = 0;
+        let mut at = t0;
+        for _ in 0..10 {
+            wire.hellos_due(at);
+            for id in wire.next_hellos(at, 0) {
+                tries += 1;
+                wire.hello_done();
+                wire.hello_missed(&id, at);
+            }
+            at += HELLO_AGAIN;
+        }
+        assert_eq!(tries, HELLO_TRIES, "then it waits for a send or mail");
+        assert!(wire.may_look_up(&a, at), "a hello's miss starts no retry");
     }
 }

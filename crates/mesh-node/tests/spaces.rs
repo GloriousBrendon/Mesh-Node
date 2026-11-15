@@ -68,10 +68,10 @@ fn ask(h: &mut Helper, func: &str, args: &[&str], binding: &str) -> Value {
 }
 
 fn befriend(a: &mut Helper, id_a: &str, b: &mut Helper, id_b: &str) {
-    a.expect("friendAdd", &[id_b, ""], "meshSocial");
-    b.expect("friendAdd", &[id_a, ""], "meshSocial");
-    a.social_until(|s| has(s, "friends", id_b));
-    b.social_until(|s| has(s, "friends", id_a));
+    ask(a, "friendAdd", &[id_b, ""], "meshSocial");
+    ask(b, "friendAdd", &[id_a, ""], "meshSocial");
+    until(a, "meshSocial", |s| has(s, "friends", id_b));
+    until(b, "meshSocial", |s| has(s, "friends", id_a));
 }
 
 /// The Space in a `meshSpaces` payload, by name.
@@ -111,6 +111,7 @@ struct Club {
     id_c: String,
     space: String,
     general: String,
+    ticket: String,
     seed: Seed,
     _relay: Relay,
 }
@@ -167,6 +168,7 @@ fn club_with(name: &str, seed_args: &[&str]) -> Club {
         id_c,
         space: s,
         general,
+        ticket,
         seed,
         _relay: relay,
     }
@@ -367,4 +369,181 @@ fn away_and_back_by_batched_mail() {
         "test 2: B {batches:?}; {puts} mail puts at the seed in all (receipts, and C passing the changes on, included)"
     );
     assert_eq!(batches, ["mesh-node: mailed 2 Space batches"], "{b_log}");
+}
+
+/// Everyone's helper: a new person on the club's relay and seed.
+fn newcomer(k: &mut Club, name: &str) -> (Helper, String) {
+    let dir = temp_dir(&format!("spaces-{name}-{}", k.space));
+    helper(&dir, &k._relay, &k.ticket, name)
+}
+
+fn channel_texts(h: &mut Helper, s: &str, g: &str) -> Vec<String> {
+    // The page asked for, not another channel's page pushed meanwhile.
+    h.send("spaceOpen", &[s, g]);
+    let open = until(h, "meshSpaceMessages", |m| m["channel"] == g);
+    (open["events"].as_array().unwrap().iter())
+        .map(|e| e["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Waits until `h` holds the club with `want` messages in #general.
+fn history_until(h: &mut Helper, s: &str, g: &str, want: &[&str]) -> Vec<String> {
+    until(h, "meshSpaces", |v| {
+        v["spaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sp| sp["id"] == s)
+    });
+    let started = Instant::now();
+    loop {
+        let texts = channel_texts(h, s, g);
+        if want.iter().all(|w| texts.iter().any(|t| t == w)) {
+            return texts;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "history so far: {texts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Waits until a channel `h` already holds shows all of `want`.
+fn texts_until(h: &mut Helper, s: &str, g: &str, want: &[&str]) -> Vec<String> {
+    let started = Instant::now();
+    loop {
+        let texts = channel_texts(h, s, g);
+        if want.iter().all(|w| texts.iter().any(|t| t == w)) {
+            return texts;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "so far: {texts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Test 3: D, a friend of B's and nobody else's, is added by B and sees
+/// what was said before D joined.
+#[test]
+fn a_friend_of_one_member_joins_and_sees_the_past() {
+    let mut k = club("spaces-join");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "before you came"],
+        "meshSpaceMessages",
+    );
+    // C answers after seeing B's line, so it sorts after it (dm D2: `seq`
+    // counts on from what's held; lines sent unseen are concurrent).
+    until(&mut k.c, "meshSpaceNotify", |n| {
+        n["text"] == "before you came"
+    });
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "long ago"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.b, "meshSpaceNotify", |n| n["text"] == "long ago");
+    let (mut d, id_d) = newcomer(&mut k, "dee");
+    befriend(&mut k.b, &k.id_b, &mut d, &id_d);
+    ask(&mut k.b, "spaceAdd", &[&s, &id_d], "meshSpaces");
+    let texts = history_until(&mut d, &s, &g, &["before you came", "long ago"]);
+    assert_eq!(texts, ["before you came", "long ago"]);
+    let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// Test 4, its departure half (the removed device is `mesh-dm`'s unit
+/// test): C posts and leaves; E, added later, still sees C's line as C's.
+#[test]
+fn history_outlives_a_departure() {
+    let mut k = club("spaces-gone");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "cal was here"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.o, "meshSpaceNotify", |n| n["text"] == "cal was here");
+    ask(&mut k.c, "spaceLeave", &[&s], "meshSpaces");
+    until(&mut k.o, "meshSpaces", |v| {
+        !members(&v["spaces"][0]).contains(&k.id_c)
+    });
+    let (mut e, id_e) = newcomer(&mut k, "eve");
+    befriend(&mut k.o, &k.id_o, &mut e, &id_e);
+    ask(&mut k.o, "spaceAdd", &[&s, &id_e], "meshSpaces");
+    history_until(&mut e, &s, &g, &["cal was here"]);
+    let open = ask(&mut e, "spaceOpen", &[&s, &g], "meshSpaceMessages");
+    assert_eq!(open["events"][0]["from"], k.id_c.as_str());
+    let _ = (e.quit(), k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// Test 5: C serves D an altered line and a line C forged into #news,
+/// where only admins post. D refuses both, keeps the rest, and gets the
+/// real line from another member.
+#[test]
+fn history_cant_be_forged() {
+    let mut k = club("spaces-forge");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let made = ask(
+        &mut k.o,
+        "spaceChannel",
+        &[&s, "news", "admins"],
+        "meshSpaces",
+    );
+    let news = channel(space(&made, "club"), "news");
+    ask(
+        &mut k.o,
+        "spaceSend",
+        &[&s, &news, "real news"],
+        "meshSpaceMessages",
+    );
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "the true line"],
+        "meshSpaceMessages",
+    );
+    // C holds both (in whichever order they came).
+    history_until(&mut k.c, &s, &g, &["the true line"]);
+    let started = Instant::now();
+    while !channel_texts(&mut k.c, &s, &news).contains(&"real news".to_owned()) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "C never got the news"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // C turns dishonest: alters others' lines and forges one into #news.
+    ask(&mut k.c, "spaceForge", &["alter"], "meshForge");
+    ask(
+        &mut k.c,
+        "spaceForge",
+        &["inject", &s, &news, "fake news"],
+        "meshForge",
+    );
+    let (mut d, id_d) = newcomer(&mut k, "dan");
+    befriend(&mut k.c, &k.id_c, &mut d, &id_d);
+    ask(&mut k.c, "spaceAdd", &[&s, &id_d], "meshSpaces");
+    let texts = history_until(&mut d, &s, &g, &["the true line"]);
+    assert!(!texts.iter().any(|t| t.contains("altered")), "{texts:?}");
+    let news_texts = texts_until(&mut d, &s, &news, &["real news"]);
+    assert!(
+        news_texts.contains(&"real news".to_owned()),
+        "{news_texts:?}"
+    );
+    assert!(
+        !news_texts.contains(&"fake news".to_owned()),
+        "{news_texts:?}"
+    );
+    // D asked C first (C added D, so C was connected) and refused C's
+    // forgeries before asking another member.
+    let d_log = d.quit();
+    assert!(d_log.contains("history events refused"), "{d_log}");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }

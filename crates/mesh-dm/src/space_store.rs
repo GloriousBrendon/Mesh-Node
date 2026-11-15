@@ -224,61 +224,106 @@ impl SpaceHistory {
         received: u64,
         now: u64,
     ) -> Result<Taken, HistoryError> {
-        if self.log.number_of(&event.id).is_some() {
-            return Ok(Taken::Duplicate);
-        }
-        let bytes = event.to_bytes()?;
-        let stored = framed(
-            postcard::to_stdvec(&Stored {
-                received,
-                person: from.person,
-                device: from.device,
-                event: bytes,
-            })
-            .expect("to memory"),
-        );
-        let (chat, change, private, (segment, position)) = match &event.body {
-            SpaceBody::Change(change) => {
-                self.chain
-                    .add(event.id, from.person, change.clone(), (event.seq, event.id));
-                let place = self.change_files.next_places(1)[0];
-                self.change_files.append(&[stored])?;
-                (CHANGES, true, false, place)
+        let taken = self.store_batch(vec![(event.clone(), from)], received, now)?;
+        Ok(taken[0])
+    }
+
+    /// Stores many events at once, as `store` would one by one, with one
+    /// sync per file touched: history's intake (S10).
+    pub fn store_batch(
+        &mut self,
+        events: Vec<(SpaceEvent, Sender)>,
+        received: u64,
+        now: u64,
+    ) -> Result<Vec<Taken>, HistoryError> {
+        let mut taken = Vec::with_capacity(events.len());
+        let mut seen: HashSet<EventId> = HashSet::new();
+        // Each file's new records, in order, and the log's entries.
+        let mut records: HashMap<Conversation, Vec<Vec<u8>>> = HashMap::new();
+        let mut entries: Vec<Entry> = Vec::new();
+        for (event, from) in events {
+            if self.log.number_of(&event.id).is_some() || !seen.insert(event.id) {
+                taken.push(Taken::Duplicate);
+                continue;
             }
-            body => {
-                let channel = channel_of(body).expect("not a change");
-                let dm = to_dm(event).expect("not a change");
-                self.load(&channel, now)?;
-                let (files, view) = self.channels.get_mut(&channel).expect("loaded");
-                let taken = view.take_received(from, dm, now, received);
-                if !matches!(taken, Taken::Shown | Taken::Waiting) {
-                    return Ok(taken);
+            let bytes = event.to_bytes()?;
+            let stored = framed(
+                postcard::to_stdvec(&Stored {
+                    received,
+                    person: from.person,
+                    device: from.device,
+                    event: bytes,
+                })
+                .expect("to memory"),
+            );
+            let (chat, change, private) = match &event.body {
+                SpaceBody::Change(change) => {
+                    self.chain
+                        .add(event.id, from.person, change.clone(), (event.seq, event.id));
+                    (CHANGES, true, false)
                 }
-                let place = files.next_places(1)[0];
-                files.append(&[stored])?;
-                let private = matches!(body, SpaceBody::Read { .. });
-                (channel_key(&self.space, &channel), false, private, place)
-            }
-        };
-        let entry = Entry {
-            id: event.id,
-            chat,
-            author: from.person,
-            from: from.device,
-            at: received,
-            private,
-            change,
-        };
-        self.log.take(entry.clone());
-        self.places.push((chat, segment, position));
-        let stored = SpaceLog::Stored {
-            entry,
-            segment,
-            position,
-        };
-        let record = framed(postcard::to_stdvec(&stored).expect("to memory"));
-        self.log_files.append(&[record])?;
-        Ok(Taken::Shown)
+                body => {
+                    let channel = channel_of(body).expect("not a change");
+                    let dm = to_dm(&event).expect("not a change");
+                    self.load(&channel, now)?;
+                    let (_, view) = self.channels.get_mut(&channel).expect("loaded");
+                    let t = view.take_received(from, dm, now, received);
+                    if !matches!(t, Taken::Shown | Taken::Waiting) {
+                        taken.push(t);
+                        continue;
+                    }
+                    let private = matches!(body, SpaceBody::Read { .. });
+                    (channel_key(&self.space, &channel), false, private)
+                }
+            };
+            records.entry(chat).or_default().push(stored);
+            entries.push(Entry {
+                id: event.id,
+                chat,
+                author: from.person,
+                from: from.device,
+                at: received,
+                private,
+                change,
+            });
+            taken.push(Taken::Shown);
+        }
+        // Where each new record lands, file by file, then one append each.
+        let mut places: HashMap<Conversation, std::vec::IntoIter<(u32, u32)>> = HashMap::new();
+        for (chat, recs) in &records {
+            let files = self.files_mut(chat)?;
+            places.insert(*chat, files.next_places(recs.len()).into_iter());
+            files.append(recs)?;
+        }
+        let mut log_records = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (segment, position) = places
+                .get_mut(&entry.chat)
+                .and_then(Iterator::next)
+                .expect("a place for each record");
+            self.log.take(entry.clone());
+            self.places.push((entry.chat, segment, position));
+            let stored = SpaceLog::Stored {
+                entry,
+                segment,
+                position,
+            };
+            log_records.push(framed(postcard::to_stdvec(&stored).expect("to memory")));
+        }
+        self.log_files.append(&log_records)?;
+        Ok(taken)
+    }
+
+    /// The files a chat's records go to: the changes', or a loaded channel's.
+    fn files_mut(&mut self, chat: &Conversation) -> Result<&mut ChatFiles, HistoryError> {
+        if *chat == CHANGES {
+            return Ok(&mut self.change_files);
+        }
+        let space = self.space;
+        let channel = (self.channels.iter_mut())
+            .find(|(c, _)| channel_key(&space, c) == *chat)
+            .map(|(_, (files, _))| files);
+        channel.ok_or_else(|| StoreError::Damaged.into())
     }
 
     /// A channel as it shows: its newest segment, read the first time.
@@ -777,6 +822,62 @@ mod tests {
         // A Space never stored here has an empty chain.
         let none = SpaceHistory::read_chain(&root, &KEY, &[3; 16]).unwrap();
         assert_eq!(none.version(&[3; 16]), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// History (S10) comes in batches, stored with one sync per file: the
+    /// same result as one at a time, duplicates and all.
+    #[test]
+    fn a_batch_stores_as_one_at_a_time_would() {
+        let root = dir("batch");
+        let m = made();
+        let me = sender(&m.o);
+        let mut h = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        let mut batch: Vec<(SpaceEvent, Sender)> =
+            m.events.iter().map(|e| (e.clone(), me)).collect();
+        for i in 0..1000u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_be_bytes());
+            id[8] = 9;
+            let post = SpaceBody::Post {
+                channel: m.general,
+                text: format!("old {i}"),
+                reply_to: None,
+                attachments: vec![],
+                mentions: vec![],
+                everyone: false,
+            };
+            let seq = NOW - 10_000 + i;
+            let e = SpaceEvent::signed(
+                m.space,
+                id,
+                (seq, seq, 100 + i),
+                post,
+                &m.o.device,
+                &m.o.cert,
+            );
+            batch.push((e, me));
+        }
+        batch.push(batch[5].clone());
+        let taken = h.store_batch(batch, NOW, NOW).unwrap();
+        assert_eq!(taken.len(), 1005);
+        assert_eq!(taken.iter().filter(|t| **t == Taken::Shown).count(), 1004);
+        assert_eq!(
+            taken[1004],
+            Taken::Duplicate,
+            "the same event twice in one batch"
+        );
+        drop(h);
+        let mut back = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        assert_eq!(back.log().len(), 1004);
+        assert!(
+            back.version()
+                .unwrap()
+                .state
+                .channels
+                .contains_key(&m.general)
+        );
+        assert_eq!(back.events(Some(&m.general)).unwrap().len(), 1002);
         let _ = std::fs::remove_dir_all(&root);
     }
 

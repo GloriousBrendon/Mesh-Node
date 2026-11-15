@@ -375,6 +375,11 @@ struct Helper {
     // ponytail: in memory only; after a restart, unanswered Space mail is mailed again and readers drop the copies by event ID. Save it with the mail state if that's seen to cost.
     space_sent: spaces::MailSent,
     space_marked: HashSet<([u8; 32], mesh_dm::space::SpaceId, u64)>,
+    /// History pulls this unlock (S10).
+    space_pulls: HashMap<mesh_dm::space::SpaceId, spaces::Pull>,
+    /// What `spaceForge` set (debug builds only).
+    #[cfg(debug_assertions)]
+    forge: spaces::Forge,
     space_mailed: HashMap<[u8; 32], std::time::Instant>,
     /// When each device last said it was typing (rate limit, D10).
     typing_last: HashMap<[u8; 32], std::time::Instant>,
@@ -417,6 +422,12 @@ type Answered = (MeshId, MeshAddr, Vec<u64>, Option<Vec<bool>>);
 
 /// What a background request found out.
 enum Back {
+    /// A history stream's request (SPEC-spaces S10).
+    HistoryAsk(Box<spaces::HistoryAsked>),
+    /// One frame of a history pull.
+    HistoryBatch(Box<(mesh_dm::space::SpaceId, Vec<Vec<u8>>)>),
+    /// A history pull ended.
+    HistoryDone(mesh_dm::space::SpaceId),
     /// Space mail none of the holders took: mailed again at the refresh.
     SpaceMailUntaken(Vec<([u8; 32], u64)>),
     /// A device answered a batch of Space events (or didn't).
@@ -532,6 +543,9 @@ impl Helper {
             space_view: None,
             space_sent: HashMap::new(),
             space_marked: HashSet::new(),
+            space_pulls: HashMap::new(),
+            #[cfg(debug_assertions)]
+            forge: spaces::Forge::default(),
             space_mailed: HashMap::new(),
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
@@ -1033,6 +1047,11 @@ impl Helper {
                         self.unopened.push((id, from, frame));
                     }
                 }
+                // Space events that waited for their keys go now (a peer we
+                // never met: their keys come only from records).
+                for id in learned {
+                    self.space_deliver(&id);
+                }
                 return;
             }
             Back::Envelopes(got) => {
@@ -1093,6 +1112,12 @@ impl Helper {
             }
             Back::Hello(id, reached, hello) => return self.hello_back(&id, reached, hello),
             Back::SpaceMailUntaken(untaken) => return self.space_mail_untaken(untaken),
+            Back::HistoryAsk(asked) => return self.history_asked(*asked),
+            Back::HistoryBatch(batch) => {
+                let (space, events) = *batch;
+                return self.history_batch(space, events);
+            }
+            Back::HistoryDone(space) => return self.history_done(space),
             Back::SpaceAnswered(answered) => {
                 let (id, addr, numbers, answers) = *answered;
                 return self.space_answered(id, addr, numbers, answers);
@@ -1117,6 +1142,7 @@ impl Helper {
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
                 self.space_deliver(&id);
+                self.history_again(&id);
                 if promoted {
                     return self.changed(None);
                 }
@@ -1139,6 +1165,7 @@ impl Helper {
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
                 self.space_deliver(&id);
+                self.history_again(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
                     // with ours if it's missing something (`Back::Synced`).
@@ -1229,15 +1256,25 @@ impl Helper {
     /// Looks up the records of every contact (or only `id`) and our own,
     /// for their e2ee keys, in the background.
     fn fetch_keys(&self, only: Option<&MeshId>) {
-        let (Some(store), Some(net), Some(_)) = (&self.store, &self.net, &self.e2ee) else {
+        let (Some(store), Some(net), Some(e2ee)) = (&self.store, &self.net, &self.e2ee) else {
             return;
         };
         if self.seeds.is_empty() {
             return;
         }
+        // Every contact; and Space peers whose keys we haven't got yet, whose
+        // only source is their records (SPEC-spaces S2).
         let ids: Vec<MeshId> = match only {
             Some(id) => vec![*id],
-            None => store.contacts().iter().map(|c| c.id()).collect(),
+            None => (store.contacts().iter().map(|c| c.id()))
+                .chain(
+                    store
+                        .peers()
+                        .iter()
+                        .map(|c| c.id())
+                        .filter(|id| !e2ee.knows(id)),
+                )
+                .collect(),
         };
         let mut targets: Vec<Target> = ids.iter().filter_map(|id| Target::of(store, id)).collect();
         if only.is_none() {
@@ -1681,6 +1718,7 @@ impl Helper {
                 e2ee::SERVICE.to_owned(),
                 dm::TYPING.to_owned(),
                 files::BLOB.to_owned(),
+                spaces::SPACE_HISTORY.to_owned(),
             ],
             ..Config::default()
         };
@@ -2038,6 +2076,10 @@ async fn serve_streams(
                     }
                 }
             });
+            continue;
+        }
+        if stream.service == spaces::SPACE_HISTORY {
+            tokio::spawn(spaces::serve_history(stream, back));
             continue;
         }
         if stream.service == files::BLOB {
