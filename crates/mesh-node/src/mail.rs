@@ -451,6 +451,9 @@ impl Helper {
         // device of ours, say): it's mailed now rather than next unlock.
         // ponytail: its answer is handled again once we're locked, to no
         // effect; a read still out at the deadline waits for next unlock.
+        // Space mail first starts the reads for members we know no device
+        // of yet, so they're waited for here too.
+        self.space_mail_out();
         for reading in std::mem::take(&mut self.mail.reads) {
             if let Ok(Ok(found)) = tokio::time::timeout_at(deadline, reading).await {
                 self.mail_records(found);

@@ -221,6 +221,29 @@ fn longest_ago_first(away: &mut [(MeshId, [u8; 32])], mailed: &HashMap<[u8; 32],
     away.sort_by_key(|(_, d)| mailed.get(d).copied());
 }
 
+/// Space mail's readers: each away device of `people` (not connected, not
+/// this one), and the members we know no device of, whose mail record is
+/// read so the next round mails them. Without that a peer whose record we
+/// read too early (before they'd put one for us) is never mailed.
+fn away_devices(
+    people: Vec<(MeshId, Vec<[u8; 32]>)>,
+    connected: &HashSet<[u8; 32]>,
+    me: &[u8; 32],
+) -> (Vec<(MeshId, [u8; 32])>, Vec<MeshId>) {
+    let (mut away, mut look_up) = (Vec::new(), Vec::new());
+    for (id, devices) in people {
+        if devices.is_empty() {
+            look_up.push(id);
+        }
+        away.extend(
+            (devices.into_iter())
+                .filter(|d| !connected.contains(d) && d != me)
+                .map(|d| (id, d)),
+        );
+    }
+    (away, look_up)
+}
+
 /// The clock in real milliseconds, for Space events' `seq` and `time`
 /// (dm D2): two lines a few ms apart then order by time, not by ID.
 fn now_ms() -> u64 {
@@ -459,6 +482,9 @@ impl Helper {
         for id in &new {
             self.wire.heard(id, now);
             self.contacts_changed(Some(id));
+            // Their keys come only from their records: looked up now, not
+            // at the next refresh or the first send that fails.
+            self.keys_for(id);
         }
         self.wire.queue_hello(new);
     }
@@ -899,11 +925,11 @@ impl Helper {
         }
         people.sort_by_key(|p| p.to_bytes());
         people.dedup();
-        let mut away: Vec<(MeshId, [u8; 32])> = Vec::new();
-        for id in &people {
-            let connected: HashSet<[u8; 32]> = (net.node.connected(id).iter())
-                .map(|a| *a.device.as_bytes())
-                .collect();
+        let connected: HashSet<[u8; 32]> = (people.iter())
+            .flat_map(|id| net.node.connected(id))
+            .map(|a| *a.device.as_bytes())
+            .collect();
+        let devices = (people.iter()).map(|id| {
             let devices: Vec<[u8; 32]> = if *id == me {
                 (store.devices().devices().iter())
                     .map(|c| c.device().to_bytes())
@@ -911,17 +937,13 @@ impl Helper {
             } else {
                 e2ee.device_keys(id)
             };
-            away.extend(
-                (devices.into_iter())
-                    .filter(|d| !connected.contains(d) && *d != my_device)
-                    .map(|d| (*id, d)),
-            );
-        }
+            (*id, devices)
+        });
+        let (mut away, mut missing) = away_devices(devices.collect(), &connected, &my_device);
         longest_ago_first(&mut away, &self.space_mailed);
         let now = now_ms();
         let anon = net.anon.clone();
         let mut puts: HashMap<Vec<String>, HolderPuts> = HashMap::new();
-        let mut missing = Vec::new();
         for (id, device) in away {
             let holders = self.mail.remembered.holders(&device);
             if holders.is_empty() {
@@ -995,6 +1017,8 @@ impl Helper {
             sealed_puts.push(sealed);
             sent.push((device, mseq));
         }
+        missing.sort_by_key(|id| id.to_bytes());
+        missing.dedup();
         for id in missing {
             self.mail_records_missing(&id);
         }
@@ -1682,6 +1706,21 @@ mod tests {
         longest_ago_first(&mut away, &mailed);
         let order: Vec<u8> = away.iter().map(|(_, d)| d[0]).collect();
         assert_eq!(order, [2, 3, 1], "never mailed, then oldest");
+    }
+
+    /// A member we know no device of (their keys and mail record not read
+    /// yet) isn't skipped: they're looked up, so the next round mails them.
+    #[test]
+    fn a_member_with_no_known_device_is_looked_up_not_skipped() {
+        let (known, unknown) = (
+            RootKey::generate().unwrap().id(),
+            RootKey::generate().unwrap().id(),
+        );
+        let people = vec![(known, vec![[1; 32], [2; 32]]), (unknown, vec![])];
+        let connected = HashSet::from([[2; 32]]);
+        let (away, look_up) = away_devices(people, &connected, &[9; 32]);
+        assert_eq!(away, [(known, [1; 32])]);
+        assert_eq!(look_up, [unknown]);
     }
 
     #[test]
