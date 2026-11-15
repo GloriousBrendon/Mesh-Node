@@ -89,6 +89,12 @@ const _: () = assert!(HELLO_LOOKUPS < crate::addrs::GETS_PER_DEVICE);
 pub(super) const HELLO_AGAIN: Duration = Duration::from_secs(10);
 pub(super) const HELLO_TRIES: u32 = 3;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PeerDial {
+    LookUp,
+    LastOnly,
+}
+
 /// Peers on the wire (S14): when each was last used, who may be looked up
 /// again when, and the hello's queue and pace. Times are passed in.
 pub(super) struct PeerWire {
@@ -142,6 +148,29 @@ impl PeerWire {
     /// Whether `who` may be looked up at the seed now.
     pub(super) fn may_look_up(&self, who: &MeshId, now: Instant) -> bool {
         self.retry.get(&who.to_bytes()).is_none_or(|at| now >= *at)
+    }
+
+    /// How a send dials `who`: in full, or, while their retry runs, at
+    /// their last address only, which costs the seed nothing.
+    pub(super) fn dial_kind(&self, who: &MeshId, now: Instant) -> PeerDial {
+        if self.may_look_up(who, now) {
+            PeerDial::LookUp
+        } else {
+            PeerDial::LastOnly
+        }
+    }
+
+    /// A dial of `who` came back: reached, their retry clears (as when they
+    /// reach us); a send's miss starts it; a hello's miss tries again soon.
+    pub(super) fn dialled(&mut self, who: &MeshId, reached: bool, hello: bool, now: Instant) {
+        if hello {
+            self.hello_done();
+        }
+        match (reached, hello) {
+            (true, _) => self.heard(who, now),
+            (false, true) => self.hello_missed(who, now),
+            (false, false) => self.missed(who, now),
+        }
     }
 
     /// A lookup or dial of `who` found nobody: not again for `PEER_RETRY`.
@@ -1509,9 +1538,28 @@ impl Helper {
     /// Dials a peer to send them something (S14), unless they were found
     /// away less than `PEER_RETRY` ago: then it waits for mail or a hello.
     pub(super) fn dial_peer(&self, id: &MeshId) {
-        if self.wire.may_look_up(id, Instant::now()) {
-            self.dial_back(id, false);
+        match self.wire.dial_kind(id, Instant::now()) {
+            PeerDial::LookUp => self.dial_back(id, false),
+            PeerDial::LastOnly => self.dial_last(id),
         }
+    }
+
+    /// A dial to `id`'s last known address only, no lookup; a miss changes
+    /// nothing (their retry runs on).
+    fn dial_last(&self, id: &MeshId) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        let Some(target) = Target::of(store, id).filter(|t| t.last.is_some()) else {
+            return;
+        };
+        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        tokio::spawn(async move {
+            if let Some(Reached { last, list, .. }) = routing::reach_known(&node, &target).await {
+                let _ = back.send(Back::Reached(Box::new((id, last, list))));
+                let _ = back.send(Back::Hello(id, true, false));
+            }
+        });
     }
 
     /// An ordinary dial, reported back either way: a hello, or a send's.
@@ -1537,17 +1585,7 @@ impl Helper {
     }
 
     pub(super) fn hello_back(&mut self, id: &MeshId, reached: bool, hello: bool) {
-        let now = Instant::now();
-        if hello {
-            self.wire.hello_done();
-            // Their record may not be at the seed yet: again soon, a few
-            // times; a hello's miss starts no `PEER_RETRY`.
-            if !reached {
-                self.wire.hello_missed(id, now);
-            }
-        } else if !reached {
-            self.wire.missed(id, now);
-        }
+        self.wire.dialled(id, reached, hello, Instant::now());
     }
 
     /// Opens the list of Spaces and works out the peers, as networking
@@ -1677,6 +1715,27 @@ mod tests {
             wire.may_look_up(&a, t0 + Duration::from_secs(5)),
             "the hello clears it"
         );
+    }
+
+    /// Reaching a peer clears their retry, as their reaching us does; and
+    /// while it runs, a send still tries their last address (no lookup).
+    #[test]
+    fn reaching_a_peer_clears_their_retry() {
+        let t0 = Instant::now();
+        let mut wire = PeerWire::new(PEER_IDLE);
+        let [a] = ids(1).try_into().unwrap();
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
+        wire.dialled(&a, false, false, t0);
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LastOnly);
+        // A send's dial to their last address got through.
+        wire.dialled(&a, true, false, t0);
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
+        // So does a hello that reaches them; one that misses starts no retry.
+        wire.dialled(&a, false, false, t0);
+        wire.dialled(&a, true, true, t0);
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
+        wire.dialled(&a, false, true, t0);
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
     }
 
     #[test]

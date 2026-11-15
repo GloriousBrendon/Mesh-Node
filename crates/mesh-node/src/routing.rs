@@ -113,13 +113,9 @@ pub enum ReachError {
 /// Pings one of the contact's devices: an open connection first, then the
 /// cached address, then every device the seeds know of, together; the first
 /// to answer wins (D8).
-pub async fn reach(
-    node: Arc<Node>,
-    anon: &Node,
-    seeds: &[MeshAddr],
-    target: Target,
-    now: u64,
-) -> Result<Reached, ReachError> {
+/// `reach` without the seed: an open connection, or the last address that
+/// worked.
+pub async fn reach_known(node: &Node, target: &Target) -> Option<Reached> {
     let current = |list: &Option<DeviceList>, device: &[u8; 32]| {
         list.as_ref()
             .is_none_or(|l| l.devices().iter().any(|c| c.device().as_bytes() == device))
@@ -128,7 +124,7 @@ pub async fn reach(
         if let Ok(pong) = node.ping(&addr).await {
             // An open connection has no relay to remember; the cache keeps
             // what it had.
-            return Ok(Reached {
+            return Some(Reached {
                 pong,
                 last: None,
                 list: None,
@@ -141,13 +137,25 @@ pub async fn reach(
         && let Ok(pong) = node.ping(&addr).await
         && pong.peer.id == target.id
     {
-        return Ok(Reached {
+        return Some(Reached {
             pong,
             last: Some(last.clone()),
             list: None,
         });
     }
+    None
+}
 
+pub async fn reach(
+    node: Arc<Node>,
+    anon: &Node,
+    seeds: &[MeshAddr],
+    target: Target,
+    now: u64,
+) -> Result<Reached, ReachError> {
+    if let Some(reached) = reach_known(&node, &target).await {
+        return Ok(reached);
+    }
     let (records, newest) = find(anon, seeds, &target, now).await?;
     let mut pings = tokio::task::JoinSet::new();
     for record in records {
