@@ -1123,7 +1123,14 @@ impl Helper {
             // A Space we don't hold yet comes only from a friend, who adds us
             // (S6), or from our own devices.
             if !held && !(own || (friend && is_change)) {
-                self.space_counts.refuse("Space not held");
+                // By kind: a change only a friend's add would bring, passed
+                // on by a member who isn't one; or a post or other line.
+                self.space_counts.refuse(match (&event.body, friend) {
+                    (SpaceBody::Change(_), _) => "Space not held: a change from a non-friend",
+                    (SpaceBody::Post { .. }, true) => "Space not held: a post from a friend",
+                    (SpaceBody::Post { .. }, false) => "Space not held: a post from a non-friend",
+                    (_, _) => "Space not held: another line",
+                });
                 refused += 1;
                 continue;
             }
