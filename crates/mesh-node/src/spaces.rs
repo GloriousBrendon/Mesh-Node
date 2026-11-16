@@ -34,7 +34,29 @@ use super::{
 
 /// A device's answer to a batch of Space events: who, which device, each
 /// event's Space and number, and the answers (none if it didn't answer).
-pub(super) type Answered = (MeshId, MeshAddr, Vec<(SpaceId, u64)>, Option<Vec<bool>>);
+/// Its answers, or why none came (`no_answer`).
+pub(super) type Answered = (
+    MeshId,
+    MeshAddr,
+    Vec<(SpaceId, u64)>,
+    Result<Vec<bool>, &'static str>,
+);
+
+/// Why a Space send got no answer (`spaceCounts`): the connection's error,
+/// if it didn't open, else whether the answer timed out.
+pub(super) fn no_answer(
+    open: Option<&mesh_transport::TransportError>,
+    timed_out: bool,
+) -> &'static str {
+    use mesh_transport::TransportError as E;
+    match open {
+        Some(E::Timeout) => "connect timed out",
+        Some(E::Handshake(_) | E::CertNotOurs) => "handshake failed",
+        Some(_) => "couldn't connect",
+        None if timed_out => "answer timed out",
+        None => "stream broke",
+    }
+}
 
 /// One piece of Space mail: the reader device and its `mseq`.
 pub(super) type MailPut = ([u8; 32], u64);
@@ -444,6 +466,9 @@ pub(super) struct Counts {
     refused: BTreeMap<String, u64>,
     /// Events answered `failed`: the sender keeps them.
     kept: BTreeMap<&'static str, u64>,
+    /// `sends_failed` for each person (`spaceCounts <id>`).
+    #[serde(skip)]
+    per_person: HashMap<[u8; 32], BTreeMap<&'static str, u64>>,
 }
 
 impl Counts {
@@ -946,7 +971,7 @@ impl Helper {
                 // refresh tries again if their record wasn't there yet.
                 self.keys_for(id);
                 self.space_retry.insert(device, (*id, addr));
-                self.space_missed(device, "no keys");
+                self.space_missed(id, device, "no keys");
                 return;
             }
         };
@@ -959,8 +984,12 @@ impl Helper {
                 .map(|e| [&[dm::ANSWER][..], e].concat())
                 .collect();
             let answers = match node.open(&addr, e2ee::SERVICE).await {
-                Ok((_, send, recv)) => dm::exchange(send, recv, &frames).await,
-                Err(_) => None,
+                Ok((_, send, recv)) => {
+                    let started = Instant::now();
+                    let answers = dm::exchange(send, recv, &frames).await;
+                    answers.ok_or_else(|| no_answer(None, started.elapsed() >= e2ee::SEND_TIMEOUT))
+                }
+                Err(e) => Err(no_answer(Some(&e), false)),
             };
             let _ = back.send(Back::SpaceAnswered(Box::new((id, addr, numbers, answers))));
         });
@@ -973,14 +1002,17 @@ impl Helper {
         id: MeshId,
         addr: MeshAddr,
         numbers: Vec<(SpaceId, u64)>,
-        answers: Option<Vec<bool>>,
+        answers: Result<Vec<bool>, &'static str>,
     ) {
         let device = *addr.device.as_bytes();
         self.space_flight.remove(&device);
-        let Some(answers) = answers else {
-            self.space_retry.insert(device, (id, addr));
-            self.space_missed(device, "no answer");
-            return;
+        let answers = match answers {
+            Ok(answers) => answers,
+            Err(why) => {
+                self.space_retry.insert(device, (id, addr));
+                self.space_missed(&id, device, why);
+                return;
+            }
         };
         let mut touched = HashSet::new();
         for ((space, number), ok) in numbers.iter().zip(&answers) {
@@ -1002,13 +1034,19 @@ impl Helper {
             self.space_deliver_to(&id, addr);
         } else {
             self.space_retry.insert(device, (id, addr));
-            self.space_missed(device, "failed answer");
+            self.space_missed(&id, device, "failed answer");
         }
     }
 
     /// A send to `device` didn't go, for `why`: it's tried again soon.
-    fn space_missed(&mut self, device: [u8; 32], why: &'static str) {
+    fn space_missed(&mut self, who: &MeshId, device: [u8; 32], why: &'static str) {
         *self.space_counts.sends_failed.entry(why).or_default() += 1;
+        let theirs = self
+            .space_counts
+            .per_person
+            .entry(who.to_bytes())
+            .or_default();
+        *theirs.entry(why).or_default() += 1;
         if self.space_soon.missed(device, Instant::now()) {
             self.space_counts.given_up += 1;
         }
@@ -1768,6 +1806,15 @@ impl Helper {
                 self.space_send_all(&space);
             }
             #[cfg(debug_assertions)]
+            "spaceCounts" if !args.is_empty() => {
+                let who = parse_id(arg(0)?)?;
+                let theirs = self.space_counts.per_person.get(&who.to_bytes());
+                emit(
+                    "meshSpaceCounts",
+                    json!({ "sendsFailed": theirs.cloned().unwrap_or_default() }),
+                );
+            }
+            #[cfg(debug_assertions)]
             "spaceCounts" => {
                 let me = self.store.as_ref().map(|s| s.id());
                 let mut people = HashSet::new();
@@ -2165,6 +2212,23 @@ mod tests {
         }
         wire.dialled(&b, Dialled::Away, false, t0);
         assert_eq!(wire.dial_kind(&b, t0), PeerDial::LastOnly);
+    }
+
+    /// A send that got no answer says why: couldn't connect (and how), the
+    /// answer timed out, or the stream broke first.
+    #[test]
+    fn no_answer_says_why() {
+        use mesh_transport::TransportError as E;
+        let cases = [
+            (Err(E::Unreachable("x".into())), false, "couldn't connect"),
+            (Err(E::Timeout), false, "connect timed out"),
+            (Err(E::CertNotOurs), false, "handshake failed"),
+            (Ok(()), true, "answer timed out"),
+            (Ok(()), false, "stream broke"),
+        ];
+        for (opened, timed_out, want) in cases {
+            assert_eq!(no_answer(opened.as_ref().err(), timed_out), want);
+        }
     }
 
     /// A hello to someone a send's dial is already reaching leaves it to

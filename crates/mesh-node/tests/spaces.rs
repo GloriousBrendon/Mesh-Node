@@ -761,6 +761,11 @@ fn space_counts_are_numbers_only() {
     for f in ["sendsFailed", "refused", "kept", "finds"] {
         assert!(c[f].as_object().unwrap().values().all(Value::is_u64), "{c}");
     }
+    // One person's: their sends failed by reason, numbers only.
+    let one = ask(&mut k.o, "spaceCounts", &[&k.id_b], "meshSpaceCounts");
+    let theirs = one["sendsFailed"].as_object().unwrap();
+    assert!(theirs.values().all(Value::is_u64), "{one}");
+    assert!(one.get("finds").is_none(), "only theirs: {one}");
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
@@ -1367,13 +1372,23 @@ fn measure_fifty_members() {
             &[&s, &g, text],
             "meshSpaceMessages",
         );
-        for (i, (h, _)) in hs.iter_mut().enumerate() {
-            if i != from {
-                // Names the stuck member if the wait fails.
-                eprintln!("fifty: waiting for m{i} to be told {text:?}");
-                until_for(h, "meshSpaceNotify", Duration::from_secs(300), |n| {
-                    n["text"] == text
-                });
+        for i in (0..hs.len()).filter(|i| *i != from) {
+            // Names the stuck member if the wait fails.
+            eprintln!("fifty: waiting for m{i} to be told {text:?}");
+            let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                until_for(
+                    &mut hs[i].0,
+                    "meshSpaceNotify",
+                    Duration::from_secs(300),
+                    |n| n["text"] == text,
+                )
+            }));
+            if let Err(failed) = told {
+                // The sender's sends to them, by why they failed: numbers.
+                let id = hs[i].1.clone();
+                let c = ask(&mut hs[from].0, "spaceCounts", &[&id], "meshSpaceCounts");
+                eprintln!("fifty: m{from}'s failed sends to m{i}: {c}");
+                std::panic::resume_unwind(failed);
             }
         }
         t.elapsed()
