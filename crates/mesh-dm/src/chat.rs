@@ -423,6 +423,16 @@ impl Chat {
         new + self.late.len()
     }
 
+    /// `unread`, of `ids` only: others' messages among them after the read
+    /// marker, and late ones.
+    pub fn unread_of(&self, ids: &HashSet<EventId>) -> usize {
+        let after = |at: &&Position| self.read.is_none_or(|read| **at > read);
+        let theirs =
+            |(_, id): &&Position| ids.contains(id) && self.held[id].sender.person != self.me;
+        let new = self.shown.iter().filter(after).filter(theirs).count();
+        new + self.late.iter().filter(|id| ids.contains(*id)).count()
+    }
+
     /// The messages to show, in order: deleted ones are gone, edits and
     /// reactions folded in.
     pub fn messages(&self) -> Vec<Message<'_>> {

@@ -523,12 +523,19 @@ struct Fork {
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
-/// `meshSpaceNotify`: someone else's post, new to us.
-fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str) {
+/// `meshSpaceNotify`: someone else's post, new to us, and whether it
+/// mentions us.
+fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str, mention: bool) {
     if let Ok(who) = MeshId::from_bytes(author) {
         emit(
             "meshSpaceNotify",
-            json!({ "space": hex16(space), "channel": hex16(channel), "from": who.to_string(), "text": text }),
+            json!({
+                "space": hex16(space),
+                "channel": hex16(channel),
+                "from": who.to_string(),
+                "text": text,
+                "mention": mention,
+            }),
         );
     }
 }
@@ -686,23 +693,34 @@ impl Helper {
     }
 
     /// `meshSpaces`: every Space held, with its channels and members.
-    pub(super) fn emit_spaces(&self) {
+    pub(super) fn emit_spaces(&mut self) {
         let me = self.store.as_ref().map(|s| s.id().to_bytes());
         let mut spaces = Vec::new();
         for space in self.held_spaces() {
             let Some(v) = self.space_version(&space) else {
                 continue;
             };
+            // Each channel's unread lines and mentions (S12).
+            // ponytail: reads every channel at the first list; keep counts in the index if Spaces grow long.
+            let mut counts = HashMap::new();
+            if let Ok(history) = self.space_mut(&space) {
+                for id in v.state.channels.keys() {
+                    counts.insert(*id, history.unread(id, now_ms()).unwrap_or((0, 0)));
+                }
+            }
             let st = &v.state;
             let mut channels: Vec<_> = st.channels.iter().collect();
             channels.sort_by_key(|(id, c)| (c.category, c.position, **id));
             let channels: Vec<Value> = (channels.into_iter())
                 .map(|(id, c)| {
+                    let (unread, mentions) = counts.get(id).copied().unwrap_or((0, 0));
                     json!({
                         "id": hex16(id),
                         "name": c.name,
                         "category": c.category.as_ref().map(hex16),
                         "adminsPost": c.admins_post,
+                        "unread": unread,
+                        "mentions": mentions,
                     })
                 })
                 .collect();
@@ -1227,7 +1245,8 @@ impl Helper {
                     } else if let SpaceBody::Post { channel, text, .. } = &event.body
                         && author.person != me.to_bytes()
                     {
-                        notify_post(&space, channel, &author.person, text);
+                        let mention = history.mentions_me(&event, &author.person);
+                        notify_post(&space, channel, &author.person, text, mention);
                         if self.space_view == Some((space, *channel)) {
                             let _ = self.emit_channel(&space, channel);
                         }
@@ -1594,13 +1613,15 @@ impl Helper {
         let joined_at = self.joined_at(&space);
         let me = self.store.as_ref().map(|s| s.id().to_bytes());
         // Posts written after our add, by others: news, however it came.
-        let news: Vec<Option<(ChannelId, Person, String)>> = (good.iter())
+        let news: Vec<Option<(ChannelId, Person, String, bool)>> = (good.iter())
             .map(|(e, author)| match &e.body {
                 SpaceBody::Post { channel, text, .. }
                     if Some(author.person) != me
                         && joined_at.is_some_and(|t| e.time + JOIN_CLOCK_TOLERANCE >= t) =>
                 {
-                    Some((*channel, author.person, text.clone()))
+                    let mention = (self.space_open.get(&space))
+                        .is_some_and(|h| h.mentions_me(e, &author.person));
+                    Some((*channel, author.person, text.clone(), mention))
                 }
                 _ => None,
             })
@@ -1611,8 +1632,8 @@ impl Helper {
         match history.store_batch(good, now, now) {
             Ok(taken) => {
                 for (taken, news) in taken.iter().zip(news) {
-                    if let (Taken::Shown, Some((channel, author, text))) = (taken, news) {
-                        notify_post(&space, &channel, &author, &text);
+                    if let (Taken::Shown, Some((channel, author, text, mention))) = (taken, news) {
+                        notify_post(&space, &channel, &author, &text, mention);
                     }
                 }
             }
@@ -1787,6 +1808,18 @@ impl Helper {
                     None => Change::Rename(name),
                 };
                 self.space_command_change(&space, change)?;
+            }
+            "spaceRead" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let up_to = parse16(arg(2)?, "message")?;
+                self.line_author(&space, &channel, &up_to)?;
+                let (key, cert) = self.signing()?;
+                let body = SpaceBody::Read { channel, up_to };
+                (self.space_mut(&space)?.send(body, &key, &cert, now_ms())).map_err(space_fail)?;
+                // To our own devices only (dm D9): the Read is private.
+                self.space_send_all(&space);
+                self.emit_spaces();
             }
             "spaceEdit" => {
                 let space = parse16(arg(0)?, "Space")?;

@@ -968,6 +968,70 @@ fn a_reply_names_who_it_answers() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// Unread and mention counts per channel (S12, Task 11b): B names C, so C's
+/// #general shows one unread and one mention, and the notification says so;
+/// reading clears both, and the owner's `@everyone` is a mention again.
+#[test]
+fn a_mention_counts_until_read() {
+    let mut k = club("spaces-unread");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let id_c = k.id_c.clone();
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "cal?", "", &id_c],
+        "meshSpaceMessages",
+    );
+    let told = until(&mut k.c, "meshSpaceNotify", |n| n["text"] == "cal?");
+    assert_eq!(told["mention"], true, "{told}");
+    let general = |v: &Value| -> Value {
+        (v["spaces"][0]["channels"].as_array().into_iter().flatten())
+            .find(|c| c["name"] == "general")
+            .cloned()
+            .unwrap_or_default()
+    };
+    k.c.send("spaceList", &[]);
+    let v = until(&mut k.c, "meshSpaces", |v| general(v)["unread"] == 1);
+    assert_eq!(general(&v)["mentions"], 1, "{v}");
+    k.c.send("spaceOpen", &[&s, &g]);
+    let page = until(&mut k.c, "meshSpaceMessages", |m| m["channel"] == g);
+    let last = page["events"].as_array().unwrap().last().unwrap()["id"].clone();
+    let v = ask(
+        &mut k.c,
+        "spaceRead",
+        &[&s, &g, last.as_str().unwrap()],
+        "meshSpaces",
+    );
+    assert_eq!(
+        (
+            general(&v)["unread"].clone(),
+            general(&v)["mentions"].clone()
+        ),
+        (0.into(), 0.into()),
+        "{v}"
+    );
+    ask(
+        &mut k.o,
+        "spaceSend",
+        &[&s, &g, "all hands", "", "@everyone"],
+        "meshSpaceMessages",
+    );
+    let told = until(&mut k.c, "meshSpaceNotify", |n| n["text"] == "all hands");
+    assert_eq!(told["mention"], true, "{told}");
+    k.c.send("spaceList", &[]);
+    until(&mut k.c, "meshSpaces", |v| general(v)["mentions"] == 1);
+    // A line that names nobody is unread but no mention.
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "plain"],
+        "meshSpaceMessages",
+    );
+    let told = until(&mut k.c, "meshSpaceNotify", |n| n["text"] == "plain");
+    assert_eq!(told["mention"], false, "{told}");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

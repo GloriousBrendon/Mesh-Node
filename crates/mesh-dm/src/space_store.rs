@@ -119,6 +119,8 @@ pub struct SpaceHistory {
     change_files: ChatFiles,
     /// Channels read so far: their files and what they show.
     channels: HashMap<ChannelId, (ChatFiles, Chat)>,
+    /// Each loaded channel's posts that mention us (S12).
+    mentioned: HashMap<ChannelId, HashSet<EventId>>,
     /// Deleted events, by channel, so a late copy stays out (dm D3).
     deleted: HashMap<Conversation, HashSet<EventId>>,
     /// Where each stored event sits, by number (from 1).
@@ -159,6 +161,7 @@ impl SpaceHistory {
             log: Log::default(),
             chain: Chain::default(),
             channels: HashMap::new(),
+            mentioned: HashMap::new(),
             deleted: HashMap::new(),
             places: Vec::new(),
             counters: Counters::new(me.person),
@@ -279,6 +282,9 @@ impl SpaceHistory {
                         taken.push(t);
                         continue;
                     }
+                    if self.mentions_me(&event, &from.person) {
+                        self.mentioned.entry(channel).or_default().insert(event.id);
+                    }
                     let private = matches!(body, SpaceBody::Read { .. });
                     (channel_key(&self.space, &channel), false, private)
                 }
@@ -395,6 +401,35 @@ impl SpaceHistory {
             })
             .collect();
         Ok((page, start > 0))
+    }
+
+    /// Whether `event` is a post by someone else that names us, or says
+    /// `@everyone` from an admin in force now (S12).
+    pub fn mentions_me(&self, event: &SpaceEvent, author: &Person) -> bool {
+        let SpaceBody::Post {
+            mentions, everyone, ..
+        } = &event.body
+        else {
+            return false;
+        };
+        let me = self.me.person;
+        *author != me
+            && (mentions.contains(&me) || (*everyone && self.moderators().contains(author)))
+    }
+
+    /// A channel's unread lines, and how many of them mention us (S12).
+    pub fn unread(
+        &mut self,
+        channel: &ChannelId,
+        now: u64,
+    ) -> Result<(usize, usize), HistoryError> {
+        self.load(channel, now)?;
+        let view = &self.channels[channel].1;
+        let mentions = self
+            .mentioned
+            .get(channel)
+            .map_or(0, |ids| view.unread_of(ids));
+        Ok((view.unread(), mentions))
     }
 
     /// Whether another member's device has taken our event (dm D5's mark).
@@ -595,6 +630,9 @@ impl SpaceHistory {
                     person: stored.person,
                     device: stored.device,
                 };
+                if self.mentions_me(&event, &from.person) {
+                    self.mentioned.entry(*channel).or_default().insert(event.id);
+                }
                 if let Some(dm) = to_dm(&event) {
                     view.restore(from, dm, stored.received, now);
                 }
