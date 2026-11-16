@@ -913,6 +913,61 @@ fn a_line_is_edited_and_reacted_to() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// A reply and mentions on a send (S12, Task 11b): C's line answers B's
+/// and names B; `@everyone` is an admin's only, and only members can be
+/// named.
+#[test]
+fn a_reply_names_who_it_answers() {
+    let mut k = club("spaces-reply");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let sent = ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "who's in?"],
+        "meshSpaceMessages",
+    );
+    let asked = sent["events"][0]["id"].as_str().unwrap().to_owned();
+    texts_until(&mut k.c, &s, &g, &["who's in?"]);
+    let err = ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "all of you", "", "@everyone"],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    let stranger = mesh_identity::RootKey::generate().unwrap().id().to_string();
+    let err = ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "you", "", &stranger],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "bad-args", "{err}");
+    let id_b = k.id_b.clone();
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "me!", &asked, &id_b],
+        "meshSpaceMessages",
+    );
+    let texts = texts_until(&mut k.b, &s, &g, &["me!"]);
+    assert!(texts.contains(&"who's in?".to_owned()));
+    k.b.send("spaceOpen", &[&s, &g]);
+    let page = until(&mut k.b, "meshSpaceMessages", |m| m["channel"] == g);
+    let reply = (page["events"].as_array().unwrap().iter())
+        .find(|e| e["text"] == "me!")
+        .unwrap();
+    assert_eq!(reply["replyTo"], asked.as_str(), "{reply}");
+    // The owner may tell everyone.
+    ask(
+        &mut k.o,
+        "spaceSend",
+        &[&s, &g, "meeting", "", "@everyone"],
+        "meshSpaceMessages",
+    );
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

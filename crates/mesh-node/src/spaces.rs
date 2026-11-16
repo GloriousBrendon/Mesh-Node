@@ -1863,14 +1863,37 @@ impl Helper {
                 if !v.state.may_post(&me, &channel) && !self.unchecked() {
                     return Err(not_allowed());
                 }
+                // [reply to, or empty] [mentioned member ID or @everyone]...
+                let reply_to = match args.get(3).map(String::as_str) {
+                    None | Some("") => None,
+                    Some(id) => Some(parse16(id, "message")?),
+                };
+                let mut mentions = Vec::new();
+                let mut everyone = false;
+                for named in args.iter().skip(4) {
+                    if named == "@everyone" {
+                        everyone = true;
+                        continue;
+                    }
+                    let who = parse_id(named)?.to_bytes();
+                    if !v.state.members.contains_key(&who) {
+                        return Err(Fail("bad-args", "only members can be mentioned".to_owned()));
+                    }
+                    mentions.push(who);
+                }
+                // `@everyone` is an admin's (S12).
+                let admin = v.state.role(&me).is_some_and(|r| r >= Role::Admin);
+                if everyone && !admin && !self.unchecked() {
+                    return Err(not_allowed());
+                }
                 let (key, cert) = self.signing()?;
                 let body = SpaceBody::Post {
                     channel,
                     text: arg(2)?.to_owned(),
-                    reply_to: None,
+                    reply_to,
                     attachments: Vec::new(),
-                    mentions: Vec::new(),
-                    everyone: false,
+                    mentions,
+                    everyone,
                 };
                 let now = now_ms();
                 self.space_mut(&space)?
