@@ -35,7 +35,7 @@ pub use id::{
     DeviceKey, IdError, Link, MeshId, RootKey, mail_collect_tag, verify_device, verify_device_bytes,
 };
 pub use keystore::{
-    KdfParams, Keystore, KeystoreError, MAX_CLOCK_OFFSET, set_clock_offset, unix_now,
+    KdfParams, Keystore, KeystoreError, MAX_CLOCK_OFFSET, set_clock_offset, unix_now, unix_now_ms,
     write_atomically,
 };
 pub use knock::{

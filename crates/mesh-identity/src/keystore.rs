@@ -1178,6 +1178,14 @@ pub fn unix_now() -> u64 {
     now.saturating_add_signed(CLOCK_OFFSET.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// `unix_now` in milliseconds.
+pub fn unix_now_ms() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    now.saturating_add_signed(CLOCK_OFFSET.load(std::sync::atomic::Ordering::Relaxed) * 1000)
+}
+
 /// Seconds added to `unix_now`: 0, unless a test moved the clock.
 static CLOCK_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// How far a test may move the clock (`--clock-offset`).

@@ -334,10 +334,15 @@ fn away_devices(
 
 /// The clock in real milliseconds, for Space events' `seq` and `time`
 /// (dm D2): two lines a few ms apart then order by time, not by ID.
+/// `--clock-offset` moves it, as it moves the rest of the process's clock.
 fn now_ms() -> u64 {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    since.map_or(0, |d| d.as_millis() as u64)
+    mesh_identity::unix_now_ms()
 }
+
+/// How far behind the adder's clock a post's author's may be and its post,
+/// in history, still be told as news after our add (ms; S10, dated
+/// 2026-11-16). Clocks differ; a post from well before the add isn't told.
+pub(super) const JOIN_CLOCK_TOLERANCE: u64 = 2 * 60 * 1000;
 
 /// The stream new members pull a Space's history on (S10).
 pub(super) const SPACE_HISTORY: &str = "space-history";
@@ -1430,7 +1435,8 @@ impl Helper {
         let news: Vec<Option<(ChannelId, Person, String)>> = (good.iter())
             .map(|(e, author)| match &e.body {
                 SpaceBody::Post { channel, text, .. }
-                    if Some(author.person) != me && joined_at.is_some_and(|t| e.time >= t) =>
+                    if Some(author.person) != me
+                        && joined_at.is_some_and(|t| e.time + JOIN_CLOCK_TOLERANCE >= t) =>
                 {
                     Some((*channel, author.person, text.clone()))
                 }

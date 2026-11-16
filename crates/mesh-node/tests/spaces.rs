@@ -25,10 +25,23 @@ fn helper_ttl(
     name: &str,
     ttl: Option<&str>,
 ) -> (Helper, String) {
+    helper_args(dir, relay, seed, name, ttl, &[])
+}
+
+/// `helper_ttl`, started with `extra` arguments too.
+fn helper_args(
+    dir: &std::path::Path,
+    relay: &Relay,
+    seed: &str,
+    name: &str,
+    ttl: Option<&str>,
+    extra: &[&str],
+) -> (Helper, String) {
     let mut args = vec!["--seed", seed, "--peer-idle", "3"];
     if let Some(ttl) = ttl {
         args.extend(["--record-ttl", ttl]);
     }
+    args.extend(extra);
     let mut h = Helper::start_with(dir, relay, &args);
     assert_eq!(h.event().0, "meshIdentity");
     let id = h.expect("idCreate", &[name, PASSWORD], "meshIdentity")["id"]
@@ -114,9 +127,9 @@ fn channel(space: &Value, name: &str) -> String {
 }
 
 fn members(space: &Value) -> Vec<String> {
-    let members = space["members"].as_array().unwrap();
+    // A list with no Space yet: no members.
+    let members = space["members"].as_array().into_iter().flatten();
     let mut ids: Vec<String> = members
-        .iter()
         .map(|m| m["id"].as_str().unwrap().to_owned())
         .collect();
     ids.sort();
@@ -665,14 +678,36 @@ fn a_linked_device_gets_the_spaces() {
 }
 
 /// A line written after someone was added is news to them however it comes:
-/// D is added while locked, B posts and locks, and D, back, gets B's line
-/// only in O's history. D is told of it, and not of what was said before.
+/// B's line while D was locked, only in history when D unlocks. Clocks
+/// differ, so up to `JOIN_CLOCK_TOLERANCE` (2 minutes) of skew is allowed:
+/// F's clock is a minute behind O's (who added D), and F's line after the
+/// add is told. E's clock is five minutes behind, so E's line before the add
+/// is well before it, and isn't.
 #[test]
 fn a_line_after_the_add_is_told_even_from_history() {
     let mut k = club("spaces-told");
     let (s, g) = (k.space.clone(), k.general.clone());
+    let mut skewed = |name: &str, offset: &str| {
+        let dir = temp_dir(&format!("spaces-told-{name}-{}", k.space));
+        let (mut h, id) = helper_args(
+            &dir,
+            &k._relay,
+            &k.ticket,
+            name,
+            // Records long enough to outlast the clocks' gap.
+            None,
+            &["--clock-offset", offset],
+        );
+        befriend(&mut k.o, &k.id_o, &mut h, &id);
+        ask(&mut k.o, "spaceAdd", &[&s, &id], "meshSpaces");
+        until(&mut h, "meshSpaces", |v| {
+            members(&v["spaces"][0]).contains(&id)
+        });
+        h
+    };
+    let (mut e, mut f) = (skewed("eve", "-300"), skewed("fay", "-60"));
     ask(
-        &mut k.b,
+        &mut e,
         "spaceSend",
         &[&s, &g, "old news"],
         "meshSpaceMessages",
@@ -682,28 +717,35 @@ fn a_line_after_the_add_is_told_even_from_history() {
     befriend(&mut k.o, &k.id_o, &mut d, &id_d);
     ask(&mut d, "idLock", &[], "meshIdentity");
     ask(&mut k.o, "spaceAdd", &[&s, &id_d], "meshSpaces");
-    until(&mut k.b, "meshSpaces", |v| {
-        members(&v["spaces"][0]).contains(&id_d)
-    });
-    ask(
-        &mut k.b,
-        "spaceSend",
-        &[&s, &g, "while you joined"],
-        "meshSpaceMessages",
-    );
-    until(&mut k.o, "meshSpaceNotify", |n| {
-        n["text"] == "while you joined"
-    });
-    ask(&mut k.b, "idLock", &[], "meshIdentity");
-    ask(&mut k.c, "idLock", &[], "meshIdentity");
+    for h in [&mut k.b, &mut f] {
+        until(h, "meshSpaces", |v| {
+            members(&v["spaces"][0]).contains(&id_d)
+        });
+    }
+    for (h, text) in [(&mut k.b, "while you joined"), (&mut f, "a minute slow")] {
+        ask(h, "spaceSend", &[&s, &g, text], "meshSpaceMessages");
+        until(&mut k.o, "meshSpaceNotify", |n| n["text"] == text);
+    }
+    for h in [&mut k.b, &mut k.c, &mut e, &mut f] {
+        ask(h, "idLock", &[], "meshIdentity");
+    }
     d.send("idUnlock", &["dot", PASSWORD]);
     let mut told = Vec::new();
     until(&mut d, "meshSpaceNotify", |n| {
         told.push(n["text"].as_str().unwrap().to_owned());
-        n["text"] == "while you joined"
+        ["while you joined", "a minute slow"]
+            .iter()
+            .all(|t| told.iter().any(|x| x == t))
     });
     assert!(!told.contains(&"old news".to_owned()), "{told:?}");
-    let _ = (d.quit(), k.o.quit(), k.b.quit(), k.c.quit());
+    let _ = (
+        d.quit(),
+        e.quit(),
+        f.quit(),
+        k.o.quit(),
+        k.b.quit(),
+        k.c.quit(),
+    );
 }
 
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
