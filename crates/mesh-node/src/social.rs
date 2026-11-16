@@ -382,7 +382,7 @@ impl Helper {
         let this = *store.device_key().public().as_bytes();
         let account = store.account().to_bytes();
         let (node, anon, seeds) = (net.node.clone(), net.anon.clone(), self.seeds.clone());
-        let (gets, dialling, me) = (net.gets.clone(), self.dialling.clone(), store.id());
+        let (gets, dialling, me) = (net.gets.for_("own"), self.dialling.clone(), store.id());
         tokio::spawn(async move {
             let found = loop {
                 let found =

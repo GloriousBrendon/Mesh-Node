@@ -186,6 +186,11 @@ impl PeerWire {
         self.retry.insert(who.to_bytes(), now + PEER_RETRY);
     }
 
+    /// How many peers are in `PEER_RETRY` (`spaceCounts`).
+    pub(super) fn in_retry(&self, now: Instant) -> usize {
+        self.retry.values().filter(|until| **until > now).count()
+    }
+
     /// `who` connected to us: their retry clears (the hello's other side).
     pub(super) fn heard(&mut self, who: &MeshId, now: Instant) {
         self.retry.remove(&who.to_bytes());
@@ -1768,6 +1773,13 @@ impl Helper {
                 counts["peersNoKeys"] = json!(no_keys);
                 counts["outstanding"] = json!(self.space_retry.len());
                 counts["soonWaiting"] = json!(self.space_soon.len());
+                counts["peersInRetry"] = json!(self.wire.in_retry(Instant::now()));
+                let finds = self
+                    .net
+                    .as_ref()
+                    .map(|n| n.gets.finds())
+                    .unwrap_or_default();
+                counts["finds"] = json!(finds);
                 emit("meshSpaceCounts", counts);
             }
             #[cfg(debug_assertions)]
@@ -1917,7 +1929,7 @@ impl Helper {
         let gets = if hello {
             net.gets.spare()
         } else {
-            net.gets.clone()
+            net.gets.for_("send")
         };
         let (seeds, id, dialling) = (self.seeds.clone(), *id, self.dialling.clone());
         tokio::spawn(async move {

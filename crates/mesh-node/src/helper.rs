@@ -840,7 +840,7 @@ impl Helper {
                 let gets = self
                     .net
                     .as_ref()
-                    .map(|n| n.gets.clone())
+                    .map(|n| n.gets.for_("contact"))
                     .unwrap_or_default();
                 if !node.status().online {
                     return Err(Fail("offline", "not connected to a relay yet".to_owned()));
@@ -1001,7 +1001,7 @@ impl Helper {
         if self.dialling.claim(vec![*id]).is_empty() {
             return;
         }
-        let (node, anon, gets) = (net.node.clone(), net.anon.clone(), net.gets.clone());
+        let (node, anon, gets) = (net.node.clone(), net.anon.clone(), net.gets.for_("contact"));
         let (seeds, back, id) = (self.seeds.clone(), self.back.clone(), *id);
         let dialling = self.dialling.clone();
         tokio::spawn(async move {
@@ -1342,7 +1342,7 @@ impl Helper {
                 continue;
             };
             let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
-            let (gets, fetching) = (net.gets.clone(), self.keys_fetching.clone());
+            let (gets, fetching) = (net.gets.for_("keys"), self.keys_fetching.clone());
             tokio::spawn(async move {
                 // Again if asked meanwhile and nothing came: their record may
                 // not have been put when this one read.

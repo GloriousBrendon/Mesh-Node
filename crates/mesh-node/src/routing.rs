@@ -4,7 +4,7 @@
 //! for them (D8). Seed requests go from the throwaway node (seed D7b).
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,15 +38,49 @@ pub struct Gets {
     seeds: Arc<Mutex<HashMap<[u8; 32], Shared>>>,
     /// Left free for others: `spare`'s takes stop this short.
     keep: usize,
+    /// What finds through this clone are for (`spaceCounts`).
+    purpose: &'static str,
+    /// Finds by purpose and result, shared by every clone.
+    finds: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl Gets {
     /// The same budgets, taking only what leaves `SPARE_KEEPS` free.
     pub fn spare(&self) -> Gets {
         Gets {
-            seeds: self.seeds.clone(),
             keep: SPARE_KEEPS,
+            ..self.for_("hello")
         }
+    }
+
+    /// The same budgets, its finds counted as for `purpose`.
+    pub fn for_(&self, purpose: &'static str) -> Gets {
+        Gets {
+            purpose,
+            ..self.clone()
+        }
+    }
+
+    /// Counts a find's result under this clone's purpose.
+    fn counted<T>(&self, found: &Result<T, ReachError>) {
+        let result = match found {
+            Ok(_) => "found",
+            Err(ReachError::Unreachable) => "not found",
+            Err(ReachError::Slowed) => "slowed",
+            Err(ReachError::RevokedDevice) => "revoked",
+        };
+        let purpose = if self.purpose.is_empty() {
+            "other"
+        } else {
+            self.purpose
+        };
+        let mut finds = self.finds.lock().unwrap_or_else(|e| e.into_inner());
+        *finds.entry(format!("{purpose} {result}")).or_default() += 1;
+    }
+
+    /// Finds so far, by purpose and result.
+    pub fn finds(&self) -> BTreeMap<String, u64> {
+        self.finds.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The budget for gets at the seed `device`.
@@ -380,6 +414,18 @@ pub async fn find(
     target: &Target,
     now: u64,
 ) -> Result<(Vec<AddrRecord>, Option<DeviceList>), ReachError> {
+    let found = find_counted(anon, gets, seeds, target, now).await;
+    gets.counted(&found);
+    found
+}
+
+async fn find_counted(
+    anon: &Node,
+    gets: &Gets,
+    seeds: &[MeshAddr],
+    target: &Target,
+    now: u64,
+) -> Result<(Vec<AddrRecord>, Option<DeviceList>), ReachError> {
     let today = day_of(now);
     let lookups =
         [today, today.saturating_sub(1)].map(|day| target.keys.lookup(&target.id, day).to_vec());
@@ -477,6 +523,26 @@ mod tests {
         let hello = gets.spare().join();
         assert!(gets.try_take(GETS_PER_FIND, later).is_none());
         drop(hello);
+    }
+
+    /// Finds are counted by what they were for and what came back
+    /// (`spaceCounts`): numbers only.
+    #[test]
+    fn finds_are_counted_by_purpose_and_result() {
+        let gets = Gets::default();
+        gets.for_("keys").counted(&Err::<(), _>(ReachError::Slowed));
+        gets.spare().counted(&Ok(()));
+        gets.spare().counted(&Err::<(), _>(ReachError::Unreachable));
+        gets.for_("send").for_("send").counted(&Ok(()));
+        let want = [
+            ("hello found", 1),
+            ("hello not found", 1),
+            ("keys slowed", 1),
+            ("send found", 1),
+        ];
+        let want: std::collections::BTreeMap<String, u64> =
+            want.into_iter().map(|(k, n)| (k.to_owned(), n)).collect();
+        assert_eq!(gets.finds(), want);
     }
 
     /// Each seed has its own limit, so a find that asks two seeds takes

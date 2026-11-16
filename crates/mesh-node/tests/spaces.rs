@@ -754,10 +754,10 @@ fn a_line_after_the_add_is_told_even_from_history() {
 fn space_counts_are_numbers_only() {
     let mut k = club("spaces-counts");
     let c = ask(&mut k.o, "spaceCounts", &[], "meshSpaceCounts");
-    for f in ["peersNoKeys", "outstanding", "givenUp"] {
+    for f in ["peersNoKeys", "outstanding", "givenUp", "peersInRetry"] {
         assert!(c[f].is_u64(), "{c}");
     }
-    for f in ["sendsFailed", "refused", "kept"] {
+    for f in ["sendsFailed", "refused", "kept", "finds"] {
         assert!(c[f].as_object().unwrap().values().all(Value::is_u64), "{c}");
     }
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
