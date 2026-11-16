@@ -4,7 +4,7 @@
 //! for them (D8). Seed requests go from the throwaway node (seed D7b).
 
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,14 +31,41 @@ pub const SPARE_KEEPS: usize = 20;
 const SLOWED_AGAIN: Duration = Duration::from_secs(10);
 const SLOWED_TRIES: u32 = 3;
 
-/// One budget for every address get a helper makes (S14): a sliding
-/// minute, so it holds whenever the seed's own minute starts. Waiters take
-/// their turn in the order they came, the hello's apart from the rest. A
-/// cheap clone shares it.
+/// The address-get budgets a helper's gets come from (S14): one per seed,
+/// each seed counting its own limit. A cheap clone shares them.
 #[derive(Clone, Default)]
 pub struct Gets {
-    window: Arc<Mutex<Window>>,
+    seeds: Arc<Mutex<HashMap<[u8; 32], Shared>>>,
     /// Left free for others: `spare`'s takes stop this short.
+    keep: usize,
+}
+
+impl Gets {
+    /// The same budgets, taking only what leaves `SPARE_KEEPS` free.
+    pub fn spare(&self) -> Gets {
+        Gets {
+            seeds: self.seeds.clone(),
+            keep: SPARE_KEEPS,
+        }
+    }
+
+    /// The budget for gets at the seed `device`.
+    pub fn at(&self, device: &[u8; 32]) -> SeedGets {
+        let mut seeds = self.seeds.lock().unwrap_or_else(|e| e.into_inner());
+        SeedGets {
+            window: seeds.entry(*device).or_default().clone(),
+            keep: self.keep,
+        }
+    }
+}
+
+type Shared = Arc<Mutex<Window>>;
+
+/// One seed's budget for every address get a helper makes there: a sliding
+/// minute, so it holds whenever the seed's own minute starts. Waiters take
+/// their turn in the order they came, the hello's apart from the rest.
+pub struct SeedGets {
+    window: Arc<Mutex<Window>>,
     keep: usize,
 }
 
@@ -86,10 +113,11 @@ impl Window {
     }
 }
 
-impl Gets {
+impl SeedGets {
     /// The same budget, taking only what leaves `SPARE_KEEPS` free.
-    pub fn spare(&self) -> Gets {
-        Gets {
+    #[cfg(test)]
+    fn spare(&self) -> SeedGets {
+        SeedGets {
             window: self.window.clone(),
             keep: SPARE_KEEPS,
         }
@@ -359,7 +387,7 @@ pub async fn find(
     for tried in 1..=SLOWED_TRIES {
         let mut slowed = false;
         for addr in seeds {
-            gets.take(GETS_PER_FIND).await;
+            gets.at(addr.device.as_bytes()).take(GETS_PER_FIND).await;
             let Ok(answers) = seed::ask_many(anon, addr, seed::ADDR_GET, &lookups).await else {
                 continue;
             };
@@ -422,7 +450,7 @@ mod tests {
     #[test]
     fn address_gets_wait_in_turn() {
         let t0 = Instant::now();
-        let gets = Gets::default();
+        let gets = Gets::default().at(&[0; 32]);
         while gets.try_take(GETS_PER_FIND, t0).is_none() {}
         let first = gets.join();
         assert!(gets.turn(&first, GETS_PER_FIND, t0).is_some(), "full");
@@ -451,10 +479,35 @@ mod tests {
         drop(hello);
     }
 
+    /// Each seed has its own limit, so a find that asks two seeds takes
+    /// from each one's budget: a second seed doesn't halve the pace.
+    #[test]
+    fn each_seed_has_its_own_budget() {
+        let t0 = Instant::now();
+        let gets = Gets::default();
+        let (a, b) = (gets.at(&[1; 32]), gets.at(&[2; 32]));
+        let mut finds = 0;
+        while a.try_take(GETS_PER_FIND, t0).is_none() && b.try_take(GETS_PER_FIND, t0).is_none() {
+            finds += 1;
+        }
+        assert_eq!(finds * GETS_PER_FIND, GETS_A_MINUTE);
+        assert!(
+            gets.at(&[1; 32]).try_take(GETS_PER_FIND, t0).is_some(),
+            "shared"
+        );
+        assert!(
+            gets.spare()
+                .at(&[2; 32])
+                .try_take(GETS_PER_FIND, t0)
+                .is_some(),
+            "the hello's too"
+        );
+    }
+
     #[test]
     fn address_gets_keep_under_the_seeds_limit() {
         let t0 = Instant::now();
-        let gets = Gets::default();
+        let gets = Gets::default().at(&[0; 32]);
         let mut at = t0;
         let mut taken = Vec::new();
         // Asking every second for three minutes.
@@ -475,7 +528,7 @@ mod tests {
         let wait = (gets.try_take(GETS_PER_FIND, t0 + Duration::from_secs(150))).unwrap();
         assert!(wait > Duration::ZERO && wait <= Duration::from_secs(60));
 
-        let gets = Gets::default();
+        let gets = Gets::default().at(&[0; 32]);
         let spare = gets.spare();
         let mut people = 0;
         while spare.try_take(GETS_PER_FIND, t0).is_none() {
