@@ -106,6 +106,9 @@ pub(crate) enum Dialled {
     Away,
     /// The seed refused the lookup for its limit.
     Slowed,
+    /// A hello not made: a send's dial to them was under way, and its
+    /// answer covers the hello.
+    Covered,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -187,6 +190,7 @@ impl PeerWire {
         match (how, hello) {
             (Dialled::Reached, _) => self.heard(who, now),
             (Dialled::Slowed, _) => self.hello_later.push((now + HELLO_AGAIN, *who)),
+            (Dialled::Covered, _) => {}
             (Dialled::Away, true) => self.hello_missed(who, now),
             (Dialled::Away, false) => self.missed(who, now),
         }
@@ -1923,13 +1927,22 @@ impl Helper {
             return;
         };
         let back = self.back.clone();
-        let Some(target) = Target::of(store, id) else {
+        let Some(mut target) = Target::of(store, id) else {
             let _ = back.send(Back::Hello(*id, Dialled::Away, hello));
             return;
         };
-        // A send's dial while one to them is under way: that one's answer
-        // delivers (hellos are paced by HELLO_DIALS already).
-        if !hello && self.dialling.claim(vec![*id]).is_empty() {
+        // An address a key lookup (or a connection) gave is tried before
+        // looking them up again (S14).
+        if target.last.is_none() {
+            target.last = self.known_last(id);
+        }
+        // One dial to a person at a time, hellos too, so each looks them up
+        // once: a send's dial while one is under way runs once more if that
+        // one misses; a hello while one is under way is left to it.
+        if self.dialling.claim(vec![*id]).is_empty() {
+            if hello {
+                let _ = back.send(Back::Hello(*id, Dialled::Covered, true));
+            }
             return;
         }
         let (node, anon) = (net.node.clone(), net.anon.clone());
@@ -1942,10 +1955,23 @@ impl Helper {
         let (seeds, id, dialling) = (self.seeds.clone(), *id, self.dialling.clone());
         tokio::spawn(async move {
             let reached = loop {
-                let reached =
-                    routing::reach(node.clone(), &anon, &gets, &seeds, &target, unix_now()).await;
+                let mut found = Vec::new();
+                let reached = routing::reach(
+                    node.clone(),
+                    &anon,
+                    &gets,
+                    &seeds,
+                    &target,
+                    unix_now(),
+                    &mut found,
+                )
+                .await;
+                // Their keys too, whether or not a device answered.
+                if !found.is_empty() {
+                    let _ = back.send(Back::Records(vec![(id, found)]));
+                }
                 // A send's dial asked again meanwhile, and missed: once more.
-                let again = !hello && dialling.done(&id);
+                let again = dialling.done(&id);
                 if reached.is_ok() && again {
                     dialling.done(&id);
                 }
@@ -2139,6 +2165,23 @@ mod tests {
         }
         wire.dialled(&b, Dialled::Away, false, t0);
         assert_eq!(wire.dial_kind(&b, t0), PeerDial::LastOnly);
+    }
+
+    /// A hello to someone a send's dial is already reaching leaves it to
+    /// that dial, which looks them up once for both: nothing is queued
+    /// again and no retry starts.
+    #[test]
+    fn a_hello_a_send_is_dialling_is_left_to_it() {
+        let t0 = Instant::now();
+        let mut wire = PeerWire::new(PEER_IDLE);
+        let [a] = ids(1).try_into().unwrap();
+        wire.queue_hello([a]);
+        assert_eq!(wire.next_hellos(t0, 0), [a]);
+        wire.dialled(&a, Dialled::Covered, true, t0);
+        let later = t0 + Duration::from_secs(3600);
+        wire.hellos_due(later);
+        assert!(wire.next_hellos(later, 0).is_empty());
+        assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp);
     }
 
     /// A failed Space send and a hello that found nobody back off the

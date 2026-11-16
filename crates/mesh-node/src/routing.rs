@@ -343,6 +343,8 @@ pub async fn reach_known(node: &Node, target: &Target) -> Option<Reached> {
     None
 }
 
+/// The records a lookup found are put in `found`, reached or not: one
+/// find gives their keys too (SPEC-spaces S14).
 pub async fn reach(
     node: Arc<Node>,
     anon: &Node,
@@ -350,11 +352,13 @@ pub async fn reach(
     seeds: &[MeshAddr],
     target: &Target,
     now: u64,
+    found: &mut Vec<AddrRecord>,
 ) -> Result<Reached, ReachError> {
     if let Some(reached) = reach_known(&node, target).await {
         return Ok(reached);
     }
     let (records, newest) = find(anon, gets, seeds, target, now).await?;
+    found.extend(records.iter().cloned());
     let mut pings = tokio::task::JoinSet::new();
     for record in records {
         let device = *record.device.as_bytes();

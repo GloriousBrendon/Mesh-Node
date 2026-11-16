@@ -764,6 +764,50 @@ fn space_counts_are_numbers_only() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// One find gives a person's address and their keys: a dial's find
+/// teaches the keys, and a key lookup's address serves the next send. With
+/// the real refresh (none falls in the test), B and C, peers who never
+/// met, find each other at most once each to get keys, say hello and
+/// trade a line each way (O, their friend, is dialled and has their keys
+/// fetched at unlock, and their own id is looked up once for their other
+/// devices' keys).
+#[test]
+fn one_find_serves_keys_and_the_dial() {
+    let mut k = club_ttl("spaces-one-find", &[], None);
+    let (s, g) = (k.space.clone(), k.general.clone());
+    for (from, to, text) in [(0, 1, "from bea"), (1, 0, "from cal")] {
+        let pair = [&mut k.b, &mut k.c];
+        ask(
+            pair[from],
+            "spaceSend",
+            &[&s, &g, text],
+            "meshSpaceMessages",
+        );
+        until(pair[to], "meshSpaceNotify", |n| n["text"] == text);
+    }
+    for h in [&mut k.b, &mut k.c] {
+        let c = ask(h, "spaceCounts", &[], "meshSpaceCounts");
+        let finds: u64 = (c["finds"].as_object().unwrap().iter())
+            // A lookup that found nobody yet (their record wasn't put) is
+            // asked again; one that found them serves keys and dials.
+            .filter(|(k, _)| k.ends_with(" found") && !k.ends_with("not found"))
+            .filter(|(k, _)| {
+                ["keys", "hello", "send", "contact"]
+                    .iter()
+                    .any(|p| k.starts_with(p))
+            })
+            .map(|(_, n)| n.as_u64().unwrap())
+            .sum();
+        eprintln!("one find: {c}");
+        // ponytail: counts aren't per person. One each for the peer and our
+        // own id (the key fetch covers our other devices), and two for O:
+        // the unlock's key fetch for contacts stays its own find, as their
+        // dial may reach them with no lookup and so bring no new keys.
+        assert!(finds <= 4, "{finds} finds for three people: {c}");
+    }
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

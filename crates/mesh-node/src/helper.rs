@@ -847,7 +847,14 @@ impl Helper {
                 }
                 let (seeds, back) = (self.seeds.clone(), self.back.clone());
                 tokio::spawn(async move {
-                    match routing::reach(node, &anon, &gets, &seeds, &target, unix_now()).await {
+                    let mut found = Vec::new();
+                    let reached =
+                        routing::reach(node, &anon, &gets, &seeds, &target, unix_now(), &mut found)
+                            .await;
+                    if !found.is_empty() {
+                        let _ = back.send(Back::Records(vec![(id, found)]));
+                    }
+                    match reached {
                         Ok(Reached { pong, last, list }) => {
                             emit_pong(&pong);
                             let _ = back.send(Back::Reached(Box::new((id, last, list))));
@@ -988,6 +995,16 @@ impl Helper {
         }
     }
 
+    /// A device address of `id`'s from their records or a connection, as
+    /// a last address to try before a lookup.
+    pub(super) fn known_last(&self, id: &MeshId) -> Option<LastAddr> {
+        let (device, (_, addr)) = self.devices_at.iter().find(|(_, (owner, _))| owner == id)?;
+        Some(LastAddr {
+            device: *device,
+            relay: addr.relay.as_ref()?.to_string(),
+        })
+    }
+
     fn dial(&self, id: &MeshId) {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
@@ -1006,8 +1023,20 @@ impl Helper {
         let dialling = self.dialling.clone();
         tokio::spawn(async move {
             let reached = loop {
-                let reached =
-                    routing::reach(node.clone(), &anon, &gets, &seeds, &target, unix_now()).await;
+                let mut found = Vec::new();
+                let reached = routing::reach(
+                    node.clone(),
+                    &anon,
+                    &gets,
+                    &seeds,
+                    &target,
+                    unix_now(),
+                    &mut found,
+                )
+                .await;
+                if !found.is_empty() {
+                    let _ = back.send(Back::Records(vec![(id, found)]));
+                }
                 let again = dialling.done(&id);
                 if reached.is_ok() && again {
                     dialling.done(&id);
