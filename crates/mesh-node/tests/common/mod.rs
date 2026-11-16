@@ -143,14 +143,20 @@ impl Helper {
 
     /// The next line's binding and decoded payload.
     pub fn line(&mut self) -> (String, Value) {
-        let line = match self.stdout.recv_timeout(LINE_TIMEOUT) {
+        self.line_within(LINE_TIMEOUT)
+            .unwrap_or_else(|| fail("mesh-node went quiet"))
+    }
+
+    /// `line`, or `None` if none comes within `wait`.
+    pub fn line_within(&mut self, wait: Duration) -> Option<(String, Value)> {
+        let line = match self.stdout.recv_timeout(wait) {
             Ok(line) => line,
-            Err(mpsc::RecvTimeoutError::Timeout) => fail("mesh-node went quiet"),
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
             Err(mpsc::RecvTimeoutError::Disconnected) => fail("mesh-node exited"),
         };
         let frame: Value = serde_json::from_str(&line).unwrap();
         let payload = serde_json::from_str(frame["payload"].as_str().unwrap()).unwrap();
-        (frame["binding"].as_str().unwrap().to_owned(), payload)
+        Some((frame["binding"].as_str().unwrap().to_owned(), payload))
     }
 
     /// The next event other than `meshNet` or a `meshSocial` nobody asked for.

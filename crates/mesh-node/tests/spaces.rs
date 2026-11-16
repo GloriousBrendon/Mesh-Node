@@ -77,10 +77,11 @@ fn until_for(
 ) -> Value {
     let started = Instant::now();
     loop {
-        if started.elapsed() > limit {
+        // To this wait's own limit, however long the helper stays quiet.
+        let left = limit.saturating_sub(started.elapsed());
+        let Some((got, payload)) = h.line_within(left).filter(|_| !left.is_zero()) else {
             fail(&format!("no {binding} came"));
-        }
-        let (got, payload) = h.line();
+        };
         if got == binding && done(&payload) {
             return payload;
         }
