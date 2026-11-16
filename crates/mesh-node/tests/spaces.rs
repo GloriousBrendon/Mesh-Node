@@ -813,6 +813,52 @@ fn one_find_serves_keys_and_the_dial() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// A channel's page is a DM's (S12, Task 11b): each line's time, reply,
+/// reactions, files and late mark, ours marked sent once a member's device
+/// took it, and older lines through `before`.
+#[test]
+fn a_channel_page_is_a_dm_page() {
+    let mut k = club("spaces-page");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    for text in ["one", "two", "three"] {
+        ask(&mut k.b, "spaceSend", &[&s, &g, text], "meshSpaceMessages");
+    }
+    texts_until(&mut k.c, &s, &g, &["one", "two", "three"]);
+    let started = Instant::now();
+    let page = loop {
+        k.b.send("spaceOpen", &[&s, &g]);
+        let page = until(&mut k.b, "meshSpaceMessages", |m| m["channel"] == g);
+        let events = page["events"].as_array().unwrap();
+        if events.len() == 3 && events.iter().all(|e| e["sent"] == true) {
+            break page;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "not sent: {page}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert_eq!(page["more"], false, "{page}");
+    for e in page["events"].as_array().unwrap() {
+        assert!(e["time"].as_u64().unwrap() > 0, "{e}");
+        assert!(e["replyTo"].is_null() && e["late"] == false, "{e}");
+        assert_eq!(e["reactions"], serde_json::json!([]), "{e}");
+        assert_eq!(e["attachments"], serde_json::json!([]), "{e}");
+    }
+    let third = page["events"][2]["id"].as_str().unwrap().to_owned();
+    k.b.send("spaceOpen", &[&s, &g, &third]);
+    // The newest page may be pushed meanwhile (a line was taken): the
+    // answer is the shorter one.
+    let older = until(&mut k.b, "meshSpaceMessages", |m| {
+        m["channel"] == g && m["events"].as_array().is_some_and(|e| e.len() == 2)
+    });
+    let texts: Vec<&str> = (older["events"].as_array().unwrap().iter())
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["one", "two"], "{older}");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

@@ -728,19 +728,28 @@ impl Helper {
 
     /// `meshSpaceMessages`: a channel as it shows.
     fn emit_channel(&mut self, space: &SpaceId, channel: &ChannelId) -> Result<(), Fail> {
-        let now = now_ms();
+        self.emit_channel_page(space, channel, None)
+    }
+
+    /// `meshSpaceMessages`: a channel's newest page, or the page before
+    /// `before`, as a DM's (Task 11b).
+    fn emit_channel_page(
+        &mut self,
+        space: &SpaceId,
+        channel: &ChannelId,
+        before: Option<[u8; 16]>,
+    ) -> Result<(), Fail> {
+        let me = self.me_sender()?.person;
         let history = self.space_mut(space)?;
-        let chat = history.channel(channel, now).map_err(space_fail)?;
-        let events: Vec<Value> = (chat.messages().iter())
-            .filter_map(|m| {
-                let from = MeshId::from_bytes(&m.author).ok()?;
-                Some(json!({ "id": hex16(&m.id), "from": from.to_string(), "text": m.text, "edited": m.edited }))
-            })
+        let (page, more) =
+            (history.page(channel, before, dm::PAGE, now_ms())).map_err(space_fail)?;
+        let events: Vec<Value> = (page.iter())
+            .map(|m| dm::shown_json(m, m.author == me && history.is_sent(&m.id)))
             .collect();
         self.space_view = Some((*space, *channel));
         emit(
             "meshSpaceMessages",
-            json!({ "space": hex16(space), "channel": hex16(channel), "events": events }),
+            json!({ "space": hex16(space), "channel": hex16(channel), "events": events, "more": more }),
         );
         Ok(())
     }
@@ -1889,7 +1898,8 @@ impl Helper {
             "spaceOpen" => {
                 let space = parse16(arg(0)?, "Space")?;
                 let channel = parse16(arg(1)?, "channel")?;
-                self.emit_channel(&space, &channel)?;
+                let before = (args.get(2)).map(|b| parse16(b, "message")).transpose()?;
+                self.emit_channel_page(&space, &channel, before)?;
             }
             _ => return Err(Fail("unknown-fn", format!("unknown command {func}"))),
         }

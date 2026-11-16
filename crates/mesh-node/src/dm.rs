@@ -32,7 +32,7 @@ const NOTIFY_CHARS: usize = 100;
 /// After a `failed` answer, the first try again; later ones go on refresh.
 const RETRY_SOON: Duration = Duration::from_secs(5);
 /// Messages in one page of `dmOpen`.
-const PAGE: usize = 50;
+pub(super) const PAGE: usize = 50;
 
 /// The transport service typing goes on (D10): one frame per signal, empty
 /// for a 1:1 chat or a group's ID, never stored or queued.
@@ -62,6 +62,39 @@ fn person_text(p: &[u8; 32]) -> String {
     MeshId::from_bytes(p)
         .map(|p| p.to_string())
         .unwrap_or_default()
+}
+
+/// One line of a page, as `meshDmMessages` and `meshSpaceMessages` give it.
+pub(super) fn shown_json(m: &mesh_dm::history::Shown, sent: bool) -> Value {
+    let reactions: Vec<Value> = (m.reactions.iter())
+        .map(|(emoji, who)| {
+            let who: Vec<String> = who.iter().map(person_text).collect();
+            json!({ "emoji": emoji, "who": who })
+        })
+        .collect();
+    let attachments: Vec<Value> = (m.attachments.iter())
+        .map(|a| {
+            json!({
+                "name": a.name,
+                "mime": a.mime,
+                "size": a.size,
+                // ponytail: hex doubles a 16 KB preview; base64 if pages grow heavy.
+                "preview": a.preview.as_ref().map(|p| e2ee::hex(p)),
+            })
+        })
+        .collect();
+    json!({
+        "id": e2ee::hex(&m.id),
+        "from": person_text(&m.author),
+        "text": m.text,
+        "edited": m.edited,
+        "replyTo": m.reply_to.map(|r| e2ee::hex(&r)),
+        "attachments": attachments,
+        "reactions": reactions,
+        "late": m.late,
+        "time": m.time,
+        "sent": sent,
+    })
 }
 
 /// Writes the frames, finishes, and reads the reader's answers: one byte
@@ -410,40 +443,8 @@ impl Helper {
         let (page, more) = history
             .page(at, before, PAGE, unix_now() * 1000)
             .map_err(dm_fail)?;
-        let events: Vec<Value> = page
-            .iter()
-            .map(|m| {
-                let reactions: Vec<Value> = (m.reactions.iter())
-                    .map(|(emoji, who)| {
-                        let who: Vec<String> = who.iter().map(person_text).collect();
-                        json!({ "emoji": emoji, "who": who })
-                    })
-                    .collect();
-                let sent = m.author == me && history.is_sent(&m.id);
-                let attachments: Vec<Value> = (m.attachments.iter())
-                    .map(|a| {
-                        json!({
-                            "name": a.name,
-                            "mime": a.mime,
-                            "size": a.size,
-                            // ponytail: hex doubles a 16 KB preview; base64 if pages grow heavy.
-                            "preview": a.preview.as_ref().map(|p| e2ee::hex(p)),
-                        })
-                    })
-                    .collect();
-                json!({
-                    "id": e2ee::hex(&m.id),
-                    "from": person_text(&m.author),
-                    "text": m.text,
-                    "edited": m.edited,
-                    "replyTo": m.reply_to.map(|r| e2ee::hex(&r)),
-                    "attachments": attachments,
-                    "reactions": reactions,
-                    "late": m.late,
-                    "time": m.time,
-                    "sent": sent,
-                })
-            })
+        let events: Vec<Value> = (page.iter())
+            .map(|m| shown_json(m, m.author == me && history.is_sent(&m.id)))
             .collect();
         emit(
             "meshDmMessages",

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat::{Chat, Taken};
 use crate::event::{Body, Event, EventId, VERSION};
-use crate::history::{HistoryError, Unread};
+use crate::history::{HistoryError, Shown, Unread};
 use crate::space::{Chain, ChannelId, Role, SpaceBody, SpaceEvent, SpaceId, SpaceVersion};
 use crate::store::{ChatFiles, Conversation, Store, StoreError};
 use crate::sync::{Counters, Entry, Log};
@@ -354,10 +354,55 @@ impl SpaceHistory {
             .collect()
     }
 
-    /// A channel as it shows: its newest segment, read the first time.
+    /// A channel as it shows: all of it, read the first time.
     pub fn channel(&mut self, channel: &ChannelId, now: u64) -> Result<&Chat, HistoryError> {
         self.load(channel, now)?;
         Ok(&self.channels[channel].1)
+    }
+
+    /// Up to `count` lines of a channel before `before` (or the newest),
+    /// oldest first; and whether there are older ones (dm's `page`, Task
+    /// 11b).
+    pub fn page(
+        &mut self,
+        channel: &ChannelId,
+        before: Option<EventId>,
+        count: usize,
+        now: u64,
+    ) -> Result<(Vec<Shown>, bool), HistoryError> {
+        self.load(channel, now)?;
+        let view = &self.channels[channel].1;
+        let messages = view.messages();
+        let end = match before {
+            Some(id) => messages.iter().position(|m| m.id == id).unwrap_or(0),
+            None => messages.len(),
+        };
+        let start = end.saturating_sub(count);
+        let page = messages[start..end]
+            .iter()
+            .map(|m| Shown {
+                id: m.id,
+                author: m.author,
+                text: m.text.to_owned(),
+                edited: m.edited,
+                reply_to: m.reply_to,
+                attachments: m.attachments.to_vec(),
+                reactions: (m.reactions.iter())
+                    .map(|(e, who)| (e.to_string(), who.clone()))
+                    .collect(),
+                late: m.late,
+                time: view.display_time(&m.id).unwrap_or(0),
+            })
+            .collect();
+        Ok((page, start > 0))
+    }
+
+    /// Whether another member's device has taken our event (dm D5's mark).
+    pub fn is_sent(&self, id: &EventId) -> bool {
+        let version = self.version();
+        let shares = |e: &Entry, n: u64, p: &Person| shares(version.as_ref(), e, n, p);
+        (self.log.number_of(id))
+            .is_some_and(|n| self.counters.taken_by_others(n, &self.log, shares))
     }
 
     /// Every stored event of a channel, or with `None` the changes, oldest
@@ -539,8 +584,11 @@ impl SpaceHistory {
         for id in self.deleted.get(&key).into_iter().flatten() {
             view.was_deleted(*id);
         }
-        if let Some(newest) = files.segments().checked_sub(1) {
-            for record in files.read(newest)? {
+        // Every segment: history comes newest first (S10), so a segment's
+        // place says nothing about its lines' order.
+        // ponytail: a channel is read whole at first use; index lines by time if channels pass ~10,000.
+        for n in 0..files.segments() {
+            for record in files.read(n)? {
                 let stored: Stored = read("a Space event", &record)?;
                 let event = SpaceEvent::from_bytes(&stored.event)?;
                 let from = Sender {
@@ -949,6 +997,66 @@ mod tests {
         // A Space never stored here has an empty chain.
         let none = SpaceHistory::read_chain(&root, &KEY, &[3; 16]).unwrap();
         assert_eq!(none.version(&[3; 16]), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A channel pages as a dm chat does (Task 11b): up to `count` before
+    /// `before`, oldest first, with each line's time, every line once
+    /// across segments; and whether there's more.
+    #[test]
+    fn a_channel_pages_back_across_segments() {
+        let root = dir("page");
+        let m = made();
+        let me = sender(&m.o);
+        let mut h = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        let mut batch: Vec<(SpaceEvent, Sender)> =
+            m.events.iter().map(|e| (e.clone(), me)).collect();
+        for i in 0..600u64 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&i.to_be_bytes());
+            id[8] = 9;
+            let post = SpaceBody::Post {
+                channel: m.general,
+                text: format!("old {i}"),
+                reply_to: None,
+                attachments: vec![],
+                mentions: vec![],
+                everyone: false,
+            };
+            let seq = NOW - 10_000 + i;
+            let e = SpaceEvent::signed(
+                m.space,
+                id,
+                (seq, seq, 100 + i),
+                post,
+                &m.o.device,
+                &m.o.cert,
+            );
+            batch.push((e, me));
+        }
+        h.store_batch(batch, NOW, NOW).unwrap();
+        drop(h);
+        let mut back = SpaceHistory::open(&root, &KEY, me, m.space).unwrap();
+        let (newest, more) = back.page(&m.general, None, 50, NOW).unwrap();
+        assert_eq!(newest.len(), 50);
+        assert!(more);
+        // The newest by order, though it's in the oldest segment.
+        assert_eq!(newest.last().unwrap().text, "two");
+        assert!(newest.iter().all(|s| s.time > 0));
+        // Back past the newest segment's start: the older one is read.
+        let mut before = newest[0].id;
+        let mut seen: HashSet<EventId> = newest.iter().map(|s| s.id).collect();
+        loop {
+            let (page, more) = back.page(&m.general, Some(before), 50, NOW).unwrap();
+            for line in &page {
+                assert!(seen.insert(line.id), "a line twice");
+            }
+            if !more {
+                break;
+            }
+            before = page[0].id;
+        }
+        assert_eq!(seen.len(), 602, "every line, once");
         let _ = std::fs::remove_dir_all(&root);
     }
 
