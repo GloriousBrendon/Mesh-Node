@@ -81,11 +81,22 @@ pub(super) const HELLO_DIALS: usize = 32;
 /// Hello pauses while more connections than this are open (S14): three
 /// quarters of transport's 256.
 pub(super) const HELLO_ROOM: usize = 192;
-/// A hello that found nobody (their record may not be at the seed yet, as
-/// when both sides were just added) is tried again after this, at most
-/// `HELLO_TRIES` times in all. It doesn't start `PEER_RETRY`.
+/// A hello whose lookup the seed refused for its limit is dialled again
+/// after this (no miss: it costs no back-off step).
 pub(super) const HELLO_AGAIN: Duration = Duration::from_secs(10);
-pub(super) const HELLO_TRIES: u32 = 3;
+
+/// The first wait after a failed Space send or a hello that found nobody
+/// (their record may not be at the seed yet, as when both sides were just
+/// added); each miss doubles it (S14, 2026-11-16). Neither starts
+/// `PEER_RETRY`.
+pub(super) const BACK_OFF_FIRST: Duration = Duration::from_secs(10);
+
+/// The wait after `misses` misses in a row, or `None` once it would reach
+/// the refresh, which then takes over.
+pub(super) fn back_off(misses: u32) -> Option<Duration> {
+    let wait = BACK_OFF_FIRST.checked_mul(1u32.checked_shl(misses.checked_sub(1)?)?)?;
+    (wait < Duration::from_secs(crate::routing::REFRESH_EVERY)).then_some(wait)
+}
 
 /// How a dial came back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,13 +238,13 @@ impl PeerWire {
         self.dialling = self.dialling.saturating_sub(1);
     }
 
-    /// A hello found nobody: queued again after `HELLO_AGAIN`, up to
-    /// `HELLO_TRIES` tries in all.
+    /// A hello found nobody: queued again after its `back_off`, until the
+    /// refresh takes over.
     pub(super) fn hello_missed(&mut self, who: &MeshId, now: Instant) {
-        let tries = self.hello_tries.entry(who.to_bytes()).or_insert(0);
-        *tries += 1;
-        if *tries < HELLO_TRIES {
-            self.hello_later.push((now + HELLO_AGAIN, *who));
+        let misses = self.hello_tries.entry(who.to_bytes()).or_insert(0);
+        *misses += 1;
+        if let Some(wait) = back_off(*misses) {
+            self.hello_later.push((now + wait, *who));
         }
     }
 
@@ -251,10 +262,6 @@ impl PeerWire {
     }
 }
 
-/// A failed Space send is tried again this soon, by the peer tick.
-pub(super) const SOON_AGAIN: Duration = Duration::from_secs(10);
-/// Tries before the refresh takes over.
-pub(super) const SOON_TRIES: u32 = 6;
 /// Devices tried a round at most (their key lookups wait in the get
 /// budget anyway: this keeps one round from filling it).
 pub(super) const SOON_PER_ROUND: usize = 16;
@@ -268,16 +275,16 @@ pub(super) struct Soon {
 }
 
 impl Soon {
-    /// A send to `device` didn't go: again after `SOON_AGAIN`, up to
-    /// `SOON_TRIES` in all. `true` when its tries ran out.
+    /// A send to `device` didn't go: again after its `back_off`. `true`
+    /// when the refresh takes over.
     pub(super) fn missed(&mut self, device: [u8; 32], now: Instant) -> bool {
-        let (at, tries) = self.due.entry(device).or_insert((now, 0));
-        *tries += 1;
-        if *tries > SOON_TRIES {
+        let (at, misses) = self.due.entry(device).or_insert((now, 0));
+        *misses += 1;
+        let Some(wait) = back_off(*misses) else {
             self.due.remove(&device);
             return true;
-        }
-        *at = now + SOON_AGAIN;
+        };
+        *at = now + wait;
         false
     }
 
@@ -307,7 +314,8 @@ impl Soon {
         due.truncate(SOON_PER_ROUND);
         for (d, _) in &due {
             if let Some((at, _)) = self.due.get_mut(d) {
-                *at = now + SOON_AGAIN * (SOON_TRIES + 1);
+                // Parked until its answer says `missed` or `done`.
+                *at = now + Duration::from_secs(crate::routing::REFRESH_EVERY);
             }
         }
         due.into_iter().map(|(d, _)| d).collect()
@@ -2122,7 +2130,7 @@ mod tests {
         wire.dialled(&a, Dialled::Slowed, false, t0);
         assert_eq!(wire.dial_kind(&a, t0), PeerDial::LookUp, "no PEER_RETRY");
         let mut at = t0;
-        for _ in 0..HELLO_TRIES + 2 {
+        for _ in 0..5 {
             at += HELLO_AGAIN;
             wire.hellos_due(at);
             let next = wire.next_hellos(at, 0);
@@ -2133,40 +2141,60 @@ mod tests {
         assert_eq!(wire.dial_kind(&b, t0), PeerDial::LastOnly);
     }
 
-    /// A failed batch or a send with no keys yet is tried again soon, a
-    /// few times, at most `SOON_PER_ROUND` devices a round; then the
-    /// refresh takes over (your review, 2026-11-15: both happen at every
-    /// join, and the refresh is 30 minutes).
+    /// A failed Space send and a hello that found nobody back off the
+    /// same way: 10 s, then doubling each miss, until the next wait would
+    /// reach the refresh, which takes over (S14, 2026-11-16: a flat few
+    /// tries ended after a minute, and a member who joined later was left
+    /// for the refresh).
     #[test]
-    fn a_failed_send_is_tried_again_soon_a_few_times() {
+    fn failed_sends_and_hellos_back_off_up_to_the_refresh() {
+        let waits: Vec<u64> = (1..).map_while(back_off).map(|w| w.as_secs()).collect();
+        assert_eq!(waits, [10, 20, 40, 80, 160, 320, 640, 1280]);
+        assert!(back_off(0).is_none());
+
         let t0 = Instant::now();
         let mut soon = Soon::default();
-        soon.missed([1; 32], t0);
-        assert!(soon.take_due(t0).is_empty());
-        assert_eq!(soon.take_due(t0 + SOON_AGAIN), [[1; 32]]);
-        assert!(
-            soon.take_due(t0 + SOON_AGAIN).is_empty(),
-            "taken: waits for its answer"
-        );
         let mut at = t0;
-        for _ in 1..SOON_TRIES {
-            soon.missed([1; 32], at);
-            at += SOON_AGAIN;
-            assert_eq!(soon.take_due(at), [[1; 32]]);
+        for wait in &waits {
+            assert!(!soon.missed([1; 32], at));
+            let wait = Duration::from_secs(*wait);
+            assert!(soon.take_due(at + wait - Duration::from_secs(1)).is_empty());
+            assert_eq!(soon.take_due(at + wait), [[1; 32]]);
+            assert!(
+                soon.take_due(at + wait * 2).is_empty(),
+                "taken: waits for its answer"
+            );
+            at += wait;
         }
-        soon.missed([1; 32], at);
-        assert!(
-            soon.take_due(at + SOON_AGAIN * 10).is_empty(),
-            "the refresh's now"
-        );
+        assert!(soon.missed([1; 32], at), "the refresh's now");
+        assert!(soon.take_due(at + Duration::from_secs(3600)).is_empty());
         soon.missed([2; 32], t0);
         soon.done(&[2; 32]);
-        assert!(soon.take_due(t0 + SOON_AGAIN).is_empty());
+        assert!(soon.take_due(t0 + Duration::from_secs(10)).is_empty());
         for d in 0..SOON_PER_ROUND as u8 + 5 {
             soon.missed([d + 10; 32], t0);
         }
-        assert_eq!(soon.take_due(t0 + SOON_AGAIN).len(), SOON_PER_ROUND);
-        assert_eq!(soon.take_due(t0 + SOON_AGAIN).len(), 5);
+        assert_eq!(
+            soon.take_due(t0 + Duration::from_secs(10)).len(),
+            SOON_PER_ROUND
+        );
+        assert_eq!(soon.take_due(t0 + Duration::from_secs(10)).len(), 5);
+
+        let mut wire = PeerWire::new(PEER_IDLE);
+        let [a] = ids(1).try_into().unwrap();
+        wire.queue_hello([a]);
+        let mut tried = Vec::new();
+        let mut at = t0;
+        while at < t0 + Duration::from_secs(3 * 3600) {
+            wire.hellos_due(at);
+            for id in wire.next_hellos(at, 0) {
+                tried.push(at.duration_since(t0).as_secs());
+                wire.dialled(&id, Dialled::Away, true, at);
+            }
+            at += Duration::from_secs(1);
+        }
+        assert_eq!(tried, [0, 10, 30, 70, 150, 310, 630, 1270, 2550]);
+        assert!(wire.may_look_up(&a, at), "a hello's miss starts no retry");
     }
 
     #[test]
@@ -2236,26 +2264,5 @@ mod tests {
         let (away, look_up) = away_devices(people, &connected, &[9; 32]);
         assert_eq!(away, [(known, [1; 32])]);
         assert_eq!(look_up, [unknown]);
-    }
-
-    #[test]
-    fn a_hello_that_finds_nobody_tries_again_a_few_times() {
-        let t0 = Instant::now();
-        let mut wire = PeerWire::new(PEER_IDLE);
-        let [a] = ids(1).try_into().unwrap();
-        wire.queue_hello([a]);
-        let mut tries = 0;
-        let mut at = t0;
-        for _ in 0..10 {
-            wire.hellos_due(at);
-            for id in wire.next_hellos(at, 0) {
-                tries += 1;
-                wire.hello_done();
-                wire.hello_missed(&id, at);
-            }
-            at += HELLO_AGAIN;
-        }
-        assert_eq!(tries, HELLO_TRIES, "then it waits for a send or mail");
-        assert!(wire.may_look_up(&a, at), "a hello's miss starts no retry");
     }
 }
