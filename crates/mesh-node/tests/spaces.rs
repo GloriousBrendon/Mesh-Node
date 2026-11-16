@@ -1203,6 +1203,28 @@ fn cpu_and_written(pid: u32) -> (u64, u64) {
     (tick(11) + tick(12), written)
 }
 
+/// Runs `step` of test 9; if it fails, first prints each helper's counts
+/// and the seed's last counts line (numbers only): why it didn't finish.
+fn or_counts<T>(
+    hs: &mut Vec<(Helper, String)>,
+    seed: &mut Seed,
+    step: impl FnOnce(&mut Vec<(Helper, String)>) -> T,
+) -> T {
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut *hs)));
+    done.unwrap_or_else(|failed| {
+        for (i, (h, _)) in hs.iter_mut().enumerate() {
+            let c = ask(h, "spaceCounts", &[], "meshSpaceCounts");
+            eprintln!("fifty counts m{i}: {c}");
+        }
+        let counts = seed
+            .drain()
+            .into_iter()
+            .rfind(|l| l.contains("address gets"));
+        eprintln!("fifty seed: {counts:?}");
+        std::panic::resume_unwind(failed)
+    })
+}
+
 /// Test 9 (an `--ignored` measurement, recorded in PLAN-spaces): a Space of
 /// 50, one device each. A line to all 49; for one line, the sender's CPU,
 /// bytes, connections and the seed's puts; unlock with 5 such Spaces; ten
@@ -1266,10 +1288,16 @@ fn measure_fifty_members() {
                 .iter()
                 .all(|s| s["members"].as_array().unwrap().len() == N)
     };
-    for (h, _) in hs.iter_mut().skip(1) {
-        h.send("spaceList", &[]);
-        until_for(h, "meshSpaces", Duration::from_secs(600), full);
-    }
+    // Past one refresh (30 minutes after each helper started): what a
+    // failed send's short retries miss, the refresh sends.
+    let set_up_by = started + Duration::from_secs(40 * 60);
+    or_counts(&mut hs, &mut seed, |hs| {
+        for (h, _) in hs.iter_mut().skip(1) {
+            h.send("spaceList", &[]);
+            let left = set_up_by.saturating_duration_since(Instant::now());
+            until_for(h, "meshSpaces", left.max(Duration::from_secs(1)), full);
+        }
+    });
     eprintln!(
         "fifty: set up in {:?}, seed refused {} address gets",
         started.elapsed(),
@@ -1294,7 +1322,7 @@ fn measure_fifty_members() {
         t.elapsed()
     };
     // B (m1) has met none of the other 48: the first line dials them.
-    let first = line_to_all(&mut hs, 1, "first");
+    let first = or_counts(&mut hs, &mut seed, |hs| line_to_all(hs, 1, "first"));
     std::thread::sleep(Duration::from_secs(2));
     seed.drain();
     let pid = hs[1].0.pid();
