@@ -859,6 +859,60 @@ fn a_channel_page_is_a_dm_page() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// Edits and reactions in a channel, as in a DM (S12, Task 11b): B edits
+/// its line, C reacts to it, and both see both. C can't edit B's line.
+#[test]
+fn a_line_is_edited_and_reacted_to() {
+    let mut k = club("spaces-edit");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let sent = ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "helo"],
+        "meshSpaceMessages",
+    );
+    let id = sent["events"][0]["id"].as_str().unwrap().to_owned();
+    texts_until(&mut k.c, &s, &g, &["helo"]);
+    let err = ask(
+        &mut k.c,
+        "spaceEdit",
+        &[&s, &g, &id, "mine now"],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    ask(
+        &mut k.b,
+        "spaceEdit",
+        &[&s, &g, &id, "hello"],
+        "meshSpaceMessages",
+    );
+    ask(
+        &mut k.c,
+        "spaceReact",
+        &[&s, &g, &id, "👍", "true"],
+        "meshSpaceMessages",
+    );
+    let id_c = k.id_c.clone();
+    let shows = |e: &Value| {
+        e["text"] == "hello"
+            && e["edited"] == true
+            && e["reactions"] == serde_json::json!([{ "emoji": "👍", "who": [id_c.as_str()] }])
+    };
+    for h in [&mut k.b, &mut k.c] {
+        let started = Instant::now();
+        loop {
+            h.send("spaceOpen", &[&s, &g]);
+            let page = until(h, "meshSpaceMessages", |m| m["channel"] == g);
+            if page["events"].as_array().unwrap().iter().any(&shows) {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30), "{page}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

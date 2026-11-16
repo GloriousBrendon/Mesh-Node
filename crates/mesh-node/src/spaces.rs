@@ -754,6 +754,35 @@ impl Helper {
         Ok(())
     }
 
+    /// Who wrote a line in a channel; not found if it isn't there.
+    fn line_author(
+        &mut self,
+        space: &SpaceId,
+        channel: &ChannelId,
+        target: &[u8; 16],
+    ) -> Result<mesh_dm::Person, Fail> {
+        let chat = (self.space_mut(space)?.channel(channel, now_ms())).map_err(space_fail)?;
+        (chat.messages().iter())
+            .find(|m| m.id == *target)
+            .map(|m| m.author)
+            .ok_or_else(not_found)
+    }
+
+    /// Signs and stores a line event of ours, shows the channel and sends it
+    /// to every member.
+    fn space_send_line(
+        &mut self,
+        space: &SpaceId,
+        channel: &ChannelId,
+        body: SpaceBody,
+    ) -> Result<(), Fail> {
+        let (key, cert) = self.signing()?;
+        (self.space_mut(space)?.send(body, &key, &cert, now_ms())).map_err(space_fail)?;
+        self.emit_channel(space, channel)?;
+        self.space_send_all(space);
+        Ok(())
+    }
+
     /// Signs and stores a change of ours, if our role allows it, and sends
     /// it to every member.
     fn space_change(&mut self, space: &SpaceId, change: Change) -> Result<(), Fail> {
@@ -1758,6 +1787,35 @@ impl Helper {
                     None => Change::Rename(name),
                 };
                 self.space_command_change(&space, change)?;
+            }
+            "spaceEdit" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let target = parse16(arg(2)?, "message")?;
+                let me = self.me_sender()?.person;
+                // The author's own only, as in a DM.
+                if self.line_author(&space, &channel, &target)? != me && !self.unchecked() {
+                    return Err(not_allowed());
+                }
+                let body = SpaceBody::Edit {
+                    channel,
+                    target,
+                    text: arg(3)?.to_owned(),
+                };
+                self.space_send_line(&space, &channel, body)?;
+            }
+            "spaceReact" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let target = parse16(arg(2)?, "message")?;
+                self.line_author(&space, &channel, &target)?;
+                let body = SpaceBody::React {
+                    channel,
+                    target,
+                    emoji: arg(3)?.to_owned(),
+                    on: arg(4)? == "true",
+                };
+                self.space_send_line(&space, &channel, body)?;
             }
             "spaceDelete" => {
                 let space = parse16(arg(0)?, "Space")?;
