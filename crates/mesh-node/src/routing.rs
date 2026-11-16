@@ -286,13 +286,13 @@ pub async fn reach(
     anon: &Node,
     gets: &Gets,
     seeds: &[MeshAddr],
-    target: Target,
+    target: &Target,
     now: u64,
 ) -> Result<Reached, ReachError> {
-    if let Some(reached) = reach_known(&node, &target).await {
+    if let Some(reached) = reach_known(&node, target).await {
         return Ok(reached);
     }
-    let (records, newest) = find(anon, gets, seeds, &target, now).await?;
+    let (records, newest) = find(anon, gets, seeds, target, now).await?;
     let mut pings = tokio::task::JoinSet::new();
     for record in records {
         let device = *record.device.as_bytes();

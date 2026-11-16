@@ -60,18 +60,70 @@ pub const MAX_WAITING: usize = 256;
 /// How long a device has to take what we send it.
 pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The people with a lookup under way: one per person at a time (a cheap
+/// clone shares it with the lookup's task). Asked for again meanwhile, the
+/// lookup runs once more when it ends: its answer may be from before what
+/// was wanted (a record not put yet).
+#[derive(Clone, Default)]
+pub struct Fetching(std::sync::Arc<std::sync::Mutex<HashMap<[u8; 32], bool>>>);
+
+impl Fetching {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], bool>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Of `ids`, those with no lookup under way, now marked as under way;
+    /// the rest are asked again.
+    pub fn claim(&self, ids: Vec<MeshId>) -> Vec<MeshId> {
+        let mut busy = self.lock();
+        ids.into_iter()
+            .filter(|id| match busy.get_mut(&id.to_bytes()) {
+                Some(again) => {
+                    *again = true;
+                    false
+                }
+                None => {
+                    busy.insert(id.to_bytes(), false);
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// `id`'s lookup ended. True if it was asked again meanwhile: it's then
+    /// still under way, to run once more.
+    pub fn done(&self, id: &MeshId) -> bool {
+        let mut busy = self.lock();
+        match busy.get_mut(&id.to_bytes()) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                busy.remove(&id.to_bytes());
+                false
+            }
+        }
+    }
+
+    /// `id`'s lookup didn't start after all.
+    pub fn forget(&self, id: &MeshId) {
+        self.lock().remove(&id.to_bytes());
+    }
+}
+
 /// Each contact's records on the seeds, for their e2ee fields.
 // ponytail: one seed stream per contact; batch them when contact lists grow.
 pub async fn fetch(
     anon: &Node,
     gets: &routing::Gets,
     seeds: &[MeshAddr],
-    targets: Vec<Target>,
+    targets: &[Target],
     now: u64,
 ) -> Vec<(MeshId, Vec<AddrRecord>)> {
     let mut found = Vec::new();
     for target in targets {
-        if let Ok((records, _)) = routing::find(anon, gets, seeds, &target, now).await {
+        if let Ok((records, _)) = routing::find(anon, gets, seeds, target, now).await {
             found.push((target.id, records));
         }
     }
@@ -176,5 +228,29 @@ mod tests {
         assert_eq!(queue.len(), MAX_WAITING);
         assert_eq!(queue.last().unwrap(), b"newest", "the oldest goes");
         assert_eq!(queue[0], 1u32.to_be_bytes());
+    }
+
+    /// One key lookup per person at a time: an ask for someone whose
+    /// lookup is under way starts nothing, so failed sends and refreshes
+    /// can't pile lookups up at the seed (49 peers at once, measured).
+    #[test]
+    fn a_person_is_looked_up_once_at_a_time() {
+        let in_flight = Fetching::default();
+        let (a, b) = (
+            mesh_identity::RootKey::generate().unwrap().id(),
+            mesh_identity::RootKey::generate().unwrap().id(),
+        );
+        assert_eq!(in_flight.claim(vec![a, b]), [a, b]);
+        assert!(!in_flight.done(&a), "nobody asked again");
+        assert_eq!(in_flight.claim(vec![a, b]), [a], "b's still under way");
+        // Asked for b while its lookup was out: that answer may be from
+        // before what was wanted, so it's looked up once more.
+        assert!(in_flight.done(&b), "b again");
+        assert_eq!(in_flight.claim(vec![b]), [], "b's second lookup is out");
+        assert!(in_flight.done(&b), "asked during it too: a third");
+        assert!(!in_flight.done(&b));
+        assert_eq!(in_flight.claim(vec![b]), [b]);
+        in_flight.forget(&b);
+        assert_eq!(in_flight.claim(vec![b]), [b], "forgotten: free again");
     }
 }

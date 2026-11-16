@@ -367,6 +367,8 @@ struct Helper {
     space_flight: HashSet<[u8; 32]>,
     /// Devices that didn't take everything: tried again at the refresh.
     space_retry: HashMap<[u8; 32], (MeshId, MeshAddr)>,
+    /// Of those, the ones tried again soon, before the refresh.
+    space_soon: spaces::Soon,
     /// The channel Mesh-Voice has open.
     space_view: Option<(mesh_dm::space::SpaceId, mesh_dm::space::ChannelId)>,
     /// Space mail (S9) in flight, by reader device and `mseq`: the events
@@ -377,6 +379,11 @@ struct Helper {
     space_marked: HashSet<([u8; 32], mesh_dm::space::SpaceId, u64)>,
     /// History pulls this unlock (S10).
     space_pulls: HashMap<mesh_dm::space::SpaceId, spaces::Pull>,
+    /// Key lookups under way, one per person.
+    keys_fetching: e2ee::Fetching,
+    /// Dials under way to send or for presence, one per person (and our
+    /// own devices' sync), so refreshes can't pile lookups up.
+    dialling: e2ee::Fetching,
     /// Our changes already redone after a fork dropped them (S7), this unlock.
     space_redone: HashMap<mesh_dm::space::SpaceId, std::collections::BTreeSet<[u8; 16]>>,
     /// What `spaceForge` set (debug builds only).
@@ -544,10 +551,13 @@ impl Helper {
             space_open: HashMap::new(),
             space_flight: HashSet::new(),
             space_retry: HashMap::new(),
+            space_soon: spaces::Soon::default(),
             space_view: None,
             space_sent: HashMap::new(),
             space_marked: HashSet::new(),
             space_pulls: HashMap::new(),
+            keys_fetching: e2ee::Fetching::default(),
+            dialling: e2ee::Fetching::default(),
             space_redone: HashMap::new(),
             #[cfg(debug_assertions)]
             forge: spaces::Forge::default(),
@@ -834,7 +844,7 @@ impl Helper {
                 }
                 let (seeds, back) = (self.seeds.clone(), self.back.clone());
                 tokio::spawn(async move {
-                    match routing::reach(node, &anon, &gets, &seeds, target, unix_now()).await {
+                    match routing::reach(node, &anon, &gets, &seeds, &target, unix_now()).await {
                         Ok(Reached { pong, last, list }) => {
                             emit_pong(&pong);
                             let _ = back.send(Back::Reached(Box::new((id, last, list))));
@@ -985,12 +995,25 @@ impl Helper {
         let Some(target) = Target::of(store, id) else {
             return;
         };
+        if self.dialling.claim(vec![*id]).is_empty() {
+            return;
+        }
         let (node, anon, gets) = (net.node.clone(), net.anon.clone(), net.gets.clone());
         let (seeds, back, id) = (self.seeds.clone(), self.back.clone(), *id);
+        let dialling = self.dialling.clone();
         tokio::spawn(async move {
-            if let Ok(Reached { last, list, .. }) =
-                routing::reach(node, &anon, &gets, &seeds, target, unix_now()).await
-            {
+            let reached = loop {
+                let reached =
+                    routing::reach(node.clone(), &anon, &gets, &seeds, &target, unix_now()).await;
+                let again = dialling.done(&id);
+                if reached.is_ok() && again {
+                    dialling.done(&id);
+                }
+                if reached.is_ok() || !again {
+                    break reached;
+                }
+            };
+            if let Ok(Reached { last, list, .. }) = reached {
                 let _ = back.send(Back::Reached(Box::new((id, last, list))));
             }
         });
@@ -1296,16 +1319,50 @@ impl Helper {
                 )
                 .collect(),
         };
-        let mut targets: Vec<Target> = ids.iter().filter_map(|id| Target::of(store, id)).collect();
+        let mut ids = ids;
         if only.is_none() {
-            targets.extend(Target::own(store));
+            ids.push(store.id());
         }
-        let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
-        let gets = net.gets.clone();
-        tokio::spawn(async move {
-            let found = e2ee::fetch(&anon, &gets, &seeds, targets, unix_now()).await;
-            let _ = back.send(Back::Records(found));
-        });
+        // Not those whose lookup is under way: its answer covers them.
+        let ids = self.keys_fetching.claim(ids);
+        let me = store.id();
+        // One task per person, each waiting its turn in the get budget: a
+        // slow one holds up nobody else, and each is released when its own
+        // answer comes.
+        for id in ids {
+            let target = match id == me {
+                true => Target::own(store),
+                false => Target::of(store, &id),
+            };
+            let Some(target) = target else {
+                self.keys_fetching.forget(&id);
+                continue;
+            };
+            let (anon, seeds, back) = (net.anon.clone(), self.seeds.clone(), self.back.clone());
+            let (gets, fetching) = (net.gets.clone(), self.keys_fetching.clone());
+            tokio::spawn(async move {
+                // Again if asked meanwhile and nothing came: their record may
+                // not have been put when this one read.
+                loop {
+                    let found = e2ee::fetch(
+                        &anon,
+                        &gets,
+                        &seeds,
+                        std::slice::from_ref(&target),
+                        unix_now(),
+                    )
+                    .await;
+                    let again = fetching.done(&id);
+                    if !found.is_empty() && again {
+                        fetching.done(&id);
+                    }
+                    if !found.is_empty() || !again {
+                        let _ = back.send(Back::Records(found));
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     /// Our own records may carry a newer list of our devices (one restored

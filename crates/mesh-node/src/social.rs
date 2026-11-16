@@ -375,12 +375,23 @@ impl Helper {
         let Some(own) = Target::own(store) else {
             return;
         };
+        // One sync at a time: a slow one isn't stacked on at each refresh.
+        if self.dialling.claim(vec![store.id()]).is_empty() {
+            return;
+        }
         let this = *store.device_key().public().as_bytes();
         let account = store.account().to_bytes();
         let (node, anon, seeds) = (net.node.clone(), net.anon.clone(), self.seeds.clone());
-        let gets = net.gets.clone();
+        let (gets, dialling, me) = (net.gets.clone(), self.dialling.clone(), store.id());
         tokio::spawn(async move {
-            for addr in routing::own_devices(&anon, &gets, &seeds, &own, &this, unix_now()).await {
+            let found = loop {
+                let found =
+                    routing::own_devices(&anon, &gets, &seeds, &own, &this, unix_now()).await;
+                if !dialling.done(&me) {
+                    break found;
+                }
+            };
+            for addr in found {
                 push_account(node.clone(), addr, account.clone());
             }
         });

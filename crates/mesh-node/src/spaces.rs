@@ -246,6 +246,63 @@ impl PeerWire {
     }
 }
 
+/// A failed Space send is tried again this soon, by the peer tick.
+pub(super) const SOON_AGAIN: Duration = Duration::from_secs(10);
+/// Tries before the refresh takes over.
+pub(super) const SOON_TRIES: u32 = 6;
+/// Devices tried a round at most (their key lookups wait in the get
+/// budget anyway: this keeps one round from filling it).
+pub(super) const SOON_PER_ROUND: usize = 16;
+
+/// Space sends to try again soon (your review, 2026-11-15): a batch not
+/// taken, or one with no keys for the device yet. Both happen at every join,
+/// and the refresh is 30 minutes away.
+#[derive(Default)]
+pub(super) struct Soon {
+    due: HashMap<[u8; 32], (Instant, u32)>,
+}
+
+impl Soon {
+    /// A send to `device` didn't go: again after `SOON_AGAIN`, up to
+    /// `SOON_TRIES` in all.
+    pub(super) fn missed(&mut self, device: [u8; 32], now: Instant) {
+        let (at, tries) = self.due.entry(device).or_insert((now, 0));
+        *tries += 1;
+        if *tries > SOON_TRIES {
+            self.due.remove(&device);
+        } else {
+            *at = now + SOON_AGAIN;
+        }
+    }
+
+    /// How many tries `device` has had, if it's waiting.
+    pub(super) fn tries(&self, device: &[u8; 32]) -> Option<u32> {
+        self.due.get(device).map(|(_, tries)| *tries)
+    }
+
+    /// It went.
+    pub(super) fn done(&mut self, device: &[u8; 32]) {
+        self.due.remove(device);
+    }
+
+    /// The devices due by `now`, `SOON_PER_ROUND` at most; each then waits
+    /// for its answer (`missed` or `done`).
+    pub(super) fn take_due(&mut self, now: Instant) -> Vec<[u8; 32]> {
+        let mut due: Vec<([u8; 32], Instant)> = (self.due.iter())
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(d, (at, _))| (*d, *at))
+            .collect();
+        due.sort_by_key(|(_, at)| *at);
+        due.truncate(SOON_PER_ROUND);
+        for (d, _) in &due {
+            if let Some((at, _)) = self.due.get_mut(d) {
+                *at = now + SOON_AGAIN * (SOON_TRIES + 1);
+            }
+        }
+        due.into_iter().map(|(d, _)| d).collect()
+    }
+}
+
 /// Away devices in S9's order at the limit: the one mailed longest ago (or
 /// never) first, so none starves when the seed says `slow-down`.
 fn longest_ago_first(away: &mut [(MeshId, [u8; 32])], mailed: &HashMap<[u8; 32], Instant>) {
@@ -835,6 +892,7 @@ impl Helper {
                 // refresh tries again if their record wasn't there yet.
                 self.keys_for(id);
                 self.space_retry.insert(device, (*id, addr));
+                self.space_soon.missed(device, Instant::now());
                 return;
             }
         };
@@ -867,6 +925,7 @@ impl Helper {
         self.space_flight.remove(&device);
         let Some(answers) = answers else {
             self.space_retry.insert(device, (id, addr));
+            self.space_soon.missed(device, Instant::now());
             return;
         };
         let mut touched = HashSet::new();
@@ -885,9 +944,11 @@ impl Helper {
         }
         if answers.iter().all(|ok| *ok) {
             self.space_retry.remove(&device);
+            self.space_soon.done(&device);
             self.space_deliver_to(&id, addr);
         } else {
             self.space_retry.insert(device, (id, addr));
+            self.space_soon.missed(device, Instant::now());
         }
     }
 
@@ -1702,6 +1763,23 @@ impl Helper {
         for id in self.wire.next_hellos(now, open) {
             self.dial_back(&id, true);
         }
+        // Failed sends, again before the refresh: their keys looked up if
+        // still missing (the answer delivers), and the batch tried.
+        for device in self.space_soon.take_due(now) {
+            match self.space_retry.get(&device).cloned() {
+                Some((id, addr)) => {
+                    self.keys_for(&id);
+                    let tries = self.space_soon.tries(&device);
+                    self.space_deliver_to(&id, addr);
+                    // Nothing left to send (and no new miss): done.
+                    let sending = self.space_flight.contains(&device);
+                    if !sending && self.space_soon.tries(&device) == tries {
+                        self.space_soon.done(&device);
+                    }
+                }
+                None => self.space_soon.done(&device),
+            }
+        }
     }
 
     /// Dials a peer to send them something (S14), unless they were found
@@ -1741,6 +1819,11 @@ impl Helper {
             let _ = back.send(Back::Hello(*id, Dialled::Away, hello));
             return;
         };
+        // A send's dial while one to them is under way: that one's answer
+        // delivers (hellos are paced by HELLO_DIALS already).
+        if !hello && self.dialling.claim(vec![*id]).is_empty() {
+            return;
+        }
         let (node, anon) = (net.node.clone(), net.anon.clone());
         // The hello takes only spare gets: sends and key lookups go first.
         let gets = if hello {
@@ -1748,9 +1831,20 @@ impl Helper {
         } else {
             net.gets.clone()
         };
-        let (seeds, id) = (self.seeds.clone(), *id);
+        let (seeds, id, dialling) = (self.seeds.clone(), *id, self.dialling.clone());
         tokio::spawn(async move {
-            let reached = routing::reach(node, &anon, &gets, &seeds, target, unix_now()).await;
+            let reached = loop {
+                let reached =
+                    routing::reach(node.clone(), &anon, &gets, &seeds, &target, unix_now()).await;
+                // A send's dial asked again meanwhile, and missed: once more.
+                let again = !hello && dialling.done(&id);
+                if reached.is_ok() && again {
+                    dialling.done(&id);
+                }
+                if reached.is_ok() || !again {
+                    break reached;
+                }
+            };
             let how = match reached {
                 Ok(Reached { last, list, .. }) => {
                     let _ = back.send(Back::Reached(Box::new((id, last, list))));
@@ -1937,6 +2031,42 @@ mod tests {
         }
         wire.dialled(&b, Dialled::Away, false, t0);
         assert_eq!(wire.dial_kind(&b, t0), PeerDial::LastOnly);
+    }
+
+    /// A failed batch or a send with no keys yet is tried again soon, a
+    /// few times, at most `SOON_PER_ROUND` devices a round; then the
+    /// refresh takes over (your review, 2026-11-15: both happen at every
+    /// join, and the refresh is 30 minutes).
+    #[test]
+    fn a_failed_send_is_tried_again_soon_a_few_times() {
+        let t0 = Instant::now();
+        let mut soon = Soon::default();
+        soon.missed([1; 32], t0);
+        assert!(soon.take_due(t0).is_empty());
+        assert_eq!(soon.take_due(t0 + SOON_AGAIN), [[1; 32]]);
+        assert!(
+            soon.take_due(t0 + SOON_AGAIN).is_empty(),
+            "taken: waits for its answer"
+        );
+        let mut at = t0;
+        for _ in 1..SOON_TRIES {
+            soon.missed([1; 32], at);
+            at += SOON_AGAIN;
+            assert_eq!(soon.take_due(at), [[1; 32]]);
+        }
+        soon.missed([1; 32], at);
+        assert!(
+            soon.take_due(at + SOON_AGAIN * 10).is_empty(),
+            "the refresh's now"
+        );
+        soon.missed([2; 32], t0);
+        soon.done(&[2; 32]);
+        assert!(soon.take_due(t0 + SOON_AGAIN).is_empty());
+        for d in 0..SOON_PER_ROUND as u8 + 5 {
+            soon.missed([d + 10; 32], t0);
+        }
+        assert_eq!(soon.take_due(t0 + SOON_AGAIN).len(), SOON_PER_ROUND);
+        assert_eq!(soon.take_due(t0 + SOON_AGAIN).len(), 5);
     }
 
     #[test]
