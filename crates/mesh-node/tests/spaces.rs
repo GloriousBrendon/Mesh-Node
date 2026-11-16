@@ -1325,6 +1325,8 @@ fn measure_fifty_members() {
         );
         for (i, (h, _)) in hs.iter_mut().enumerate() {
             if i != from {
+                // Names the stuck member if the wait fails.
+                eprintln!("fifty: waiting for m{i} to be told {text:?}");
                 until_for(h, "meshSpaceNotify", Duration::from_secs(300), |n| {
                     n["text"] == text
                 });
