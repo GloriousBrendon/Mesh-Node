@@ -1213,17 +1213,28 @@ fn or_counts<T>(
 ) -> T {
     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut *hs)));
     done.unwrap_or_else(|failed| {
-        for (i, (h, _)) in hs.iter_mut().enumerate() {
-            let c = ask(h, "spaceCounts", &[], "meshSpaceCounts");
-            eprintln!("fifty counts m{i}: {c}");
-        }
-        let counts = seed
-            .drain()
-            .into_iter()
-            .rfind(|l| l.contains("address gets"));
-        eprintln!("fifty seed: {counts:?}");
+        print_counts(hs, seed, "when it failed");
         std::panic::resume_unwind(failed)
     })
+}
+
+/// Every helper's counts, the finds summed over all of them, and the
+/// seed's last counts line (numbers only).
+fn print_counts(hs: &mut [(Helper, String)], seed: &mut Seed, when: &str) {
+    let mut finds = std::collections::BTreeMap::<String, u64>::new();
+    for (i, (h, _)) in hs.iter_mut().enumerate() {
+        let c = ask(h, "spaceCounts", &[], "meshSpaceCounts");
+        for (k, n) in c["finds"].as_object().into_iter().flatten() {
+            *finds.entry(k.clone()).or_default() += n.as_u64().unwrap_or(0);
+        }
+        eprintln!("fifty counts m{i} {when}: {c}");
+    }
+    eprintln!("fifty finds, all helpers, {when}: {finds:?}");
+    let counts = seed
+        .drain()
+        .into_iter()
+        .rfind(|l| l.contains("address gets"));
+    eprintln!("fifty seed {when}: {counts:?}");
 }
 
 /// Test 9 (an `--ignored` measurement, recorded in PLAN-spaces): a Space of
@@ -1299,11 +1310,10 @@ fn measure_fifty_members() {
             until_for(h, "meshSpaces", left.max(Duration::from_secs(1)), full);
         }
     });
-    eprintln!(
-        "fifty: set up in {:?}, seed refused {} address gets",
-        started.elapsed(),
-        gets_slowed(&seed.drain())
-    );
+    let set_up = started.elapsed();
+    let slowed = gets_slowed(&seed.drain());
+    print_counts(&mut hs, &mut seed, "after the set-up");
+    eprintln!("fifty: set up in {set_up:?}, seed refused {slowed} address gets");
     let s = spaces[0].clone();
     let line_to_all = |hs: &mut Vec<(Helper, String)>, from: usize, text: &str| -> Duration {
         let t = Instant::now();
