@@ -748,6 +748,21 @@ fn a_line_after_the_add_is_told_even_from_history() {
     );
 }
 
+/// `spaceCounts` (debug builds, for test 9): each helper's Space send and
+/// receive counts, numbers only.
+#[test]
+fn space_counts_are_numbers_only() {
+    let mut k = club("spaces-counts");
+    let c = ask(&mut k.o, "spaceCounts", &[], "meshSpaceCounts");
+    for f in ["peersNoKeys", "outstanding", "givenUp"] {
+        assert!(c[f].is_u64(), "{c}");
+    }
+    for f in ["sendsFailed", "refused", "kept"] {
+        assert!(c[f].as_object().unwrap().values().all(Value::is_u64), "{c}");
+    }
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

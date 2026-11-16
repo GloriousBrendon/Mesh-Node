@@ -3,7 +3,7 @@
 //! unlock they're worked out from each Space's chain alone, without its
 //! log (S11), and handed to the keystore beside the contacts.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -264,15 +264,21 @@ pub(super) struct Soon {
 
 impl Soon {
     /// A send to `device` didn't go: again after `SOON_AGAIN`, up to
-    /// `SOON_TRIES` in all.
-    pub(super) fn missed(&mut self, device: [u8; 32], now: Instant) {
+    /// `SOON_TRIES` in all. `true` when its tries ran out.
+    pub(super) fn missed(&mut self, device: [u8; 32], now: Instant) -> bool {
         let (at, tries) = self.due.entry(device).or_insert((now, 0));
         *tries += 1;
         if *tries > SOON_TRIES {
             self.due.remove(&device);
-        } else {
-            *at = now + SOON_AGAIN;
+            return true;
         }
+        *at = now + SOON_AGAIN;
+        false
+    }
+
+    /// Devices waiting for a try.
+    pub(super) fn len(&self) -> usize {
+        self.due.len()
     }
 
     /// How many tries `device` has had, if it's waiting.
@@ -405,6 +411,32 @@ pub(super) async fn serve_history(
         }
     }
     let _ = stream.send.finish();
+}
+
+/// Space send and receive counts for test 9 (`spaceCounts`, debug builds):
+/// numbers only, by reason.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Counts {
+    /// Sends that didn't go: no keys for the device yet, no answer (no
+    /// connection, or it timed out), or a `failed` answer.
+    sends_failed: BTreeMap<&'static str, u64>,
+    /// Devices whose short retries ran out (the refresh takes over).
+    given_up: u64,
+    /// Events taken in and dropped: answered `ok`, so never sent again.
+    refused: BTreeMap<String, u64>,
+    /// Events answered `failed`: the sender keeps them.
+    kept: BTreeMap<&'static str, u64>,
+}
+
+impl Counts {
+    fn refuse(&mut self, why: &str) {
+        *self.refused.entry(why.to_owned()).or_default() += 1;
+    }
+
+    fn keep(&mut self, why: &'static str) {
+        *self.kept.entry(why).or_default() += 1;
+    }
 }
 
 /// A history pull in this unlock: which devices were asked, how many
@@ -897,7 +929,7 @@ impl Helper {
                 // refresh tries again if their record wasn't there yet.
                 self.keys_for(id);
                 self.space_retry.insert(device, (*id, addr));
-                self.space_soon.missed(device, Instant::now());
+                self.space_missed(device, "no keys");
                 return;
             }
         };
@@ -930,7 +962,7 @@ impl Helper {
         self.space_flight.remove(&device);
         let Some(answers) = answers else {
             self.space_retry.insert(device, (id, addr));
-            self.space_soon.missed(device, Instant::now());
+            self.space_missed(device, "no answer");
             return;
         };
         let mut touched = HashSet::new();
@@ -953,7 +985,15 @@ impl Helper {
             self.space_deliver_to(&id, addr);
         } else {
             self.space_retry.insert(device, (id, addr));
-            self.space_soon.missed(device, Instant::now());
+            self.space_missed(device, "failed answer");
+        }
+    }
+
+    /// A send to `device` didn't go, for `why`: it's tried again soon.
+    fn space_missed(&mut self, device: [u8; 32], why: &'static str) {
+        *self.space_counts.sends_failed.entry(why).or_default() += 1;
+        if self.space_soon.missed(device, Instant::now()) {
+            self.space_counts.given_up += 1;
         }
     }
 
@@ -1002,16 +1042,24 @@ impl Helper {
             };
             match read {
                 Ok(read) => unpacked.extend(read.into_iter().map(|r| (frame, own, r))),
-                Err(mesh_dm::history::Unread::Newer) => answers[frame] = dm::FAILED,
-                Err(_) => refused += 1,
+                Err(mesh_dm::history::Unread::Newer) => {
+                    self.space_counts.keep("newer format");
+                    answers[frame] = dm::FAILED
+                }
+                Err(_) => {
+                    self.space_counts.refuse("unreadable");
+                    refused += 1
+                }
             }
         }
         for (frame, own, (space, synced, event)) in unpacked {
             if event.space != space {
+                self.space_counts.refuse("wrong Space");
                 refused += 1;
                 continue;
             }
             let Some(author) = event.author() else {
+                self.space_counts.refuse("no author");
                 refused += 1;
                 continue;
             };
@@ -1020,6 +1068,7 @@ impl Helper {
             // A Space we don't hold yet comes only from a friend, who adds us
             // (S6), or from our own devices.
             if !held && !(own || (friend && is_change)) {
+                self.space_counts.refuse("Space not held");
                 refused += 1;
                 continue;
             }
@@ -1030,6 +1079,7 @@ impl Helper {
                     // the handshake proved; a change may be passed on.
                     let direct = author.person == id.to_bytes() && author.device == *device;
                     if !is_change && !direct {
+                        self.space_counts.refuse("not from its author");
                         refused += 1;
                         continue;
                     }
@@ -1038,11 +1088,13 @@ impl Helper {
             };
             if !is_change && !own {
                 let Ok(history) = self.space_mut(&space) else {
+                    self.space_counts.keep("no store");
                     answers[frame] = dm::FAILED;
                     continue;
                 };
                 let Some(v) = history.version() else {
                     // Its changes haven't come yet: the sender keeps it.
+                    self.space_counts.keep("no changes yet");
                     answers[frame] = dm::FAILED;
                     continue;
                 };
@@ -1054,11 +1106,17 @@ impl Helper {
                 };
                 let member = v.state.members.contains_key(&author.person);
                 if !member || posting.is_some_and(|c| !v.state.may_post(&author.person, c)) {
+                    self.space_counts.keep(if member {
+                        "may not post"
+                    } else {
+                        "not a member yet"
+                    });
                     answers[frame] = dm::FAILED;
                     continue;
                 }
             }
             let Ok(history) = self.space_mut(&space) else {
+                self.space_counts.keep("no store");
                 answers[frame] = dm::FAILED;
                 continue;
             };
@@ -1075,10 +1133,14 @@ impl Helper {
                         }
                     }
                 }
-                Ok(Taken::Refused(_)) => refused += 1,
+                Ok(Taken::Refused(why)) => {
+                    self.space_counts.refuse(&format!("{why:?}"));
+                    refused += 1
+                }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("mesh-node: couldn't store a Space event: {e}");
+                    self.space_counts.keep("store error");
                     answers[frame] = dm::FAILED;
                 }
             }
@@ -1687,6 +1749,26 @@ impl Helper {
                     .map_err(space_fail)?;
                 self.emit_channel(&space, &channel)?;
                 self.space_send_all(&space);
+            }
+            #[cfg(debug_assertions)]
+            "spaceCounts" => {
+                let me = self.store.as_ref().map(|s| s.id());
+                let mut people = HashSet::new();
+                for space in self.held_spaces() {
+                    if let Some(v) = self.space_version(&space) {
+                        people.extend(v.state.members.keys().copied());
+                    }
+                }
+                let no_keys = (people.iter())
+                    .filter_map(|p| MeshId::from_bytes(p).ok())
+                    .filter(|id| Some(*id) != me)
+                    .filter(|id| self.e2ee.as_ref().is_some_and(|e| !e.knows(id)))
+                    .count();
+                let mut counts = serde_json::to_value(&self.space_counts).unwrap_or_default();
+                counts["peersNoKeys"] = json!(no_keys);
+                counts["outstanding"] = json!(self.space_retry.len());
+                counts["soonWaiting"] = json!(self.space_soon.len());
+                emit("meshSpaceCounts", counts);
             }
             #[cfg(debug_assertions)]
             "spaceForge" => {

@@ -369,6 +369,8 @@ struct Helper {
     space_retry: HashMap<[u8; 32], (MeshId, MeshAddr)>,
     /// Of those, the ones tried again soon, before the refresh.
     space_soon: spaces::Soon,
+    /// Test 9's counts (`spaceCounts`).
+    space_counts: spaces::Counts,
     /// The channel Mesh-Voice has open.
     space_view: Option<(mesh_dm::space::SpaceId, mesh_dm::space::ChannelId)>,
     /// Space mail (S9) in flight, by reader device and `mseq`: the events
@@ -552,6 +554,7 @@ impl Helper {
             space_flight: HashSet::new(),
             space_retry: HashMap::new(),
             space_soon: spaces::Soon::default(),
+            space_counts: spaces::Counts::default(),
             space_view: None,
             space_sent: HashMap::new(),
             space_marked: HashSet::new(),
