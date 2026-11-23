@@ -123,7 +123,8 @@ pub struct Call {
 }
 
 /// Who's in a voice channel, by device: whose it is, and when last heard.
-type Inside = HashMap<[u8; 32], (MeshId, Instant)>;
+/// Each one's own list of who's in, too: the joiner's count for "full".
+type Inside = HashMap<[u8; 32], (MeshId, Instant, Vec<[u8; 32]>)>;
 
 /// Calls' state on the helper.
 #[derive(Default)]
@@ -137,6 +138,8 @@ pub struct Calls {
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
     last_voice_state: Option<Instant>,
+    /// Someone joined or left our voice channel since we last said who's in.
+    voice_changed: bool,
     /// Who's in each voice channel we've heard of, by device: whose it is,
     /// and when it last said so (C8). Not us.
     voice: HashMap<([u8; 16], [u8; 16]), Inside>,
@@ -572,6 +575,13 @@ impl Helper {
         {
             self.calls.last_keep = Some(now);
             self.wire.used(&with, now);
+            if self
+                .net
+                .as_ref()
+                .is_some_and(|n| n.node.connected(&with).is_empty())
+            {
+                self.dial_back(&with, false);
+            }
         }
         let connected: HashSet<[u8; 32]> = (self.net.as_ref())
             .map(|n| {
@@ -626,7 +636,7 @@ impl Helper {
         let speaking: Vec<String> = (self.calls.speaking.iter())
             .filter_map(|d| match me {
                 Some((id, mine)) if *d == mine => Some(id.to_string()),
-                _ if voice.is_some() => in_channel?.get(d).map(|(id, _)| id.to_string()),
+                _ if voice.is_some() => in_channel?.get(d).map(|(id, ..)| id.to_string()),
                 _ => Some(call.with.to_string()),
             })
             .collect();
@@ -673,7 +683,12 @@ impl Helper {
             .get(&(space, channel))
             .cloned()
             .unwrap_or_default();
-        if others.len() >= CALL_MAX {
+        // Everyone anyone in it named: we may have heard from only one.
+        let named: HashSet<[u8; 32]> = (others.values())
+            .flat_map(|(id, _, listed)| listed.iter().copied().chain([id.to_bytes()]))
+            .filter(|p| *p != me.to_bytes())
+            .collect();
+        if named.len() >= CALL_MAX {
             return Err(Fail("full", "that voice channel is full".into()));
         }
         // One call at a time: joining hangs up the old one.
@@ -708,7 +723,7 @@ impl Helper {
             return;
         };
         let inside: HashSet<MeshId> = (self.calls.voice.get(&(space, channel)))
-            .map(|m| m.values().map(|(id, _)| *id).collect())
+            .map(|m| m.values().map(|(id, ..)| *id).collect())
             .unwrap_or_default();
         let members: Vec<(MeshId, bool)> = (v.state.members.keys())
             .filter_map(|p| MeshId::from_bytes(p).ok())
@@ -722,7 +737,7 @@ impl Helper {
     /// Our voice state, with who we know is in the channel.
     fn voice_msg(&self, space: [u8; 16], channel: [u8; 16], joined: bool) -> CallMsg {
         let mut people: Vec<[u8; 32]> = (self.calls.voice.get(&(space, channel)))
-            .map(|m| m.values().map(|(id, _)| id.to_bytes()).collect())
+            .map(|m| m.values().map(|(id, ..)| id.to_bytes()).collect())
             .unwrap_or_default();
         people.sort();
         people.dedup();
@@ -744,14 +759,14 @@ impl Helper {
         {
             self.dial_back(id, false);
         }
-        let members = to;
-        let node = net.node.clone();
-        tokio::spawn(async move {
-            for (id, inside) in members {
+        // Each on its own: one slow dial mustn't hold up the rest.
+        for (id, dial) in to {
+            let (node, msg) = (net.node.clone(), msg.clone());
+            tokio::spawn(async move {
                 let mut addrs = node.connected(&id);
-                // A participant we're dialling: give the dial a moment.
+                // One we're dialling: give the dial a moment.
                 for _ in 0..20 {
-                    if !addrs.is_empty() || !inside {
+                    if !addrs.is_empty() || !dial {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -760,8 +775,8 @@ impl Helper {
                 for addr in addrs {
                     send_to(&node, &addr, &msg).await;
                 }
-            }
-        });
+            });
+        }
     }
 
     /// A participant joined or left a voice channel.
@@ -781,25 +796,32 @@ impl Helper {
             return;
         }
         let inside = self.calls.voice.entry((space, channel)).or_default();
-        let new = if joined {
-            inside.insert(device, (id, Instant::now())).is_none()
+        let (new, gone) = if joined {
+            (
+                inside
+                    .insert(device, (id, Instant::now(), people.clone()))
+                    .is_none(),
+                false,
+            )
         } else {
-            inside.remove(&device);
-            false
+            (false, inside.remove(&device).is_some())
         };
         let ours = (self.calls.current.as_ref())
             .is_some_and(|c| matches!(c.stage, Stage::Voice { space: s, channel: ch } if s == space && ch == channel));
         if ours {
+            self.calls.voice_changed |= new || gone;
             self.voice_peers(space, channel);
-            // A newcomer learns we're here, and who else is, at once.
-            if new {
+            // A newcomer learns we're here, and who else is, at once; so
+            // does anyone whose state doesn't list us (a reply that was lost).
+            let me = self.store.as_ref().map(|s| s.id().to_bytes());
+            let knows_us = me.is_some_and(|me| people.contains(&me));
+            if joined && (new || !knows_us) {
                 let msg = self.voice_msg(space, channel, true);
                 self.call_send(&[(id, device)], msg);
             }
             // Those they know of and we don't: we tell them we're here.
-            let me = self.store.as_ref().map(|s| s.id().to_bytes());
             let known: HashSet<[u8; 32]> = (self.calls.voice.get(&(space, channel)))
-                .map(|m| m.values().map(|(p, _)| p.to_bytes()).collect())
+                .map(|m| m.values().map(|(p, ..)| p.to_bytes()).collect())
                 .unwrap_or_default();
             let unknown: Vec<(MeshId, bool)> = (people.iter())
                 .filter(|p| {
@@ -841,7 +863,7 @@ impl Helper {
                 continue;
             };
             let before = people.len();
-            people.retain(|_, (id, at)| {
+            people.retain(|_, (id, at, _)| {
                 now.duration_since(*at) < VOICE_STALE
                     && members
                         .as_ref()
@@ -878,18 +900,28 @@ impl Helper {
         {
             self.calls.last_keep = Some(now);
             let ids: HashSet<MeshId> = (self.calls.voice.get(&(space, channel)))
-                .map(|m| m.values().map(|(id, _)| *id).collect())
+                .map(|m| m.values().map(|(id, ..)| *id).collect())
                 .unwrap_or_default();
             for id in &ids {
                 self.wire.used(id, now);
+                // A participant we lost the connection to: dialled again,
+                // or their voice and states never come back.
+                if self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.node.connected(id).is_empty())
+                {
+                    self.dial_back(id, false);
+                }
             }
         }
-        if self
-            .calls
-            .last_voice_state
-            .is_none_or(|t| now.duration_since(t) >= VOICE_STATE_EVERY)
-        {
-            self.calls.last_voice_state = Some(now);
+        // Every 30 s, and within 5 s of someone joining or leaving, so
+        // members outside see it (and a joiner counts right for "full").
+        let since = self.calls.last_voice_state.map(|t| now.duration_since(t));
+        let due = since.is_none_or(|d| d >= VOICE_STATE_EVERY)
+            || (self.calls.voice_changed && since.is_none_or(|d| d >= KEEP_EVERY));
+        if due {
+            (self.calls.last_voice_state, self.calls.voice_changed) = (Some(now), false);
             self.voice_announce(space, channel, true);
         }
     }
@@ -897,7 +929,7 @@ impl Helper {
     /// Who's in a voice channel, by ID: those we've heard, and us if we're in.
     fn voice_people(&self, space: [u8; 16], channel: [u8; 16]) -> Vec<String> {
         let mut people: Vec<String> = (self.calls.voice.get(&(space, channel)))
-            .map(|m| m.values().map(|(id, _)| id.to_string()).collect())
+            .map(|m| m.values().map(|(id, ..)| id.to_string()).collect())
             .unwrap_or_default();
         let ours = (self.calls.current.as_ref())
             .is_some_and(|c| matches!(c.stage, Stage::Voice { space: s, channel: ch } if s == space && ch == channel));

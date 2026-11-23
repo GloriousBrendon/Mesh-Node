@@ -577,3 +577,119 @@ fn push_to_talk() {
     }
     let _ = (w.a.h.quit(), w.b.h.quit());
 }
+
+/// CPU seconds a process has used (Linux: /proc/<pid>/stat).
+fn cpu_secs(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let after = stat.rsplit(')').next().unwrap_or("");
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let ticks = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|f| f.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    (ticks(11) + ticks(12)) / 100.0
+}
+
+/// Tests 3 and 9 at full size (`--ignored`): ten members in one voice
+/// channel, each hearing the others; the eleventh is told it's full; each
+/// helper's CPU over 10 s with all ten sending. Printed for PLAN-calls.
+#[test]
+#[ignore = "eleven helpers, a minute or two: run by hand"]
+fn measure_a_full_voice_channel() {
+    let relay = Relay::start();
+    let names: Vec<String> = (0..11).map(|i| format!("m{i}")).collect();
+    let mut dirs = vec![temp_dir("calls-full-seed")];
+    dirs.extend(names.iter().map(|n| temp_dir(&format!("calls-full-{n}"))));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut people: Vec<Person> = (0..11)
+        .map(|i| {
+            person(
+                &dirs[i + 1],
+                &relay,
+                &ticket,
+                &names[i],
+                &(300 + 70 * i).to_string(),
+            )
+        })
+        .collect();
+    let (owner, rest) = people.split_first_mut().unwrap();
+    for p in rest.iter_mut() {
+        friends(owner, p);
+    }
+    let made = ask(&mut owner.h, "spaceCreate", &["big"], "meshSpaces");
+    let s = made["spaces"][0]["id"].as_str().unwrap().to_owned();
+    let made = ask(
+        &mut owner.h,
+        "spaceVoiceChannel",
+        &[&s, "hall", ""],
+        "meshSpaces",
+    );
+    let v = made["spaces"][0]["channels"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for p in rest.iter() {
+        ask(&mut owner.h, "spaceAdd", &[&s, &p.id], "meshSpaces");
+    }
+    for p in rest.iter_mut() {
+        until_for(&mut p.h, "meshSpaces", Duration::from_secs(120), |l| {
+            l["spaces"][0]["members"]
+                .as_array()
+                .is_some_and(|m| m.len() == 11)
+        });
+    }
+    let started = Instant::now();
+    for p in people.iter_mut().take(10) {
+        p.h.send("voiceJoin", &[&s, &v]);
+        call_state(&mut p.h, "live");
+    }
+    for p in people.iter_mut().take(10) {
+        until_for(&mut p.h, "meshVoice", Duration::from_secs(120), |m| {
+            m["channel"] == v.as_str() && m["people"].as_array().is_some_and(|x| x.len() == 10)
+        });
+    }
+    let joined = started.elapsed();
+    // Each hears every other's tone.
+    for (i, p) in people.iter().take(10).enumerate() {
+        let others: Vec<f64> = (0..10)
+            .filter(|j| *j != i)
+            .map(|j| (300 + 70 * j) as f64)
+            .collect();
+        let started = Instant::now();
+        loop {
+            let got: Vec<f64> = others.iter().map(|hz| strength(&p.heard, *hz)).collect();
+            if got.iter().all(|s| *s > 0.15) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "m{i}: {got:.2?}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    let before: Vec<f64> = people
+        .iter()
+        .take(10)
+        .map(|p| cpu_secs(p.h.pid()))
+        .collect();
+    std::thread::sleep(Duration::from_secs(10));
+    let cpu: Vec<f64> = (people.iter().take(10).zip(&before))
+        .map(|(p, b)| (cpu_secs(p.h.pid()) - b) / 10.0 * 100.0)
+        .collect();
+    let eleventh = &mut people[10];
+    eleventh.h.send("voiceJoin", &[&s, &v]);
+    let err = until(&mut eleventh.h, "meshError", |e| e["fn"] == "voiceJoin");
+    assert_eq!(err["kind"], "full", "{err}");
+    eprintln!(
+        "full voice channel: all ten in {:.1} s; CPU per helper over 10 s (%): {:.1?}",
+        joined.as_secs_f64(),
+        cpu
+    );
+    for p in people {
+        let _ = p.h.quit();
+    }
+}

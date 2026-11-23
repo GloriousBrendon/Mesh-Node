@@ -447,7 +447,8 @@ async fn mix(
     }
 }
 
-/// Frames summed, clipped to `i16`.
+/// Frames summed. A sum past `i16` is scaled down as a whole, not clipped:
+/// several people at once stay voices, not distortion.
 fn mixed<'a>(frames: impl Iterator<Item = &'a [i16]>) -> Vec<i16> {
     let mut sum = vec![0i32; FRAME_SAMPLES];
     for frame in frames {
@@ -455,8 +456,14 @@ fn mixed<'a>(frames: impl Iterator<Item = &'a [i16]>) -> Vec<i16> {
             *acc += i32::from(*s);
         }
     }
+    let peak = sum.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    let scale = if peak > i16::MAX as u32 {
+        f64::from(i16::MAX) / f64::from(peak)
+    } else {
+        1.0
+    };
     sum.into_iter()
-        .map(|s| s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
+        .map(|s| (f64::from(s) * scale).round() as i16)
         .collect()
 }
 
@@ -588,6 +595,8 @@ mod tests {
         assert_eq!(j.target, JITTER_START + 1);
     }
 
+    /// Quiet frames add up as they are; loud ones are scaled down together,
+    /// keeping their shape.
     #[test]
     fn the_mix_sums_and_clips() {
         let a = vec![20_000i16; FRAME_SAMPLES];
@@ -595,6 +604,11 @@ mod tests {
         let c = vec![-5i16; FRAME_SAMPLES];
         assert_eq!(mixed([a.as_slice(), b.as_slice()].into_iter())[0], i16::MAX);
         assert_eq!(mixed([a.as_slice(), c.as_slice()].into_iter())[0], 19_995);
+        let half: Vec<i16> = (0..FRAME_SAMPLES)
+            .map(|i| if i % 2 == 0 { 20_000 } else { 10_000 })
+            .collect();
+        let m = mixed([half.as_slice(), half.as_slice()].into_iter());
+        assert_eq!((m[0], m[1]), (i16::MAX, 16_384), "the ratio holds");
     }
 
     /// A datagram's layout (C2).
