@@ -86,9 +86,9 @@ const _: () = assert!(REHOLD_EVERY.as_secs() * 7 <= crate::codes::HOLD_LIFE);
 /// A failed publish is tried again after this, doubling up to the refresh.
 const PUBLISH_RETRY: Duration = Duration::from_secs(60);
 /// Seeds every install knows (SPEC-seed D6); `--seed` replaces them.
-// ponytail: the homelab seed is home-only for now (its relay answers on the LAN and Tailscale only); add a VPS seed when friends outside need codes.
+/// The homelab seed: relay on the public 443, direct on UDP 7842 (D8c).
 pub const SEEDS: &[&str] = &[
-    "mesh://node/1191ccb55a67bcf6fe9408ccd615fce54ff8af653b19a4909f4dbdc967e9533e?relay=https://relay.nagbreeklabs.co.za/",
+    "mesh://node/1191ccb55a67bcf6fe9408ccd615fce54ff8af653b19a4909f4dbdc967e9533e?relay=https://relay.nagbreeklabs.co.za/&addr=154.118.246.15:7842",
 ];
 
 #[derive(Deserialize)]
