@@ -194,6 +194,9 @@ pub struct Options {
     pub holders: Vec<String>,
     /// `--crash-at records` (tests only).
     pub crash_at_records: bool,
+    /// `--no-calls` (tests only): no `call` service, as an engine from
+    /// before calls (SPEC-calls C11).
+    pub no_calls: bool,
     /// `--tone`, `--heard` and `--drop` (tests only, SPEC-calls).
     #[cfg(feature = "audio")]
     pub audio: crate::media::Io,
@@ -208,6 +211,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     helper.holders = options.holders;
     helper.cut_live = options.cut.live;
     helper.crash_at_records = options.crash_at_records;
+    helper.no_calls = options.no_calls;
     #[cfg(feature = "audio")]
     {
         helper.calls.io = options.audio;
@@ -411,6 +415,8 @@ struct Helper {
     typing_last: HashMap<[u8; 32], std::time::Instant>,
     /// The call, if any (SPEC-calls).
     calls: calls::Calls,
+    /// `--no-calls`.
+    no_calls: bool,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -592,6 +598,7 @@ impl Helper {
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
             calls: calls::Calls::default(),
+            no_calls: false,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -1861,8 +1868,10 @@ impl Helper {
                 dm::TYPING.to_owned(),
                 files::BLOB.to_owned(),
                 spaces::SPACE_HISTORY.to_owned(),
-                calls::CALL.to_owned(),
-            ],
+            ]
+            .into_iter()
+            .chain((!self.no_calls).then(|| calls::CALL.to_owned()))
+            .collect(),
             ..Config::default()
         };
         self.allow_contacts();

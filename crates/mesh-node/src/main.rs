@@ -219,6 +219,7 @@ fn main() {
             crash_at_records: args
                 .windows(2)
                 .any(|w| w[0] == "--crash-at" && w[1] == "records"),
+            no_calls: args.iter().any(|a| a == "--no-calls"),
             #[cfg(feature = "audio")]
             audio: audio_options(&args),
         };

@@ -414,3 +414,131 @@ fn a_lossy_path() {
     assert!(gap <= 2_880, "a gap of {} ms", gap / 48);
     let _ = (a.h.quit(), b.h.quit());
 }
+
+/// Test 1's two devices (C7): B links a laptop; A's call rings both; the
+/// laptop answers and the desk stops ringing, answered elsewhere; A and the
+/// laptop hear each other.
+#[test]
+fn both_devices_ring_and_one_answers() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a", "desk", "laptop"].map(|n| temp_dir(&format!("calls-two-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut a = person(&dirs[1], &relay, &ticket, "ann", "440");
+    let mut desk = person(&dirs[2], &relay, &ticket, "ben", "660");
+    friends(&mut a, &mut desk);
+
+    let heard = dirs[3].join("heard.raw");
+    let mut h = Helper::start_with(
+        &dirs[3],
+        &relay,
+        &[
+            "--seed",
+            &ticket,
+            "--record-ttl",
+            TTL,
+            "--tone",
+            "880",
+            "--heard",
+            heard.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(h.event().0, "meshIdentity");
+    let code = ask(&mut desk.h, "linkStart", &[], "meshLink")["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.send("linkJoin", &[&code, "Laptop"]);
+    until(&mut desk.h, "meshLinkConfirm", |_| true);
+    desk.h.send("linkConfirm", &["true"]);
+    until(&mut h, "meshLinkReceived", |_| true);
+    h.send("linkFinish", &["ben", PASSWORD]);
+    until(&mut h, "meshIdentity", |i| i["state"] == "unlocked");
+    h.net_state("online");
+    let mut laptop = Person {
+        h,
+        id: desk.id.clone(),
+        heard,
+    };
+    let ia = a.id.clone();
+    until(&mut laptop.h, "meshSocial", |s| {
+        s["friends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == ia.as_str())
+    });
+
+    // The laptop connects to A on its own soon after: call until both ring.
+    let started = Instant::now();
+    loop {
+        a.h.send("callStart", &[&desk.id]);
+        call_state(&mut desk.h, "ringing");
+        let both = laptop
+            .h
+            .line_within(Duration::from_secs(5))
+            .into_iter()
+            .chain(std::iter::from_fn(|| {
+                laptop.h.line_within(Duration::from_millis(500))
+            }))
+            .take(20)
+            .any(|(b, c)| b == "meshCall" && c["state"] == "ringing");
+        if both {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the laptop never rang"
+        );
+        a.h.send("callHangup", &[]);
+        call_state(&mut desk.h, "ended");
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    laptop.h.send("callAnswer", &[]);
+    call_state(&mut laptop.h, "live");
+    let ended = until_for(&mut desk.h, "meshCall", Duration::from_secs(5), |c| {
+        c["state"] == "ended"
+    });
+    assert_eq!(ended["outcome"], "elsewhere", "{ended}");
+    call_state(&mut a.h, "live");
+    hears(&a, 880.0, 660.0);
+    hears(&laptop, 440.0, 880.0);
+    let _ = (a.h.quit(), desk.h.quit(), laptop.h.quit());
+}
+
+/// Test 7: calling an engine from before calls (here `--no-calls`, which
+/// refuses the `call` service as one would): "they need to update Mesh",
+/// and no call line.
+#[test]
+fn an_old_engine_needs_an_update() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a", "b"].map(|n| temp_dir(&format!("calls-old-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut a = person(&dirs[1], &relay, &ticket, "ann", "440");
+    let mut h = Helper::start_with(
+        &dirs[2],
+        &relay,
+        &["--seed", &ticket, "--record-ttl", TTL, "--no-calls"],
+    );
+    assert_eq!(h.event().0, "meshIdentity");
+    let id = h.expect("idCreate", &["ben", PASSWORD], "meshIdentity")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.net_state("online");
+    let mut b = Person {
+        h,
+        id,
+        heard: dirs[2].join("none"),
+    };
+    friends(&mut a, &mut b);
+    a.h.send("callStart", &[&b.id]);
+    let ended = until(&mut a.h, "meshCall", |c| c["state"] == "ended");
+    assert_eq!(ended["outcome"], "update", "{ended}");
+    assert!(
+        !last_line(&mut a.h, &b.id).starts_with("📞"),
+        "no call line"
+    );
+    let _ = (a.h.quit(), b.h.quit());
+}
