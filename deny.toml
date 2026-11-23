@@ -1,4 +1,4 @@
-# `cargo deny check advisories` (CI). These five are flagged unmaintained,
+# `cargo deny check advisories` (CI). These are flagged unmaintained,
 # with no known hole; listed so the check fails only on something new.
 # Look again when postcard, iroh and keyring release.
 [advisories]
@@ -8,4 +8,6 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant: keyring -> secret-service -> zbus (Linux)" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names: keyring -> secret-service -> zbus (Linux)" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: keyring -> secret-service -> zbus (Linux)" },
+    { id = "RUSTSEC-2026-0150", reason = "audiopus_sys: opus (calls), the binding Mesh-Voice uses too; no newer one" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono: iroh -> iroh-relay -> tokio-rustls-acme" },
 ]
