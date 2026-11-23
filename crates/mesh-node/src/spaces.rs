@@ -740,6 +740,12 @@ impl Helper {
                     Some(json!({ "id": id.to_string(), "name": m.display, "role": role_text(m.role) }))
                 })
                 .collect();
+            let categories: Vec<Value> = (st.categories.iter())
+                .map(|(id, c)| json!({ "id": hex16(id), "name": c.name, "position": c.position }))
+                .collect();
+            let bans: Vec<String> = (st.bans.iter())
+                .filter_map(|p| MeshId::from_bytes(p).ok().map(|id| id.to_string()))
+                .collect();
             let role = me.and_then(|me| st.role(&me)).map(role_text);
             let changes = self.space_open.get(&space).map(SpaceHistory::changes_held);
             spaces.push(json!({
@@ -748,6 +754,10 @@ impl Helper {
                 "role": role,
                 "channels": channels,
                 "members": members,
+                "categories": categories,
+                "membersMayAdd": st.members_may_add,
+                "bans": bans,
+                "ended": st.ended,
                 "changes": changes,
             }));
         }

@@ -1357,7 +1357,18 @@ fn kick_and_ban() {
     all_until(&mut [&mut k.b], |v| role_of(v, &id_c).is_none());
     ask(&mut k.o, "spaceAdd", &[&s, &id_c], "meshSpaces");
     all_until(&mut [&mut k.b, &mut k.c], |v| role_of(v, &id_c).is_some());
-    ask(&mut k.o, "spaceBan", &[&s, &id_c], "meshSpaces");
+    let banned = ask(&mut k.o, "spaceBan", &[&s, &id_c], "meshSpaces");
+    let club = space(&banned, "club");
+    assert_eq!(club["bans"], serde_json::json!([id_c]), "{club}");
+    assert_eq!(
+        (&club["categories"], &club["membersMayAdd"], &club["ended"]),
+        (
+            &serde_json::json!([]),
+            &serde_json::json!(true),
+            &serde_json::json!(false)
+        ),
+        "{club}"
+    );
     all_until(&mut [&mut k.b, &mut k.c], |v| role_of(v, &id_c).is_none());
     let err = ask(&mut k.o, "spaceAdd", &[&s, &id_c], "meshError");
     assert_eq!(err["kind"], "not-allowed", "{err}");
