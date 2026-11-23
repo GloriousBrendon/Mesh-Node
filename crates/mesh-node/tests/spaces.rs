@@ -1107,6 +1107,90 @@ fn a_file_goes_to_a_channel() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// The settings (Task 13): categories and where channels sit, the post
+/// switch, members-may-add, deleting a channel, then transfer and end. A
+/// member can't change them, an ex-owner can't end, and every device sees
+/// each change.
+#[test]
+fn settings_change_for_everyone() {
+    let mut k = club("spaces-settings");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let made = ask(&mut k.o, "spaceCategory", &[&s, "Info"], "meshSpaces");
+    let cats = space(&made, "club")["categories"].clone();
+    let info = cats[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (cats[0]["name"].as_str(), cats[0]["position"].as_u64()),
+        (Some("Info"), Some(0)),
+        "{cats}"
+    );
+    let made = ask(
+        &mut k.o,
+        "spaceChannel",
+        &[&s, "rules", "admins", &info],
+        "meshSpaces",
+    );
+    let rules = channel(space(&made, "club"), "rules");
+    ask(
+        &mut k.o,
+        "spaceChannelMove",
+        &[&s, &g, &info, "1"],
+        "meshSpaces",
+    );
+    ask(
+        &mut k.o,
+        "spaceChannelPost",
+        &[&s, &g, "admins"],
+        "meshSpaces",
+    );
+    ask(
+        &mut k.o,
+        "spaceCategoryRename",
+        &[&s, &info, "About"],
+        "meshSpaces",
+    );
+    ask(&mut k.o, "spaceMembersMayAdd", &[&s, "false"], "meshSpaces");
+    let sits = |v: &Value, id: &str| {
+        let cs = v["spaces"][0]["channels"].as_array().unwrap();
+        cs.iter()
+            .find(|c| c["id"] == id)
+            .map(|c| (c["category"].clone(), c["adminsPost"].clone()))
+    };
+    let info_v = Value::from(info.clone());
+    all_until(&mut [&mut k.b, &mut k.c], |v| {
+        let club = &v["spaces"][0];
+        club["categories"][0]["name"] == "About"
+            && club["membersMayAdd"] == false
+            && sits(v, &rules) == Some((info_v.clone(), Value::from(true)))
+            && sits(v, &g) == Some((info_v.clone(), Value::from(true)))
+    });
+    // A member changes nothing.
+    let err = ask(&mut k.b, "spaceCategory", &[&s, "Mine"], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    let err = ask(&mut k.b, "spaceEnd", &[&s], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    // Deleting a category leaves its channels loose; a channel goes.
+    ask(&mut k.o, "spaceCategoryDelete", &[&s, &info], "meshSpaces");
+    ask(&mut k.o, "spaceChannelDelete", &[&s, &rules], "meshSpaces");
+    all_until(&mut [&mut k.b, &mut k.c], |v| {
+        v["spaces"][0]["categories"] == serde_json::json!([])
+            && sits(v, &rules).is_none()
+            && sits(v, &g) == Some((Value::Null, Value::from(true)))
+    });
+    // The owner hands it to B, who ends it; O, now an admin, can't.
+    let id_b = k.id_b.clone();
+    ask(&mut k.o, "spaceTransfer", &[&s, &id_b], "meshSpaces");
+    all_until(&mut [&mut k.b], |v| {
+        role_of(v, &id_b).as_deref() == Some("owner")
+    });
+    let err = ask(&mut k.o, "spaceEnd", &[&s], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    ask(&mut k.b, "spaceEnd", &[&s], "meshSpaces");
+    all_until(&mut [&mut k.o, &mut k.c], |v| {
+        v["spaces"][0]["ended"] == true
+    });
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

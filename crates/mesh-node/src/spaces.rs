@@ -1823,10 +1823,15 @@ impl Helper {
                     "everyone" => false,
                     _ => return Err(Fail("bad-args", "who posts: admins or everyone".to_owned())),
                 };
+                // [category], under which it sits; none or empty: no category.
+                let category = match args.get(3).map(String::as_str) {
+                    None | Some("") => None,
+                    Some(c) => Some(parse16(c, "category")?),
+                };
                 let change = Change::ChannelCreate {
                     nonce,
                     name: arg(1)?.trim().to_owned(),
-                    category: None,
+                    category,
                     admins_post,
                 };
                 self.space_change(&space, change)?;
@@ -1888,6 +1893,69 @@ impl Helper {
                         name,
                     },
                     None => Change::Rename(name),
+                };
+                self.space_command_change(&space, change)?;
+            }
+            // The settings (S3, S6, S7): each one change, refused here if it
+            // wouldn't count (an admin's, or the owner's for transfer and end).
+            "spaceChannelDelete"
+            | "spaceChannelPost"
+            | "spaceChannelMove"
+            | "spaceCategory"
+            | "spaceCategoryRename"
+            | "spaceCategoryMove"
+            | "spaceCategoryDelete"
+            | "spaceMembersMayAdd"
+            | "spaceTransfer"
+            | "spaceEnd" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let position = |i: usize| -> Result<u16, Fail> {
+                    (arg(i)?.parse()).map_err(|_| Fail("bad-args", "a position".to_owned()))
+                };
+                let change = match func {
+                    "spaceChannelDelete" => Change::ChannelDelete(parse16(arg(1)?, "channel")?),
+                    "spaceChannelPost" => Change::ChannelPost {
+                        channel: parse16(arg(1)?, "channel")?,
+                        admins_only: match arg(2)? {
+                            "admins" => true,
+                            "everyone" => false,
+                            _ => {
+                                return Err(Fail(
+                                    "bad-args",
+                                    "who posts: admins or everyone".to_owned(),
+                                ));
+                            }
+                        },
+                    },
+                    "spaceChannelMove" => Change::ChannelMove {
+                        channel: parse16(arg(1)?, "channel")?,
+                        category: match arg(2)? {
+                            "" => None,
+                            c => Some(parse16(c, "category")?),
+                        },
+                        position: position(3)?,
+                    },
+                    "spaceCategory" => Change::CategoryCreate {
+                        nonce: mesh_dm::space::nonce()
+                            .ok_or_else(|| space_fail("no randomness"))?,
+                        name: arg(1)?.trim().to_owned(),
+                    },
+                    "spaceCategoryRename" => Change::CategoryRename {
+                        category: parse16(arg(1)?, "category")?,
+                        name: arg(2)?.trim().to_owned(),
+                    },
+                    "spaceCategoryMove" => Change::CategoryMove {
+                        category: parse16(arg(1)?, "category")?,
+                        position: position(2)?,
+                    },
+                    "spaceCategoryDelete" => Change::CategoryDelete(parse16(arg(1)?, "category")?),
+                    "spaceMembersMayAdd" => Change::MembersMayAdd(match arg(1)? {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(Fail("bad-args", "true or false".to_owned())),
+                    }),
+                    "spaceTransfer" => Change::Transfer(parse_id(arg(1)?)?.to_bytes()),
+                    _ => Change::End,
                 };
                 self.space_command_change(&space, change)?;
             }
