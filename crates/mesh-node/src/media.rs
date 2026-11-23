@@ -65,7 +65,13 @@ struct Shared {
     peers: Mutex<HashSet<[u8; 32]>>,
     muted: AtomicBool,
     deafened: AtomicBool,
+    /// Push-to-talk (C10): `PTT_OFF` (the voice gate), `PTT_UP` or `PTT_DOWN`.
+    ptt: std::sync::atomic::AtomicU8,
 }
+
+pub const PTT_OFF: u8 = 0;
+pub const PTT_UP: u8 = 1;
+pub const PTT_DOWN: u8 = 2;
 
 /// A call's running audio. Dropping it stops everything.
 pub struct Media {
@@ -101,6 +107,7 @@ impl Media {
             peers: Mutex::new(HashSet::new()),
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
+            ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
         });
         let stop = Arc::new(AtomicBool::new(false));
         // A tone is a test's: noise suppression would take it out.
@@ -159,6 +166,10 @@ impl Media {
 
     pub fn set_deafened(&self, on: bool) {
         self.shared.deafened.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_ptt(&self, mode: u8) {
+        self.shared.ptt.store(mode, Ordering::Relaxed);
     }
 }
 
@@ -290,7 +301,14 @@ async fn send(
             frame = d.frame(&frame);
         }
         let now = Instant::now();
-        if shared.muted.load(Ordering::Relaxed) || !gate.pass(rms(&frame), now) {
+        // Push-to-talk sends while the key is held, whatever the level;
+        // otherwise the gate decides.
+        let open = match shared.ptt.load(Ordering::Relaxed) {
+            PTT_DOWN => true,
+            PTT_UP => false,
+            _ => gate.pass(rms(&frame), now),
+        };
+        if shared.muted.load(Ordering::Relaxed) || !open {
             continue;
         }
         lock(&us).last_loud.insert(me, now);

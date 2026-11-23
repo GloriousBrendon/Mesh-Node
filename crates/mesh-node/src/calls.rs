@@ -131,6 +131,8 @@ pub struct Calls {
     pub current: Option<Call>,
     pub muted: bool,
     pub deafened: bool,
+    /// Push-to-talk's mode (`media::PTT_*`); off is the voice gate.
+    ptt: u8,
     /// Who's speaking in the current call, by device.
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
@@ -222,6 +224,19 @@ impl Helper {
                     m.set_deafened(self.calls.deafened);
                 }
                 self.emit_call(None);
+            }
+            // Push-to-talk (C10): `off`, `up` (on, the key released) or `down`.
+            "callPtt" => {
+                self.calls.ptt = match arg(0)? {
+                    "off" => 0,
+                    "up" => 1,
+                    "down" => 2,
+                    _ => return Err(Fail("bad-args", "off, up or down".into())),
+                };
+                #[cfg(feature = "audio")]
+                if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
+                    m.set_ptt(self.calls.ptt);
+                }
             }
             // Microphone and speakers by name, "" for the default: the next
             // call uses them.
@@ -411,6 +426,7 @@ impl Helper {
             media.set_peers(call.devices.iter().copied());
             media.set_muted(self.calls.muted);
             media.set_deafened(self.calls.deafened);
+            media.set_ptt(self.calls.ptt);
             call.media = Some(media);
         }
         Ok(())

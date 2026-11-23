@@ -542,3 +542,38 @@ fn an_old_engine_needs_an_update() {
     );
     let _ = (a.h.quit(), b.h.quit());
 }
+
+/// Push-to-talk (C10): on with the key up, B hears nothing new from A;
+/// held, B hears A; off again, the voice gate sends A's tone as before.
+#[test]
+fn push_to_talk() {
+    let mut w = world("calls-ptt");
+    let ib = w.b.id.clone();
+    w.a.h.send("callPtt", &["up"]);
+    w.a.h.send("callStart", &[&ib]);
+    call_state(&mut w.b.h, "ringing");
+    w.b.h.send("callAnswer", &[]);
+    call_state(&mut w.a.h, "live");
+    hears(&w.a, 660.0, 440.0);
+    let size = |p: &Person| std::fs::metadata(&p.heard).map(|m| m.len()).unwrap_or(0);
+    let before = size(&w.b);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(size(&w.b), before, "nothing from A with the key up");
+    w.a.h.send("callPtt", &["down"]);
+    hears(&w.b, 440.0, 660.0);
+    w.a.h.send("callPtt", &["up"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let before = size(&w.b);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(size(&w.b), before, "nothing once it's let go");
+    w.a.h.send("callPtt", &["off"]);
+    let started = Instant::now();
+    while size(&w.b) == before {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "voice activity again"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = (w.a.h.quit(), w.b.h.quit());
+}
