@@ -103,11 +103,12 @@ impl Media {
             deafened: AtomicBool::new(false),
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let (frames, capture) = match io.tone {
-            Some(hz) => (tone(hz, stop.clone()), None),
+        // A tone is a test's: noise suppression would take it out.
+        let (frames, capture, denoise) = match io.tone {
+            Some(hz) => (tone(hz, stop.clone()), None, None),
             None => {
                 let (handle, rx) = audio::start_capture(io.input.clone())?;
-                (rx, Some(handle))
+                (rx, Some(handle), Some(Denoise::new()))
             }
         };
         let (sink, playback) = match &io.heard {
@@ -130,7 +131,7 @@ impl Media {
             tokio::spawn(send(
                 node.clone(),
                 shared.clone(),
-                frames,
+                (frames, denoise),
                 encoder,
                 me,
                 us.clone(),
@@ -186,6 +187,35 @@ fn tone(hz: f32, stop: Arc<AtomicBool>) -> tokio::sync::mpsc::UnboundedReceiver<
         }
     });
     rx
+}
+
+/// Our microphone's 20 ms frames.
+type Frames = tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>;
+
+/// Noise suppression on our microphone (Q2): RNNoise, on each 20 ms frame's
+/// two 10 ms halves. Its first output is silent (its own delay).
+struct Denoise(Box<nnnoiseless::DenoiseState<'static>>);
+
+impl Denoise {
+    fn new() -> Self {
+        Self(nnnoiseless::DenoiseState::new())
+    }
+
+    fn frame(&mut self, frame: &[i16]) -> Vec<i16> {
+        let mut out = Vec::with_capacity(frame.len());
+        let mut half = [0f32; nnnoiseless::FRAME_SIZE];
+        for chunk in frame.chunks(nnnoiseless::FRAME_SIZE) {
+            if chunk.len() < nnnoiseless::FRAME_SIZE {
+                out.extend_from_slice(chunk);
+                continue;
+            }
+            // It takes and gives `i16`'s range as floats.
+            let input: Vec<f32> = chunk.iter().map(|&s| f32::from(s)).collect();
+            self.0.process_frame(&mut half, &input);
+            out.extend(half.iter().map(|s| s.clamp(-32768.0, 32767.0) as i16));
+        }
+        out
+    }
 }
 
 fn rms(frame: &[i16]) -> f64 {
@@ -246,7 +276,7 @@ impl Speakers {
 async fn send(
     node: Arc<Node>,
     shared: Arc<Shared>,
-    mut frames: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
+    (mut frames, mut denoise): (Frames, Option<Denoise>),
     mut encoder: Encoder,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
@@ -254,8 +284,11 @@ async fn send(
     let mut gate = Gate::default();
     let mut seq: u32 = 0;
     let mut out = vec![0u8; 1500];
-    while let Some(frame) = frames.recv().await {
+    while let Some(mut frame) = frames.recv().await {
         seq = seq.wrapping_add(1);
+        if let Some(d) = denoise.as_mut() {
+            frame = d.frame(&frame);
+        }
         let now = Instant::now();
         if shared.muted.load(Ordering::Relaxed) || !gate.pass(rms(&frame), now) {
             continue;
@@ -557,6 +590,37 @@ mod tests {
         assert_eq!(parse(&d[..12]), None);
         d[0] = 2;
         assert_eq!(parse(&d), None);
+    }
+
+    /// Steady hiss is cut: after a second or so of it, the output is under
+    /// 60% of its level (measured: about half). Seeded noise, so it's the
+    /// same every run.
+    #[test]
+    fn noise_is_suppressed() {
+        let mut d = Denoise::new();
+        let mut x: u32 = 7;
+        let (mut heard, mut fed) = (0.0, 0.0);
+        for k in 0..150 {
+            let frame: Vec<i16> = (0..FRAME_SAMPLES)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    ((x % 2001) as i32 - 1000) as i16
+                })
+                .collect();
+            let out = d.frame(&frame);
+            assert_eq!(out.len(), FRAME_SAMPLES);
+            if k >= 90 {
+                (heard, fed) = (heard + rms(&out), fed + rms(&frame));
+            }
+        }
+        assert!(
+            heard < fed * 0.6,
+            "{:.0} of {:.0}",
+            heard / 60.0,
+            fed / 60.0
+        );
     }
 
     /// Speech opens the gate and it stays open for the hangover; quiet
