@@ -1032,6 +1032,38 @@ fn a_mention_counts_until_read() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// Typing in a channel (S12, Task 11b): to members' connected devices only,
+/// as a DM's (D10). B and C are connected by B's line, so C hears B typing.
+#[test]
+fn typing_shows_in_a_channel() {
+    let mut k = club("spaces-typing");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "here"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.c, "meshSpaceNotify", |n| n["text"] == "here");
+    let started = Instant::now();
+    let id_b = k.id_b.clone();
+    loop {
+        k.b.send("spaceTyping", &[&s, &g]);
+        let heard = until_for(&mut k.c, "meshSpaceTyping", Duration::from_secs(3), |_| {
+            true
+        });
+        if heard["who"] == serde_json::json!([id_b.as_str()]) {
+            assert_eq!(
+                (heard["space"].as_str(), heard["channel"].as_str()),
+                (Some(&*s), Some(&*g))
+            );
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "{heard}");
+    }
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

@@ -772,6 +772,53 @@ impl Helper {
         Ok(())
     }
 
+    /// "Typing" in a channel, to members' connected devices only (dm D10).
+    fn space_send_typing(&mut self, space: &SpaceId, channel: &ChannelId) -> Result<(), Fail> {
+        let me = self.me_sender()?.person;
+        let v = self.space_version(space).ok_or_else(not_found)?;
+        let Some(net) = &self.net else { return Ok(()) };
+        let frame = [&space[..], &channel[..]].concat();
+        let others = (v.state.members.keys()).filter(|p| **p != me);
+        for person in others.filter_map(|p| MeshId::from_bytes(p).ok()) {
+            for addr in net.node.connected(&person) {
+                let (node, frame) = (net.node.clone(), frame.clone());
+                tokio::spawn(async move {
+                    if let Ok((_, mut send, _)) = node.open(&addr, dm::TYPING).await {
+                        let _ = mesh_transport::frame::write_frame(&mut send, &frame).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A typing signal for a Space's channel: `meshSpaceTyping` if it's
+    /// from a member.
+    pub(super) fn space_typing_heard(
+        &mut self,
+        id: MeshId,
+        device: [u8; 32],
+        both: [u8; 32],
+        now: Instant,
+    ) {
+        let (space, channel): ([u8; 16], [u8; 16]) = (
+            both[..16].try_into().expect("16"),
+            both[16..].try_into().expect("16"),
+        );
+        let member = (self.space_version(&space)).is_some_and(|v| {
+            v.state.members.contains_key(&id.to_bytes()) && v.state.channels.contains_key(&channel)
+        });
+        if !member {
+            return;
+        }
+        self.typing_last.insert(device, now);
+        emit(
+            "meshSpaceTyping",
+            json!({ "space": hex16(&space), "channel": hex16(&channel), "who": [id.to_string()] }),
+        );
+    }
+
     /// Who wrote a line in a channel; not found if it isn't there.
     fn line_author(
         &mut self,
@@ -1808,6 +1855,11 @@ impl Helper {
                     None => Change::Rename(name),
                 };
                 self.space_command_change(&space, change)?;
+            }
+            "spaceTyping" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                self.space_send_typing(&space, &channel)?;
             }
             "spaceRead" => {
                 let space = parse16(arg(0)?, "Space")?;

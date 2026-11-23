@@ -2201,8 +2201,9 @@ async fn serve_streams(
         if stream.service == dm::TYPING {
             tokio::spawn(async move {
                 let read = mesh_transport::frame::read_frame(&mut stream.recv);
+                // Nothing (a 1:1), a group's ID, or a Space's and a channel's.
                 if let Ok(Ok(Some(frame))) = tokio::time::timeout(SYNC_TIMEOUT, read).await
-                    && frame.len() <= 16
+                    && frame.len() <= 32
                 {
                     let (id, device) = (stream.peer.id, *stream.peer.device.as_bytes());
                     let _ = back.send(Back::Typing(Box::new((id, device, frame))));

@@ -776,6 +776,9 @@ impl Helper {
         {
             return;
         }
+        if let Ok(both) = <[u8; 32]>::try_from(&frame[..]) {
+            return self.space_typing_heard(id, device, both, now);
+        }
         let at = match <[u8; 16]>::try_from(&frame[..]) {
             Ok(group) => Where::Group(group),
             Err(_) if frame.is_empty() => direct_chat(&id),
