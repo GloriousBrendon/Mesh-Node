@@ -641,7 +641,6 @@ fn measure_a_full_voice_channel() {
                 .is_some_and(|m| m.len() == 11)
         });
     }
-    let started = Instant::now();
     for p in people.iter_mut().take(10) {
         p.h.send("voiceJoin", &[&s, &v]);
         call_state(&mut p.h, "live");
@@ -651,7 +650,6 @@ fn measure_a_full_voice_channel() {
             m["channel"] == v.as_str() && m["people"].as_array().is_some_and(|x| x.len() == 10)
         });
     }
-    let joined = started.elapsed();
     // Each hears every other's tone.
     for (i, p) in people.iter().take(10).enumerate() {
         let others: Vec<f64> = (0..10)
@@ -684,11 +682,7 @@ fn measure_a_full_voice_channel() {
     eleventh.h.send("voiceJoin", &[&s, &v]);
     let err = until(&mut eleventh.h, "meshError", |e| e["fn"] == "voiceJoin");
     assert_eq!(err["kind"], "full", "{err}");
-    eprintln!(
-        "full voice channel: all ten in {:.1} s; CPU per helper over 10 s (%): {:.1?}",
-        joined.as_secs_f64(),
-        cpu
-    );
+    eprintln!("full voice channel: CPU per helper over 10 s (%, debug build): {cpu:.1?}");
     for p in people {
         let _ = p.h.quit();
     }

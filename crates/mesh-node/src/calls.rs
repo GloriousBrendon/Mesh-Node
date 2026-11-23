@@ -914,6 +914,28 @@ impl Helper {
                     self.dial_back(id, false);
                 }
             }
+            // Anyone the others say is in, whom we haven't heard from: we
+            // tell them we're here (dialling if need be) until their reply
+            // comes, so two members who aren't friends always find each
+            // other, whatever was lost.
+            let me = self.store.as_ref().map(|s| s.id().to_bytes());
+            let v = self.space_version(&space);
+            let missing: Vec<(MeshId, bool)> = (self.calls.voice.get(&(space, channel)))
+                .into_iter()
+                .flat_map(|m| m.values().flat_map(|(_, _, listed)| listed.iter().copied()))
+                .collect::<HashSet<[u8; 32]>>()
+                .into_iter()
+                .filter(|p| {
+                    Some(*p) != me && v.as_ref().is_some_and(|v| v.state.members.contains_key(p))
+                })
+                .filter_map(|p| MeshId::from_bytes(&p).ok())
+                .filter(|p| !ids.contains(p))
+                .map(|p| (p, true))
+                .collect();
+            if !missing.is_empty() {
+                let msg = self.voice_msg(space, channel, true);
+                self.voice_send(missing, msg);
+            }
         }
         // Every 30 s, and within 5 s of someone joining or leaving, so
         // members outside see it (and a joiner counts right for "full").
