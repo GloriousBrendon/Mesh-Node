@@ -30,6 +30,12 @@ const KEEP_EVERY: Duration = Duration::from_secs(5);
 const LOST_AFTER: Duration = Duration::from_secs(15);
 /// The prefix of a call's line in the DM (Q3).
 const LINE: &str = "📞";
+/// People in a voice channel at most (C1).
+pub const CALL_MAX: usize = 10;
+/// How often a participant says it's in its voice channel (C8).
+const VOICE_STATE_EVERY: Duration = Duration::from_secs(30);
+/// A participant not heard from for this long has gone.
+const VOICE_STALE: Duration = Duration::from_secs(75);
 
 /// A control message (C2), one per stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +56,15 @@ pub enum CallMsg {
     Taken {
         call: [u8; 8],
     },
+    /// A participant's voice channel: it joined (or left) `channel` (C8),
+    /// and who else it knows is in it, by ID, so a newcomer can reach people
+    /// it isn't connected to.
+    Voice {
+        space: [u8; 16],
+        channel: [u8; 16],
+        joined: bool,
+        people: Vec<[u8; 32]>,
+    },
 }
 
 impl CallMsg {
@@ -60,6 +75,7 @@ impl CallMsg {
             | CallMsg::Decline { call }
             | CallMsg::Hangup { call }
             | CallMsg::Taken { call } => *call,
+            CallMsg::Voice { channel, .. } => voice_call(channel),
         }
     }
 }
@@ -84,6 +100,11 @@ enum Stage {
     Live {
         since: Instant,
     },
+    /// In a voice channel; `devices` are the others in it.
+    Voice {
+        space: [u8; 16],
+        channel: [u8; 16],
+    },
 }
 
 pub struct Call {
@@ -101,6 +122,9 @@ pub struct Call {
     media: Option<crate::media::Media>,
 }
 
+/// Who's in a voice channel, by device: whose it is, and when last heard.
+type Inside = HashMap<[u8; 32], (MeshId, Instant)>;
+
 /// Calls' state on the helper.
 #[derive(Default)]
 pub struct Calls {
@@ -110,8 +134,22 @@ pub struct Calls {
     /// Who's speaking in the current call, by device.
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
+    last_voice_state: Option<Instant>,
+    /// Who's in each voice channel we've heard of, by device: whose it is,
+    /// and when it last said so (C8). Not us.
+    voice: HashMap<([u8; 16], [u8; 16]), Inside>,
     #[cfg(feature = "audio")]
     pub io: crate::media::Io,
+}
+
+/// A voice channel's call ID: its own ID's first bytes (channel IDs are
+/// already unique, from the Space's).
+fn voice_call(channel: &[u8; 16]) -> [u8; 8] {
+    channel[..8].try_into().expect("8")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn hex8(id: &[u8; 8]) -> String {
@@ -162,6 +200,12 @@ impl Helper {
                 self.call_start(with)?;
             }
             "callAnswer" => self.call_answer()?,
+            "voiceJoin" => {
+                let space = super::spaces::parse16(arg(0)?, "Space")?;
+                let channel = super::spaces::parse16(arg(1)?, "channel")?;
+                self.voice_join(space, channel)?;
+            }
+            "voiceLeave" => self.call_hangup(),
             "callDecline" | "callHangup" => self.call_hangup(),
             "callMute" => {
                 self.calls.muted = arg(0)? == "true";
@@ -294,6 +338,11 @@ impl Helper {
             return;
         };
         let (id, with) = (call.id, call.with);
+        if let Stage::Voice { space, channel } = call.stage {
+            self.voice_announce(space, channel, false);
+            self.call_end("left", false);
+            return self.emit_voice(space, channel);
+        }
         let to: Vec<(MeshId, [u8; 32])> = match call.stage {
             Stage::Ringing { from } => vec![(with, from)],
             _ => call.devices.iter().map(|d| (with, *d)).collect(),
@@ -301,7 +350,7 @@ impl Helper {
         let (msg, outcome) = match call.stage {
             Stage::Ringing { .. } => (CallMsg::Decline { call: id }, "declined"),
             Stage::Calling => (CallMsg::Hangup { call: id }, "missed"),
-            Stage::Live { .. } => (CallMsg::Hangup { call: id }, "ended"),
+            Stage::Live { .. } | Stage::Voice { .. } => (CallMsg::Hangup { call: id }, "ended"),
         };
         self.call_send(&to, msg);
         self.call_end(outcome, true);
@@ -383,6 +432,15 @@ impl Helper {
 
     /// A control message from another device.
     pub(super) fn call_heard(&mut self, id: MeshId, device: [u8; 32], msg: CallMsg) {
+        if let CallMsg::Voice {
+            space,
+            channel,
+            joined,
+            people,
+        } = msg
+        {
+            return self.voice_heard(id, device, (space, channel), joined, people);
+        }
         let me = self.store.as_ref().map(|s| s.id());
         let current = self.calls.current.as_ref().filter(|c| c.id == msg.call());
         match (msg, current.map(|c| &c.stage)) {
@@ -473,6 +531,7 @@ impl Helper {
     /// and a peer gone.
     pub(super) fn call_tick(&mut self) {
         let now = Instant::now();
+        self.voice_tick(now);
         let Some(call) = &self.calls.current else {
             return;
         };
@@ -537,30 +596,308 @@ impl Helper {
         let state = match call.stage {
             Stage::Calling => "calling",
             Stage::Ringing { .. } => "ringing",
-            Stage::Live { .. } => "live",
+            Stage::Live { .. } | Stage::Voice { .. } => "live",
         };
         let me = self
             .store
             .as_ref()
             .map(|s| (s.id(), s.device_key().public().to_bytes()));
+        let voice = match call.stage {
+            Stage::Voice { space, channel } => Some((space, channel)),
+            _ => None,
+        };
+        let in_channel = voice.and_then(|k| self.calls.voice.get(&k));
         let speaking: Vec<String> = (self.calls.speaking.iter())
-            .map(|d| match me {
-                Some((id, mine)) if *d == mine => id.to_string(),
-                _ => call.with.to_string(),
+            .filter_map(|d| match me {
+                Some((id, mine)) if *d == mine => Some(id.to_string()),
+                _ if voice.is_some() => in_channel?.get(d).map(|(id, _)| id.to_string()),
+                _ => Some(call.with.to_string()),
             })
             .collect();
+        let mut payload = json!({
+            "state": state,
+            "id": hex8(&call.id),
+            "with": call.with.to_string(),
+            "caller": call.caller,
+            "muted": self.calls.muted,
+            "deafened": self.calls.deafened,
+            "speaking": speaking,
+            "outcome": outcome,
+        });
+        if let Some((space, channel)) = voice {
+            payload["space"] = json!(hex(&space));
+            payload["channel"] = json!(hex(&channel));
+            payload["people"] = json!(self.voice_people(space, channel));
+        }
+        emit("meshCall", payload);
+    }
+}
+
+impl Helper {
+    /// Joins a voice channel (C8): as a member, while it has room.
+    fn voice_join(&mut self, space: [u8; 16], channel: [u8; 16]) -> Result<(), Fail> {
+        if !cfg!(feature = "audio") {
+            return Err(Fail(
+                "unavailable",
+                "this Mesh was built without calls".into(),
+            ));
+        }
+        let me = self.unlocked()?.id();
+        let v = (self.space_version(&space))
+            .ok_or_else(|| Fail("not-found", "no such Space".into()))?;
+        if !v.state.members.contains_key(&me.to_bytes()) || v.state.ended {
+            return Err(Fail("not-allowed", "you're not in that Space".into()));
+        }
+        if !v.state.channels.get(&channel).is_some_and(|c| c.voice) {
+            return Err(Fail("not-found", "no such voice channel".into()));
+        }
+        let others = self
+            .calls
+            .voice
+            .get(&(space, channel))
+            .cloned()
+            .unwrap_or_default();
+        if others.len() >= CALL_MAX {
+            return Err(Fail("full", "that voice channel is full".into()));
+        }
+        // One call at a time: joining hangs up the old one.
+        self.call_hangup();
+        self.calls.current = Some(Call {
+            id: voice_call(&channel),
+            with: me,
+            stage: Stage::Voice { space, channel },
+            caller: false,
+            started: Instant::now(),
+            devices: others.keys().copied().collect(),
+            seen: HashMap::new(),
+            #[cfg(feature = "audio")]
+            media: None,
+        });
+        self.call_media()?;
+        self.calls.last_voice_state = Some(Instant::now());
+        self.voice_announce(space, channel, true);
+        self.emit_call(None);
+        self.emit_voice(space, channel);
+        Ok(())
+    }
+
+    /// Tells the Space's members we joined or left: their connected devices,
+    /// and the participants, dialled if need be (C8).
+    fn voice_announce(&self, space: [u8; 16], channel: [u8; 16], joined: bool) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let me = store.id();
+        let Some(v) = self.space_version(&space) else {
+            return;
+        };
+        let inside: HashSet<MeshId> = (self.calls.voice.get(&(space, channel)))
+            .map(|m| m.values().map(|(id, _)| *id).collect())
+            .unwrap_or_default();
+        let members: Vec<(MeshId, bool)> = (v.state.members.keys())
+            .filter_map(|p| MeshId::from_bytes(p).ok())
+            .filter(|id| *id != me)
+            .map(|id| (id, inside.contains(&id)))
+            .collect();
+        let msg = self.voice_msg(space, channel, joined);
+        self.voice_send(members, msg);
+    }
+
+    /// Our voice state, with who we know is in the channel.
+    fn voice_msg(&self, space: [u8; 16], channel: [u8; 16], joined: bool) -> CallMsg {
+        let mut people: Vec<[u8; 32]> = (self.calls.voice.get(&(space, channel)))
+            .map(|m| m.values().map(|(id, _)| id.to_bytes()).collect())
+            .unwrap_or_default();
+        people.sort();
+        people.dedup();
+        CallMsg::Voice {
+            space,
+            channel,
+            joined,
+            people,
+        }
+    }
+
+    /// Sends `msg` to each person's connected devices; those marked are
+    /// dialled first if need be.
+    fn voice_send(&self, to: Vec<(MeshId, bool)>, msg: CallMsg) {
+        let Some(net) = &self.net else { return };
+        for (id, _) in to
+            .iter()
+            .filter(|(id, dial)| *dial && net.node.connected(id).is_empty())
+        {
+            self.dial_back(id, false);
+        }
+        let members = to;
+        let node = net.node.clone();
+        tokio::spawn(async move {
+            for (id, inside) in members {
+                let mut addrs = node.connected(&id);
+                // A participant we're dialling: give the dial a moment.
+                for _ in 0..20 {
+                    if !addrs.is_empty() || !inside {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    addrs = node.connected(&id);
+                }
+                for addr in addrs {
+                    send_to(&node, &addr, &msg).await;
+                }
+            }
+        });
+    }
+
+    /// A participant joined or left a voice channel.
+    fn voice_heard(
+        &mut self,
+        id: MeshId,
+        device: [u8; 32],
+        (space, channel): ([u8; 16], [u8; 16]),
+        joined: bool,
+        people: Vec<[u8; 32]>,
+    ) {
+        let Some(v) = self.space_version(&space) else {
+            return;
+        };
+        let member = v.state.members.contains_key(&id.to_bytes());
+        if joined && !(member && v.state.channels.get(&channel).is_some_and(|c| c.voice)) {
+            return;
+        }
+        let inside = self.calls.voice.entry((space, channel)).or_default();
+        let new = if joined {
+            inside.insert(device, (id, Instant::now())).is_none()
+        } else {
+            inside.remove(&device);
+            false
+        };
+        let ours = (self.calls.current.as_ref())
+            .is_some_and(|c| matches!(c.stage, Stage::Voice { space: s, channel: ch } if s == space && ch == channel));
+        if ours {
+            self.voice_peers(space, channel);
+            // A newcomer learns we're here, and who else is, at once.
+            if new {
+                let msg = self.voice_msg(space, channel, true);
+                self.call_send(&[(id, device)], msg);
+            }
+            // Those they know of and we don't: we tell them we're here.
+            let me = self.store.as_ref().map(|s| s.id().to_bytes());
+            let known: HashSet<[u8; 32]> = (self.calls.voice.get(&(space, channel)))
+                .map(|m| m.values().map(|(p, _)| p.to_bytes()).collect())
+                .unwrap_or_default();
+            let unknown: Vec<(MeshId, bool)> = (people.iter())
+                .filter(|p| {
+                    Some(**p) != me && !known.contains(*p) && v.state.members.contains_key(*p)
+                })
+                .filter_map(|p| MeshId::from_bytes(p).ok())
+                .map(|p| (p, true))
+                .collect();
+            if !unknown.is_empty() {
+                let msg = self.voice_msg(space, channel, true);
+                self.voice_send(unknown, msg);
+            }
+        }
+        self.emit_voice(space, channel);
+    }
+
+    /// The current voice call's peers, from who's in its channel.
+    fn voice_peers(&mut self, space: [u8; 16], channel: [u8; 16]) {
+        let devices: HashSet<[u8; 32]> = (self.calls.voice.get(&(space, channel)))
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        if let Some(call) = self.calls.current.as_mut() {
+            #[cfg(feature = "audio")]
+            if let Some(m) = &call.media {
+                m.set_peers(devices.iter().copied());
+            }
+            call.devices = devices;
+        }
+    }
+
+    /// Every second: stale and removed participants go; in a voice channel,
+    /// its connections stay up and we say we're here every 30 s.
+    fn voice_tick(&mut self, now: Instant) {
+        let mut changed = Vec::new();
+        let keys: Vec<([u8; 16], [u8; 16])> = self.calls.voice.keys().copied().collect();
+        for (space, channel) in keys {
+            let members = self.space_version(&space).map(|v| v.state.members);
+            let Some(people) = self.calls.voice.get_mut(&(space, channel)) else {
+                continue;
+            };
+            let before = people.len();
+            people.retain(|_, (id, at)| {
+                now.duration_since(*at) < VOICE_STALE
+                    && members
+                        .as_ref()
+                        .is_some_and(|m| m.contains_key(&id.to_bytes()))
+            });
+            if people.len() != before {
+                changed.push((space, channel));
+            }
+        }
+        for (space, channel) in changed {
+            self.voice_peers(space, channel);
+            self.emit_voice(space, channel);
+        }
+        let Some(Stage::Voice { space, channel }) = self.calls.current.as_ref().map(|c| &c.stage)
+        else {
+            return;
+        };
+        let (space, channel) = (*space, *channel);
+        // Kicked, banned, or the channel's gone: out.
+        let me = self.store.as_ref().map(|s| s.id().to_bytes());
+        let still = self.space_version(&space).is_some_and(|v| {
+            me.is_some_and(|me| v.state.members.contains_key(&me))
+                && !v.state.ended
+                && v.state.channels.get(&channel).is_some_and(|c| c.voice)
+        });
+        if !still {
+            self.call_end("removed", false);
+            return self.emit_voice(space, channel);
+        }
+        if self
+            .calls
+            .last_keep
+            .is_none_or(|t| now.duration_since(t) >= KEEP_EVERY)
+        {
+            self.calls.last_keep = Some(now);
+            let ids: HashSet<MeshId> = (self.calls.voice.get(&(space, channel)))
+                .map(|m| m.values().map(|(id, _)| *id).collect())
+                .unwrap_or_default();
+            for id in &ids {
+                self.wire.used(id, now);
+            }
+        }
+        if self
+            .calls
+            .last_voice_state
+            .is_none_or(|t| now.duration_since(t) >= VOICE_STATE_EVERY)
+        {
+            self.calls.last_voice_state = Some(now);
+            self.voice_announce(space, channel, true);
+        }
+    }
+
+    /// Who's in a voice channel, by ID: those we've heard, and us if we're in.
+    fn voice_people(&self, space: [u8; 16], channel: [u8; 16]) -> Vec<String> {
+        let mut people: Vec<String> = (self.calls.voice.get(&(space, channel)))
+            .map(|m| m.values().map(|(id, _)| id.to_string()).collect())
+            .unwrap_or_default();
+        let ours = (self.calls.current.as_ref())
+            .is_some_and(|c| matches!(c.stage, Stage::Voice { space: s, channel: ch } if s == space && ch == channel));
+        if let (true, Some(store)) = (ours, &self.store) {
+            people.push(store.id().to_string());
+        }
+        people.sort();
+        people.dedup();
+        people
+    }
+
+    /// `meshVoice`: who's in one voice channel now.
+    fn emit_voice(&self, space: [u8; 16], channel: [u8; 16]) {
         emit(
-            "meshCall",
-            json!({
-                "state": state,
-                "id": hex8(&call.id),
-                "with": call.with.to_string(),
-                "caller": call.caller,
-                "muted": self.calls.muted,
-                "deafened": self.calls.deafened,
-                "speaking": speaking,
-                "outcome": outcome,
-            }),
+            "meshVoice",
+            json!({ "space": hex(&space), "channel": hex(&channel), "people": self.voice_people(space, channel) }),
         );
     }
 }
@@ -574,7 +911,7 @@ pub async fn serve(
 ) {
     let read = mesh_transport::frame::read_frame(&mut stream.recv);
     if let Ok(Ok(Some(frame))) = tokio::time::timeout(wait, read).await
-        && frame.len() <= 64
+        && frame.len() <= 512
         && let Ok(msg) = postcard::from_bytes::<CallMsg>(&frame)
     {
         let (id, device) = (stream.peer.id, *stream.peer.device.as_bytes());

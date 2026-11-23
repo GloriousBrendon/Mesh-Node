@@ -236,3 +236,181 @@ fn declined_unreachable_and_muted() {
     }
     let _ = (w.a.h.quit(), w.b.h.quit());
 }
+
+/// Waits until `p` clearly hears every one of `yes` and not `no`.
+fn hears_all(p: &Person, yes: &[f64], no: f64) {
+    let started = Instant::now();
+    loop {
+        let got: Vec<f64> = yes.iter().map(|hz| strength(&p.heard, *hz)).collect();
+        let own = strength(&p.heard, no);
+        if got.iter().all(|s| *s > 0.35) && own < 0.2 {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{yes:?}: {got:.2?}, own {no}: {own:.2}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// The longest run of silence (in samples) in the last second heard.
+fn longest_gap(heard: &Path) -> usize {
+    let bytes = std::fs::read(heard).unwrap_or_default();
+    let samples: Vec<i16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
+        .collect();
+    let tail = &samples[samples.len().saturating_sub(48_000)..];
+    let (mut run, mut longest) = (0, 0);
+    for s in tail {
+        run = if s.unsigned_abs() < 50 { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+fn ask(h: &mut Helper, func: &str, args: &[&str], binding: &str) -> Value {
+    h.send(func, args);
+    loop {
+        let (got, payload) = h.event();
+        if got == binding || got == "meshError" {
+            assert_eq!(got, binding, "{func} answered {payload}");
+            return payload;
+        }
+    }
+}
+
+fn voice(people: &Value) -> Vec<String> {
+    let mut v: Vec<String> = (people["people"].as_array().unwrap().iter())
+        .map(|p| p.as_str().unwrap().to_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Tests 3 and 4 at four members: O makes a voice channel; O, B and C join
+/// and each hears the other two (and not themselves); D, outside it, sees
+/// the three. B leaves and is dropped; O kicks C, who is out of the channel
+/// and can't come back.
+#[test]
+fn a_voice_channel() {
+    let relay = Relay::start();
+    let dirs = ["seed", "o", "b", "c", "d"].map(|n| temp_dir(&format!("calls-voice-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut o = person(&dirs[1], &relay, &ticket, "owen", "440");
+    let mut b = person(&dirs[2], &relay, &ticket, "ben", "660");
+    let mut c = person(&dirs[3], &relay, &ticket, "cal", "880");
+    let mut d = person(&dirs[4], &relay, &ticket, "dee", "1100");
+    for p in [&mut b, &mut c, &mut d] {
+        friends(&mut o, p);
+    }
+    let made = ask(&mut o.h, "spaceCreate", &["club"], "meshSpaces");
+    let s = made["spaces"][0]["id"].as_str().unwrap().to_owned();
+    let made = ask(
+        &mut o.h,
+        "spaceVoiceChannel",
+        &[&s, "lounge", ""],
+        "meshSpaces",
+    );
+    let lounge = made["spaces"][0]["channels"][0].clone();
+    assert_eq!(lounge["voice"], true, "{lounge}");
+    let v = lounge["id"].as_str().unwrap().to_owned();
+    for p in [&b, &c, &d] {
+        ask(&mut o.h, "spaceAdd", &[&s, &p.id], "meshSpaces");
+    }
+    for p in [&mut b, &mut c, &mut d] {
+        until(&mut p.h, "meshSpaces", |l| {
+            l["spaces"][0]["members"]
+                .as_array()
+                .is_some_and(|m| m.len() == 4)
+        });
+    }
+    // A member can't make one.
+    let err = ask(
+        &mut b.h,
+        "spaceVoiceChannel",
+        &[&s, "mine", ""],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+
+    let mut inside = vec![o.id.clone(), b.id.clone(), c.id.clone()];
+    inside.sort();
+    for p in [&mut o, &mut b, &mut c] {
+        p.h.send("voiceJoin", &[&s, &v]);
+        call_state(&mut p.h, "live");
+    }
+    hears_all(&o, &[660.0, 880.0], 440.0);
+    hears_all(&b, &[440.0, 880.0], 660.0);
+    hears_all(&c, &[440.0, 660.0], 880.0);
+    until(&mut d.h, "meshVoice", |m| voice(m) == inside);
+
+    b.h.send("voiceLeave", &[]);
+    assert_eq!(call_state(&mut b.h, "ended")["outcome"], "left");
+    let mut two = vec![o.id.clone(), c.id.clone()];
+    two.sort();
+    for p in [&mut o, &mut c, &mut d] {
+        until_for(&mut p.h, "meshVoice", Duration::from_secs(5), |m| {
+            voice(m) == two
+        });
+    }
+
+    ask(&mut o.h, "spaceKick", &[&s, &c.id], "meshSpaces");
+    assert_eq!(call_state(&mut c.h, "ended")["outcome"], "removed");
+    let alone = vec![o.id.clone()];
+    until_for(&mut o.h, "meshVoice", Duration::from_secs(5), |m| {
+        voice(m) == alone
+    });
+    c.h.send("voiceJoin", &[&s, &v]);
+    until(&mut c.h, "meshError", |e| e["fn"] == "voiceJoin");
+    let _ = (o.h.quit(), b.h.quit(), c.h.quit(), d.h.quit());
+}
+
+/// Test 5: with 10% of B's incoming voice dropped, B still hears A's tone
+/// with no gap over 60 ms (concealment and FEC fill them).
+#[test]
+fn a_lossy_path() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a", "b"].map(|n| temp_dir(&format!("calls-loss-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut a = person(&dirs[1], &relay, &ticket, "ann", "440");
+    let heard = dirs[2].join("heard.raw");
+    let mut h = Helper::start_with(
+        &dirs[2],
+        &relay,
+        &[
+            "--seed",
+            &ticket,
+            "--record-ttl",
+            TTL,
+            "--tone",
+            "660",
+            "--heard",
+            heard.to_str().unwrap(),
+            "--drop",
+            "10",
+        ],
+    );
+    assert_eq!(h.event().0, "meshIdentity");
+    let id = h.expect("idCreate", &["ben", PASSWORD], "meshIdentity")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.net_state("online");
+    let mut b = Person { h, id, heard };
+    friends(&mut a, &mut b);
+    a.h.send("callStart", &[&b.id]);
+    call_state(&mut b.h, "ringing");
+    b.h.send("callAnswer", &[]);
+    call_state(&mut a.h, "live");
+    hears(&b, 440.0, 660.0);
+    std::thread::sleep(Duration::from_secs(2));
+    let gap = longest_gap(&b.heard);
+    assert!(gap <= 2_880, "a gap of {} ms", gap / 48);
+    let _ = (a.h.quit(), b.h.quit());
+}

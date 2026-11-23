@@ -554,7 +554,7 @@ fn hex16(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn parse16(text: &str, what: &str) -> Result<[u8; 16], Fail> {
+pub(super) fn parse16(text: &str, what: &str) -> Result<[u8; 16], Fail> {
     let bad = || Fail("bad-args", format!("that isn't a {what} ID"));
     if text.len() != 32 {
         return Err(bad());
@@ -729,6 +729,7 @@ impl Helper {
                         "name": c.name,
                         "category": c.category.as_ref().map(hex16),
                         "adminsPost": c.admins_post,
+                        "voice": c.voice,
                         "unread": unread,
                         "mentions": mentions,
                     })
@@ -1851,6 +1852,21 @@ impl Helper {
                     name: arg(1)?.trim().to_owned(),
                     category,
                     admins_post,
+                };
+                self.space_change(&space, change)?;
+            }
+            // A voice channel (SPEC-calls C8): [Space, name, category or ""].
+            "spaceVoiceChannel" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let nonce = mesh_dm::space::nonce().ok_or_else(|| space_fail("no randomness"))?;
+                let category = match args.get(2).map(String::as_str) {
+                    None | Some("") => None,
+                    Some(c) => Some(parse16(c, "category")?),
+                };
+                let change = Change::VoiceChannelCreate {
+                    nonce,
+                    name: arg(1)?.trim().to_owned(),
+                    category,
                 };
                 self.space_change(&space, change)?;
             }

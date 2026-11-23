@@ -187,6 +187,13 @@ pub enum Change {
     CategoryDelete(CategoryId),
     /// The owner ends the Space.
     End,
+    /// A voice channel (SPEC-calls C8). Last, so every earlier change keeps
+    /// its encoding; an engine without it can't read it, and refuses it.
+    VoiceChannelCreate {
+        nonce: [u8; 16],
+        name: String,
+        category: Option<CategoryId>,
+    },
 }
 
 /// The fields a device signs: everything but the signature.
@@ -329,6 +336,7 @@ impl SpaceEvent {
                 Change::Add { display, .. } => long(display, MAX_DISPLAY_NAME, "name")?,
                 Change::Rename(name) => long(name, MAX_SPACE_NAME, "space name")?,
                 Change::ChannelCreate { name, .. }
+                | Change::VoiceChannelCreate { name, .. }
                 | Change::ChannelRename { name, .. }
                 | Change::CategoryCreate { name, .. }
                 | Change::CategoryRename { name, .. } => {
@@ -366,6 +374,8 @@ pub struct Channel {
     pub position: u16,
     /// Only admins post (S3).
     pub admins_post: bool,
+    /// A voice channel: people join it to talk (SPEC-calls C8).
+    pub voice: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,20 +652,31 @@ fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> O
             && v.channels.len() < MAX_CHANNELS
             && category.is_none_or(|c| v.categories.contains_key(&c)) =>
         {
-            let channel = part_id(space, nonce);
-            if v.channels.contains_key(&channel) || v.categories.contains_key(&channel) {
-                return None;
-            }
-            let position = u16::try_from(v.channels.len()).unwrap_or(u16::MAX);
-            next.channels.insert(
-                channel,
-                Channel {
-                    name: name.clone(),
-                    category: *category,
-                    position,
-                    admins_post: *admins_post,
-                },
-            );
+            let c = Channel {
+                name: name.clone(),
+                category: *category,
+                position: 0,
+                admins_post: *admins_post,
+                voice: false,
+            };
+            add_channel(&mut next, v, part_id(space, nonce), c)?;
+        }
+        Change::VoiceChannelCreate {
+            nonce,
+            name,
+            category,
+        } if admin
+            && v.channels.len() < MAX_CHANNELS
+            && category.is_none_or(|c| v.categories.contains_key(&c)) =>
+        {
+            let c = Channel {
+                name: name.clone(),
+                category: *category,
+                position: 0,
+                admins_post: false,
+                voice: true,
+            };
+            add_channel(&mut next, v, part_id(space, nonce), c)?;
         }
         Change::ChannelRename { channel, name } if admin => {
             next.channels.get_mut(channel)?.name = name.clone();
@@ -707,6 +728,16 @@ fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> O
         _ => return None,
     }
     Some(next)
+}
+
+/// Adds channel `c` to `next`, last in order; `None` if its ID is taken.
+fn add_channel(next: &mut SpaceState, v: &SpaceState, id: ChannelId, mut c: Channel) -> Option<()> {
+    if v.channels.contains_key(&id) || v.categories.contains_key(&id) {
+        return None;
+    }
+    c.position = u16::try_from(v.channels.len()).unwrap_or(u16::MAX);
+    next.channels.insert(id, c);
+    Some(())
 }
 
 /// Why a Space event doesn't count (S5).
@@ -1025,6 +1056,27 @@ pub(crate) mod tests {
         fn counts(by: Person, change: Change) -> bool {
             let v = version(&with(base(), &[(50, by, Some(7), change, 50)]));
             v.head == [50; 16]
+        }
+
+        /// A voice channel (SPEC-calls C8): an admin's to make, as a text
+        /// channel is, and marked voice.
+        #[test]
+        fn a_voice_channel() {
+            let voice = Change::VoiceChannelCreate {
+                nonce: [8; 16],
+                name: "lounge".into(),
+                category: None,
+            };
+            assert!(!counts(B, voice.clone()), "a member can't");
+            assert!(counts(X, voice.clone()), "an admin can");
+            let v = version(&with(base(), &[(50, X, Some(7), voice, 50)]));
+            let c = v
+                .state
+                .channels
+                .values()
+                .find(|c| c.name == "lounge")
+                .unwrap();
+            assert!(c.voice && !c.admins_post);
         }
 
         #[test]
