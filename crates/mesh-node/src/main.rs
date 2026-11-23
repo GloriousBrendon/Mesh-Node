@@ -29,12 +29,16 @@
 //! three seeds.
 
 mod addrs;
+#[cfg(feature = "audio")]
+mod audio;
 mod codes;
 mod e2ee;
 mod helper;
 mod knocks;
 mod maillog;
 mod mailstore;
+#[cfg(feature = "audio")]
+mod media;
 mod routing;
 mod saved;
 mod seed;
@@ -215,6 +219,8 @@ fn main() {
             crash_at_records: args
                 .windows(2)
                 .any(|w| w[0] == "--crash-at" && w[1] == "records"),
+            #[cfg(feature = "audio")]
+            audio: audio_options(&args),
         };
         runtime.block_on(helper::run(&dir, relays, seeds, options));
     }
@@ -317,6 +323,30 @@ fn default_data_dir() -> Option<PathBuf> {
         env("XDG_DATA_HOME").or_else(|| env("HOME").map(|h| h.join(".local/share")))?
     };
     Some(base.join("mesh").join("node"))
+}
+
+/// The calls' test flags (SPEC-calls *Acceptance tests*): `--tone <hz>`
+/// for the microphone, `--heard <file>` for the speakers, and `--drop
+/// <percent>` of incoming voice.
+#[cfg(feature = "audio")]
+fn audio_options(args: &[String]) -> media::Io {
+    let value = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let fail = |msg: &str| -> ! {
+        eprintln!("mesh-node: {msg}");
+        std::process::exit(2);
+    };
+    media::Io {
+        tone: value("--tone").map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| fail("--tone takes a frequency in Hz"))
+        }),
+        heard: value("--heard").map(PathBuf::from),
+        drop: value("--drop").map_or(0, |v| match v.parse::<u8>() {
+            Ok(p) if p <= 100 => p,
+            _ => fail("--drop takes 0 to 100"),
+        }),
+        ..media::Io::default()
+    }
 }
 
 #[cfg(test)]

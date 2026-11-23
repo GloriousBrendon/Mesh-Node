@@ -50,6 +50,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
+#[path = "calls.rs"]
+mod calls;
 #[path = "dm.rs"]
 mod dm;
 #[path = "files.rs"]
@@ -192,6 +194,9 @@ pub struct Options {
     pub holders: Vec<String>,
     /// `--crash-at records` (tests only).
     pub crash_at_records: bool,
+    /// `--tone`, `--heard` and `--drop` (tests only, SPEC-calls).
+    #[cfg(feature = "audio")]
+    pub audio: crate::media::Io,
 }
 
 /// Reads commands until stdin closes (Mesh quit or restarted us).
@@ -203,6 +208,10 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     helper.holders = options.holders;
     helper.cut_live = options.cut.live;
     helper.crash_at_records = options.crash_at_records;
+    #[cfg(feature = "audio")]
+    {
+        helper.calls.io = options.audio;
+    }
     if options.cut.seed {
         helper.cut = Some(std::mem::take(&mut helper.seeds));
     }
@@ -232,6 +241,8 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
         (helper.wire.idle() / 2).clamp(Duration::from_millis(500), spaces::PEER_TICK),
     );
     peers.tick().await;
+    let mut calls = tokio::time::interval(Duration::from_secs(1));
+    calls.tick().await;
     loop {
         let mut line = tokio::select! {
             line = lines.recv() => match line {
@@ -269,6 +280,10 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
             }
             _ = peers.tick() => {
                 helper.peer_tick();
+                continue;
+            }
+            _ = calls.tick() => {
+                helper.call_tick();
                 continue;
             }
         };
@@ -394,6 +409,8 @@ struct Helper {
     space_mailed: HashMap<[u8; 32], std::time::Instant>,
     /// When each device last said it was typing (rate limit, D10).
     typing_last: HashMap<[u8; 32], std::time::Instant>,
+    /// The call, if any (SPEC-calls).
+    calls: calls::Calls,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -469,6 +486,13 @@ enum Back {
     DmAnswered(Box<Answered>),
     /// Time to send again to a device that answered `failed`.
     DmRetry([u8; 32]),
+    /// How a call's invites went (SPEC-calls C7).
+    CallInvited([u8; 8], Vec<([u8; 32], calls::Invited)>),
+    /// A call control message: whose, which device, what.
+    Call(Box<(MeshId, [u8; 32], calls::CallMsg)>),
+    /// Who's speaking in the call changed (device keys); only with audio.
+    #[cfg_attr(not(feature = "audio"), allow(dead_code))]
+    Speaking(Vec<[u8; 32]>),
     /// A typing signal: whose, which device, the frame (D10).
     Typing(Box<(MeshId, [u8; 32], Vec<u8>)>),
     /// Someone asks for a kept file's chunks: whose, the file's hash, and
@@ -567,6 +591,7 @@ impl Helper {
             space_mailed: HashMap::new(),
             typing_last: HashMap::new(),
             mail: mail::Mail::default(),
+            calls: calls::Calls::default(),
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -884,6 +909,7 @@ impl Helper {
             "deviceRemove" => self.remove_device(arg(0)?)?,
             "linkStart" => self.link_start()?,
             f if f.starts_with("dm") => self.dm_command(f, args)?,
+            f if f.starts_with("call") => self.call_command(f, args)?,
             f if f.starts_with("space") => self.space_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
             "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
@@ -1137,6 +1163,12 @@ impl Helper {
                 let (id, device, frame) = *got;
                 return self.typing_heard(id, device, frame);
             }
+            Back::CallInvited(id, rang) => return self.call_invited(id, rang),
+            Back::Call(got) => {
+                let (id, device, msg) = *got;
+                return self.call_heard(id, device, msg);
+            }
+            Back::Speaking(who) => return self.call_speaking(who),
             Back::DmAnswered(got) => {
                 let (id, addr, numbers, answers) = *got;
                 return self.dm_answered(id, addr, numbers, answers);
@@ -1829,6 +1861,7 @@ impl Helper {
                 dm::TYPING.to_owned(),
                 files::BLOB.to_owned(),
                 spaces::SPACE_HISTORY.to_owned(),
+                calls::CALL.to_owned(),
             ],
             ..Config::default()
         };
@@ -1879,6 +1912,8 @@ impl Helper {
 
     /// Closes every connection (they're told it's locked) and the node.
     async fn stop_net(&mut self) {
+        // Locking or quitting hangs up.
+        self.call_hangup_now();
         if let Some(net) = self.net.take() {
             net.watch.abort();
             net.peers.abort();
@@ -2196,6 +2231,10 @@ async fn serve_streams(
         if stream.service == files::BLOB {
             let (dir, open) = (blobs.clone(), blob_streams.clone());
             tokio::spawn(files::serve_blob(stream, dir, back, open));
+            continue;
+        }
+        if stream.service == calls::CALL {
+            tokio::spawn(calls::serve(stream, back.clone(), SYNC_TIMEOUT));
             continue;
         }
         if stream.service == dm::TYPING {

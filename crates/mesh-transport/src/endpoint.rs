@@ -31,6 +31,9 @@ const IDLE: u32 = 7;
 const ACCEPTED_QUEUE: usize = 64;
 /// Service streams waiting for `next_stream`; past this, new ones are reset.
 const STREAM_QUEUE: usize = 64;
+/// Datagrams received and not yet read; past this, new ones are dropped
+/// (a late voice packet is no use anyway). About 2 s of a full call.
+const DATAGRAM_QUEUE: usize = 1024;
 /// Stream reset codes: an unknown service, and a busy one.
 const UNKNOWN_SERVICE: u32 = 1;
 const BUSY: u32 = 2;
@@ -41,6 +44,7 @@ pub struct Node {
     shared: Arc<Shared>,
     accepted: tokio::sync::Mutex<mpsc::Receiver<Peer>>,
     streams: tokio::sync::Mutex<mpsc::Receiver<ServiceStream>>,
+    datagrams: tokio::sync::Mutex<mpsc::Receiver<(Peer, Vec<u8>)>>,
 }
 
 /// What the node's tasks share.
@@ -57,6 +61,7 @@ struct Shared {
     accepted: mpsc::Sender<Peer>,
     services: Vec<String>,
     streams: mpsc::Sender<ServiceStream>,
+    datagrams: mpsc::Sender<(Peer, Vec<u8>)>,
     allow: crate::Allow,
 }
 
@@ -108,6 +113,7 @@ impl Node {
             .map_err(|e| TransportError::Bind(e.to_string()))?;
         let (tx, rx) = mpsc::channel(ACCEPTED_QUEUE);
         let (streams_tx, streams_rx) = mpsc::channel(STREAM_QUEUE);
+        let (datagrams_tx, datagrams_rx) = mpsc::channel(DATAGRAM_QUEUE);
         let shared = Arc::new(Shared {
             cert: cert.to_bytes(),
             conns: Mutex::new(HashMap::new()),
@@ -116,6 +122,7 @@ impl Node {
             accepted: tx,
             services: config.services,
             streams: streams_tx,
+            datagrams: datagrams_tx,
             allow: config.allow,
         });
         tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
@@ -124,6 +131,7 @@ impl Node {
             shared,
             accepted: tokio::sync::Mutex::new(rx),
             streams: tokio::sync::Mutex::new(streams_rx),
+            datagrams: tokio::sync::Mutex::new(datagrams_rx),
         })
     }
 
@@ -254,6 +262,17 @@ impl Node {
     /// The next stream another device opened for one of `Config::services`.
     pub async fn next_stream(&self) -> Option<ServiceStream> {
         self.streams.lock().await.recv().await
+    }
+
+    /// Sends one unreliable datagram to `device` on its open connection
+    /// (SPEC-calls C2): false if there's none, or it doesn't fit.
+    pub fn send_datagram(&self, device: &iroh::PublicKey, data: Vec<u8>) -> bool {
+        (self.shared.open(device)).is_some_and(|(_, conn)| conn.send_datagram(data.into()).is_ok())
+    }
+
+    /// The next datagram any connected device sent us, and who sent it.
+    pub async fn next_datagram(&self) -> Option<(Peer, Vec<u8>)> {
+        self.datagrams.lock().await.recv().await
     }
 
     /// The next peer that connected to us and passed the handshake; `None`
@@ -388,6 +407,11 @@ impl Shared {
             (peer.clone(), conn.clone()),
         );
         drop(conns);
+        tokio::spawn(read_datagrams(
+            self.datagrams.clone(),
+            peer.clone(),
+            conn.clone(),
+        ));
         tokio::spawn(serve(self.clone(), peer, conn));
         Ok(())
     }
@@ -479,6 +503,14 @@ async fn next_bi(
             }
             Err(_) => {}
         }
+    }
+}
+
+/// Passes on a connection's datagrams until it closes; dropped when nobody
+/// keeps up.
+async fn read_datagrams(to: mpsc::Sender<(Peer, Vec<u8>)>, peer: Peer, conn: Connection) {
+    while let Ok(data) = conn.read_datagram().await {
+        let _ = to.try_send((peer.clone(), data.to_vec()));
     }
 }
 

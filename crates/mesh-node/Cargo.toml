@@ -17,6 +17,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+cpal = { workspace = true, optional = true }
+opus = { workspace = true, optional = true }
+
+[features]
+default = ["audio"]
+# Calls' audio (SPEC-calls C4). The seed's image builds without it: no ALSA
+# or CMake there, and a seed makes no calls.
+audio = ["dep:cpal", "dep:opus"]
 
 [dev-dependencies]
 # A plain-http relay on loopback for the two-helper test, so the helper never

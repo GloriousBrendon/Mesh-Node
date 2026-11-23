@@ -2323,7 +2323,7 @@ impl Helper {
     }
 
     /// An ordinary dial, reported back either way: a hello, or a send's.
-    fn dial_back(&self, id: &MeshId, hello: bool) {
+    pub(super) fn dial_back(&self, id: &MeshId, hello: bool) {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
         };

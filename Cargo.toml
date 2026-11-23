@@ -50,6 +50,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # Pinned; no libolm compatibility, no precomputed tables.
 vodozemac = { version = "=0.11.2", default-features = false }
 
+# Calls (SPEC-calls C4, Q1): microphone and speakers, and the Opus codec, as
+# Mesh-Voice already uses them (same versions). opus bundles libopus (CMake).
+cpal = "0.18"
+opus = "0.3"
+
 mesh-dm = { path = "crates/mesh-dm" }
 mesh-e2ee = { path = "crates/mesh-e2ee" }
 mesh-identity = { path = "crates/mesh-identity" }

@@ -485,3 +485,26 @@ async fn a_fixed_port_is_the_one_bound() {
     let peer = c.dial(&fixed).await.expect("dial the fixed port");
     assert_eq!(peer.id, seed.id());
 }
+
+/// Datagrams (SPEC-calls C2): one each way on the connection a dial made,
+/// tagged with who sent it; none to a device with no connection.
+#[tokio::test]
+async fn datagrams_go_both_ways() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let (a, b) = (alice.node("a").await, bob.node("b").await);
+    let to_b = addr_of(&b);
+    let (dev_a, dev_b) = (a.addr().device, to_b.device);
+    assert!(!a.send_datagram(&dev_b, vec![1]), "no connection yet");
+    a.dial(&to_b).await.unwrap();
+    assert!(a.send_datagram(&dev_b, b"hi bob".to_vec()));
+    let (from, data) = wait(&b).await;
+    assert_eq!((from.id, data.as_slice()), (alice.id(), &b"hi bob"[..]));
+    assert!(b.send_datagram(&dev_a, b"hi alice".to_vec()));
+    let (from, data) = wait(&a).await;
+    assert_eq!((from.id, data.as_slice()), (bob.id(), &b"hi alice"[..]));
+}
+
+async fn wait(n: &Node) -> (mesh_transport::Peer, Vec<u8>) {
+    let got = tokio::time::timeout(Duration::from_secs(5), n.next_datagram()).await;
+    got.expect("a datagram in 5 s").expect("the node is open")
+}

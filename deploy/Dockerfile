@@ -3,7 +3,8 @@
 FROM rust:1.99-trixie AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p mesh-node && strip target/release/mesh-node
+# No `audio`: a seed makes no calls, and the image has no ALSA or CMake.
+RUN cargo build --release --locked -p mesh-node --no-default-features && strip target/release/mesh-node
 # An empty /data owned by the runtime user: a new named volume copies it, so
 # the seed can write its key without root.
 RUN mkdir /data
