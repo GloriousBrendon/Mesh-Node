@@ -1064,6 +1064,49 @@ fn typing_shows_in_a_channel() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// Files in a channel, as in a DM (S12, Task 11b): B posts one in #general,
+/// and C, a member who isn't B's friend, fetches it from B's device.
+#[test]
+fn a_file_goes_to_a_channel() {
+    let mut k = club("spaces-file");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let plain: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let dir = temp_dir(&format!("spaces-file-src-{}", k.space));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("map.png");
+    std::fs::write(&source, &plain).unwrap();
+    let sent = ask(
+        &mut k.b,
+        "spaceSendFile",
+        &[&s, &g, source.to_str().unwrap()],
+        "meshSpaceMessages",
+    );
+    let line = &sent["events"][0];
+    let file = &line["attachments"][0];
+    assert_eq!(
+        (
+            file["name"].as_str(),
+            file["mime"].as_str(),
+            file["size"].as_u64()
+        ),
+        (Some("map.png"), Some("image/png"), Some(200_000)),
+        "{line}"
+    );
+    let message = line["id"].as_str().unwrap().to_owned();
+    let told = until(&mut k.c, "meshSpaceNotify", |n| n["channel"] == g);
+    assert_eq!(told["text"], "map.png", "a file's name when it has no text");
+    let got = ask(
+        &mut k.c,
+        "spaceFetch",
+        &[&s, &g, &message, "0"],
+        "meshDmFile",
+    );
+    assert_eq!(got["id"], s.as_str(), "{got}");
+    let path = got["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), plain, "the same bytes");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use mesh_dm::Where;
 use mesh_dm::space::SpaceId;
 use mesh_dm::space_store::{SpaceHistory, SpaceList};
 use mesh_identity::MeshId;
@@ -522,7 +523,15 @@ struct Fork {
     made: u8,
 }
 
-/// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
+/// What a notification shows of a post: its text, or a file's name if it
+/// has none (as a DM's).
+fn post_text(text: &str, attachments: &[mesh_dm::event::Attachment]) -> String {
+    match attachments.first() {
+        Some(file) if text.is_empty() => file.name.clone(),
+        _ => text.to_owned(),
+    }
+}
+
 /// `meshSpaceNotify`: someone else's post, new to us, and whether it
 /// mentions us.
 fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str, mention: bool) {
@@ -540,6 +549,7 @@ fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str
     }
 }
 
+/// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
 fn hex16(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -636,7 +646,7 @@ impl Helper {
     }
 
     /// A Space's version: from its opened history, else its chain alone.
-    fn space_version(&self, space: &SpaceId) -> Option<SpaceVersion> {
+    pub(super) fn space_version(&self, space: &SpaceId) -> Option<SpaceVersion> {
         if let Some(h) = self.space_open.get(space) {
             return h.version();
         }
@@ -1289,11 +1299,17 @@ impl Helper {
                 Ok(Taken::Shown) => {
                     if is_change {
                         changed.push(space);
-                    } else if let SpaceBody::Post { channel, text, .. } = &event.body
+                    } else if let SpaceBody::Post {
+                        channel,
+                        text,
+                        attachments,
+                        ..
+                    } = &event.body
                         && author.person != me.to_bytes()
                     {
                         let mention = history.mentions_me(&event, &author.person);
-                        notify_post(&space, channel, &author.person, text, mention);
+                        let text = post_text(text, attachments);
+                        notify_post(&space, channel, &author.person, &text, mention);
                         if self.space_view == Some((space, *channel)) {
                             let _ = self.emit_channel(&space, channel);
                         }
@@ -1662,13 +1678,22 @@ impl Helper {
         // Posts written after our add, by others: news, however it came.
         let news: Vec<Option<(ChannelId, Person, String, bool)>> = (good.iter())
             .map(|(e, author)| match &e.body {
-                SpaceBody::Post { channel, text, .. }
-                    if Some(author.person) != me
-                        && joined_at.is_some_and(|t| e.time + JOIN_CLOCK_TOLERANCE >= t) =>
+                SpaceBody::Post {
+                    channel,
+                    text,
+                    attachments,
+                    ..
+                } if Some(author.person) != me
+                    && joined_at.is_some_and(|t| e.time + JOIN_CLOCK_TOLERANCE >= t) =>
                 {
                     let mention = (self.space_open.get(&space))
                         .is_some_and(|h| h.mentions_me(e, &author.person));
-                    Some((*channel, author.person, text.clone(), mention))
+                    Some((
+                        *channel,
+                        author.person,
+                        post_text(text, attachments),
+                        mention,
+                    ))
                 }
                 _ => None,
             })
@@ -1855,6 +1880,56 @@ impl Helper {
                     None => Change::Rename(name),
                 };
                 self.space_command_change(&space, change)?;
+            }
+            "spaceSendFile" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let me = self.me_sender()?.person;
+                let v = self.space_mut(&space)?.version().ok_or_else(not_found)?;
+                if !v.state.may_post(&me, &channel) && !self.unchecked() {
+                    return Err(not_allowed());
+                }
+                // ponytail: kept under the Space's ID as a group's would be; a Where::Space if blobs need telling apart.
+                let file = self.keep_attachment(arg(2)?, args.get(3), Where::Group(space))?;
+                let body = SpaceBody::Post {
+                    channel,
+                    text: String::new(),
+                    reply_to: None,
+                    attachments: vec![file],
+                    mentions: Vec::new(),
+                    everyone: false,
+                };
+                self.space_send_line(&space, &channel, body)?;
+            }
+            "spaceFetch" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let channel = parse16(arg(1)?, "channel")?;
+                let message = parse16(arg(2)?, "message")?;
+                let index: usize = (arg(3)?.parse())
+                    .map_err(|_| Fail("bad-args", "that isn't an attachment".to_owned()))?;
+                let me = self.me_sender()?.person;
+                let chat =
+                    (self.space_mut(&space)?.channel(&channel, now_ms())).map_err(space_fail)?;
+                let file = (chat.messages().iter())
+                    .find(|m| m.id == message)
+                    .ok_or_else(not_found)?
+                    .attachments
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| Fail("not-found", "no such attachment".to_owned()))?;
+                let v = self.space_version(&space).ok_or_else(not_found)?;
+                let members = (v.state.members.keys())
+                    .filter(|p| **p != me)
+                    .filter_map(|p| MeshId::from_bytes(p).ok())
+                    .collect();
+                // Opened as a DM's file (`meshDmFile`), its `id` the Space's.
+                self.fetch_attachment(
+                    Where::Group(space),
+                    arg(2)?.to_owned(),
+                    index,
+                    file,
+                    members,
+                )?;
             }
             "spaceTyping" => {
                 let space = parse16(arg(0)?, "Space")?;

@@ -155,9 +155,15 @@ impl Helper {
             Some(*id) == me
                 || match at {
                     Where::Direct(p) => *p == id.to_bytes(),
-                    Where::Group(_) => (self.dm.as_ref())
-                        .and_then(|h| h.members(at))
-                        .is_some_and(|m| m.contains(&id.to_bytes())),
+                    // A group's members, or a Space's: its files are kept
+                    // under the Space's ID (Task 11b).
+                    Where::Group(g) => {
+                        (self.dm.as_ref())
+                            .and_then(|h| h.members(at))
+                            .is_some_and(|m| m.contains(&id.to_bytes()))
+                            || (self.space_version(g))
+                                .is_some_and(|v| v.state.members.contains_key(&id.to_bytes()))
+                    }
                 }
         })
     }
@@ -219,34 +225,7 @@ impl Helper {
         let blobs = self.blobs()?;
         match func {
             "dmSendFile" => {
-                let source = Path::new(arg(1)?);
-                let name = (source.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let (key, hash, size) = blobs.add_file(source, at).map_err(|e| {
-                    let too_big = e.get_ref().and_then(|e| e.downcast_ref::<BlobError>());
-                    let kind = if too_big == Some(&BlobError::TooBig) {
-                        "too-long"
-                    } else {
-                        "io"
-                    };
-                    Fail(kind, format!("couldn't keep that file: {e}"))
-                })?;
-                if let Err(e) = blobs.evict(MAX_KEPT) {
-                    eprintln!("mesh-node: couldn't make room for kept files: {e}");
-                }
-                // A preview Mesh-Voice made, if it fits (D12).
-                let preview = (args.get(2).filter(|p| !p.is_empty()))
-                    .and_then(|p| std::fs::read(p).ok())
-                    .filter(|p| p.len() <= MAX_PREVIEW);
-                let attachment = Attachment {
-                    key,
-                    hash,
-                    size,
-                    mime: mime_of(&name).to_owned(),
-                    name,
-                    preview,
-                };
+                let attachment = self.keep_attachment(arg(1)?, args.get(2), at)?;
                 let body = Body::Text {
                     text: String::new(),
                     reply_to: None,
@@ -280,29 +259,82 @@ impl Helper {
                     return self.open_file(&at, &message, index, &file);
                 }
                 // From any connected device in the chat (ours too).
-                let mut people = self.dm_recipients(&at);
-                people.extend(self.store.as_ref().map(Keystore::id));
-                let Some(net) = &self.net else {
-                    return Err(Fail("unavailable", "not connected".to_owned()));
-                };
-                let addrs: Vec<MeshAddr> =
-                    people.iter().flat_map(|p| net.node.connected(p)).collect();
-                let (node, back) = (net.node.clone(), self.back.clone());
-                tokio::spawn(async move {
-                    let mut got = None;
-                    // ponytail: one device after another, one chunk at a time; ask several at once if big files feel slow.
-                    for addr in addrs {
-                        got = fetch_from(&node, &addr, &file).await;
-                        if got.is_some() {
-                            break;
-                        }
-                    }
-                    let _ = back.send(Back::Fetched(Box::new((at, message, index, file, got))));
-                });
-                Ok(())
+                let people = self.dm_recipients(&at);
+                self.fetch_attachment(at, message, index, file, people)
             }
             _ => Err(Fail("unknown-fn", format!("unknown command {func}"))),
         }
+    }
+
+    /// Keeps the file at `source` for `at` and makes its attachment, with
+    /// the preview Mesh-Voice made at `preview` if it fits (D12).
+    pub(super) fn keep_attachment(
+        &self,
+        source: &str,
+        preview: Option<&String>,
+        at: Where,
+    ) -> Result<Attachment, Fail> {
+        let blobs = self.blobs()?;
+        let source = Path::new(source);
+        let name = (source.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (key, hash, size) = blobs.add_file(source, at).map_err(|e| {
+            let too_big = e.get_ref().and_then(|e| e.downcast_ref::<BlobError>());
+            let kind = if too_big == Some(&BlobError::TooBig) {
+                "too-long"
+            } else {
+                "io"
+            };
+            Fail(kind, format!("couldn't keep that file: {e}"))
+        })?;
+        if let Err(e) = blobs.evict(MAX_KEPT) {
+            eprintln!("mesh-node: couldn't make room for kept files: {e}");
+        }
+        let preview = (preview.filter(|p| !p.is_empty()))
+            .and_then(|p| std::fs::read(p).ok())
+            .filter(|p| p.len() <= MAX_PREVIEW);
+        Ok(Attachment {
+            key,
+            hash,
+            size,
+            mime: mime_of(&name).to_owned(),
+            name,
+            preview,
+        })
+    }
+
+    /// A kept file, opened (`meshDmFile`), or fetched from a connected
+    /// device of `people` or our own and then opened.
+    pub(super) fn fetch_attachment(
+        &mut self,
+        at: Where,
+        message: String,
+        index: usize,
+        file: Attachment,
+        mut people: Vec<MeshId>,
+    ) -> Result<(), Fail> {
+        if self.blobs()?.has(&file.hash) {
+            return self.open_file(&at, &message, index, &file);
+        }
+        people.extend(self.store.as_ref().map(Keystore::id));
+        let Some(net) = &self.net else {
+            return Err(Fail("unavailable", "not connected".to_owned()));
+        };
+        let addrs: Vec<MeshAddr> = people.iter().flat_map(|p| net.node.connected(p)).collect();
+        let (node, back) = (net.node.clone(), self.back.clone());
+        tokio::spawn(async move {
+            let mut got = None;
+            // ponytail: one device after another, one chunk at a time; ask several at once if big files feel slow.
+            for addr in addrs {
+                got = fetch_from(&node, &addr, &file).await;
+                if got.is_some() {
+                    break;
+                }
+            }
+            let _ = back.send(Back::Fetched(Box::new((at, message, index, file, got))));
+        });
+        Ok(())
     }
 
     /// A fetch finished: keep the file and open it, or say it's unavailable.
