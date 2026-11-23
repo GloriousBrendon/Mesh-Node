@@ -1202,6 +1202,9 @@ impl Helper {
             .is_some_and(|s| s.account().kind(id) == Some(mesh_identity::Kind::Friend));
         let now = now_ms();
         let mut changed = Vec::new();
+        // Someone's post, or our own read marker from another device: a
+        // channel's unread count changed (S12).
+        let mut recount = false;
         let mut refused = 0;
         // A mail batch (S9) is one frame with many events: unpacked here,
         // and answered `failed` if any of them is.
@@ -1309,19 +1312,26 @@ impl Helper {
                 Ok(Taken::Shown) => {
                     if is_change {
                         changed.push(space);
-                    } else if let SpaceBody::Post {
-                        channel,
-                        text,
-                        attachments,
-                        ..
-                    } = &event.body
-                        && author.person != me.to_bytes()
-                    {
-                        let mention = history.mentions_me(&event, &author.person);
-                        let text = post_text(text, attachments);
-                        notify_post(&space, channel, &author.person, &text, mention);
-                        if self.space_view == Some((space, *channel)) {
-                            let _ = self.emit_channel(&space, channel);
+                    } else {
+                        if let SpaceBody::Post {
+                            channel,
+                            text,
+                            attachments,
+                            ..
+                        } = &event.body
+                            && author.person != me.to_bytes()
+                        {
+                            let mention = history.mentions_me(&event, &author.person);
+                            let text = post_text(text, attachments);
+                            notify_post(&space, channel, &author.person, &text, mention);
+                            recount = true;
+                        }
+                        recount |= matches!(event.body, SpaceBody::Read { .. });
+                        // The open channel shows every line, edit, delete
+                        // and reaction as it comes.
+                        let channel = mesh_dm::space_store::channel_of(&event.body);
+                        if let Some(c) = channel.filter(|c| self.space_view == Some((space, *c))) {
+                            let _ = self.emit_channel(&space, &c);
                         }
                     }
                 }
@@ -1342,6 +1352,10 @@ impl Helper {
         }
         changed.sort();
         changed.dedup();
+        // A change lists the Spaces anyway (`space_changed`).
+        if recount && changed.is_empty() {
+            self.emit_spaces();
+        }
         for space in changed {
             self.space_changed(&space);
         }
@@ -1686,6 +1700,7 @@ impl Helper {
         let joined_at = self.joined_at(&space);
         let me = self.store.as_ref().map(|s| s.id().to_bytes());
         // Posts written after our add, by others: news, however it came.
+        let mut posted = false;
         let news: Vec<Option<(ChannelId, Person, String, bool)>> = (good.iter())
             .map(|(e, author)| match &e.body {
                 SpaceBody::Post {
@@ -1716,6 +1731,7 @@ impl Helper {
                 for (taken, news) in taken.iter().zip(news) {
                     if let (Taken::Shown, Some((channel, author, text, mention))) = (taken, news) {
                         notify_post(&space, &channel, &author, &text, mention);
+                        posted = true;
                     }
                 }
             }
@@ -1723,6 +1739,8 @@ impl Helper {
         }
         if changes {
             self.refresh_peers();
+        }
+        if changes || posted {
             self.emit_spaces();
         }
         if let Some((s, channel)) = self.space_view

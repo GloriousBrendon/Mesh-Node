@@ -798,7 +798,8 @@ fn shares(version: Option<&SpaceVersion>, e: &Entry, n: u64, p: &Person) -> bool
         || (e.change && v.audience.get(&e.id).is_some_and(|who| who.contains(p)))
 }
 
-fn channel_of(body: &SpaceBody) -> Option<ChannelId> {
+/// The channel an event is in; `None` for a change.
+pub fn channel_of(body: &SpaceBody) -> Option<ChannelId> {
     match body {
         SpaceBody::Post { channel, .. }
         | SpaceBody::Edit { channel, .. }

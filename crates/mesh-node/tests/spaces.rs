@@ -1191,6 +1191,55 @@ fn settings_change_for_everyone() {
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
 
+/// Someone's post updates the list's unread count unasked (S12), so the
+/// rail and channel badges move live; nobody sends `spaceList` here.
+#[test]
+fn a_post_moves_the_unread_count_live() {
+    let mut k = club("spaces-unread-live");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "news"],
+        "meshSpaceMessages",
+    );
+    let unread = |v: &Value| {
+        let cs = v["spaces"][0]["channels"].as_array().unwrap();
+        cs.iter()
+            .find(|c| c["id"] == g.as_str())
+            .and_then(|c| c["unread"].as_u64())
+    };
+    until(&mut k.c, "meshSpaces", |v| unread(v) == Some(1));
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
+/// An open channel shows others' reactions as they come, as a DM does:
+/// B opens #general once and C's reaction reaches B's page unasked.
+#[test]
+fn an_open_channel_shows_a_reaction_live() {
+    let mut k = club("spaces-react-live");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let sent = ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "look"],
+        "meshSpaceMessages",
+    );
+    let id = sent["events"][0]["id"].as_str().unwrap().to_owned();
+    texts_until(&mut k.c, &s, &g, &["look"]);
+    ask(&mut k.b, "spaceOpen", &[&s, &g], "meshSpaceMessages");
+    ask(
+        &mut k.c,
+        "spaceReact",
+        &[&s, &g, &id, "👍", "true"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.b, "meshSpaceMessages", |m| {
+        m["channel"] == g && m["events"][0]["reactions"][0]["emoji"] == "👍"
+    });
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}
+
 /// The club's `name` channel as `h` sees it in a `meshSpaces`, if any.
 fn channel_named(v: &Value, name: &str) -> bool {
     (v["spaces"][0]["channels"].as_array().into_iter().flatten()).any(|c| c["name"] == name)
