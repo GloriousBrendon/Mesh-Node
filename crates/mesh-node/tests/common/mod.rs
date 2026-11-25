@@ -35,6 +35,15 @@ impl Relay {
         });
         Self { url, runtime }
     }
+
+    /// A real relay on the internet, for the `--ignored` live tests.
+    pub fn remote(url: &str) -> Self {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        Self {
+            url: url.to_owned(),
+            runtime,
+        }
+    }
 }
 
 /// The longest a test waits for the helper to say anything.
