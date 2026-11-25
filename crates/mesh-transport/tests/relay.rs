@@ -6,16 +6,23 @@ use mesh_identity::{DeviceCert, DeviceKey, RootKey};
 use mesh_transport::{Config, MeshAddr, Node, Path, Relays, TestOptions};
 use std::time::Duration;
 
-async fn node(relays: Relays, test: TestOptions) -> (Node, RootKey) {
+/// A node on `relays`; `relay_only` switches its direct paths off.
+async fn node(relays: Relays, relay_only: bool) -> (Node, RootKey) {
     let (root, key) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
     let cert = DeviceCert::issue(&root, &key.public(), "box", 1).unwrap();
     let config = Config {
         relays,
-        test,
+        relay_only,
+        test: TEST_RELAY,
         ..Config::default()
     };
     (Node::start(&key, &cert, config).await.unwrap(), root)
 }
+
+/// Trusts iroh's in-process test relay (and nothing else changes for n0's).
+const TEST_RELAY: TestOptions = TestOptions {
+    trust_any_relay: true,
+};
 
 /// Key and relay only, as a ticket carries.
 fn via_relay(node: &Node) -> MeshAddr {
@@ -28,12 +35,8 @@ fn via_relay(node: &Node) -> MeshAddr {
 #[tokio::test]
 async fn ping_goes_through_the_relay_when_direct_is_impossible() {
     let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
-    let test = TestOptions {
-        trust_any_relay: true,
-        relay_only: true,
-    };
-    let (a, _) = node(Relays::Custom(vec![url.clone()]), test).await;
-    let (b, bob) = node(Relays::Custom(vec![url.clone()]), test).await;
+    let (a, _) = node(Relays::Custom(vec![url.clone()]), true).await;
+    let (b, bob) = node(Relays::Custom(vec![url.clone()]), true).await;
     assert!(
         b.online(Duration::from_secs(10)).await,
         "bob reaches the test relay"
@@ -50,8 +53,8 @@ async fn ping_goes_through_the_relay_when_direct_is_impossible() {
 #[tokio::test]
 #[ignore = "uses the internet (n0's public relays)"]
 async fn real_relays() {
-    let (a, _) = node(Relays::Default, TestOptions::default()).await;
-    let (b, bob) = node(Relays::Default, TestOptions::default()).await;
+    let (a, _) = node(Relays::Default, false).await;
+    let (b, bob) = node(Relays::Default, false).await;
     assert!(
         b.online(Duration::from_secs(20)).await,
         "bob reaches an n0 relay"
@@ -84,10 +87,7 @@ async fn fixed_seed(url: &iroh::RelayUrl) -> (Node, MeshAddr) {
         relays: Relays::Custom(vec![url.clone()]),
         services: vec!["ask".into()],
         port: Some(port),
-        test: TestOptions {
-            trust_any_relay: true,
-            relay_only: false,
-        },
+        test: TEST_RELAY,
         ..Config::default()
     };
     let seed = Node::start(&key, &cert, config).await.unwrap();
@@ -105,11 +105,7 @@ const WAIT: Duration = Duration::from_secs(2);
 async fn direct_first_arrives_direct_on_the_first_stream() {
     let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
     let (seed, addr) = fixed_seed(&url).await;
-    let test = TestOptions {
-        trust_any_relay: true,
-        relay_only: false,
-    };
-    let (client, _) = node(Relays::Custom(vec![url]), test).await;
+    let (client, _) = node(Relays::Custom(vec![url]), false).await;
     client
         .open_direct_first(&addr, "ask", WAIT)
         .await
@@ -123,11 +119,7 @@ async fn direct_first_falls_back_to_the_relay() {
     let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
     let (seed, addr) = fixed_seed(&url).await;
     // A network that blocks UDP: the client can use the relay only.
-    let test = TestOptions {
-        trust_any_relay: true,
-        relay_only: true,
-    };
-    let (client, _) = node(Relays::Custom(vec![url]), test).await;
+    let (client, _) = node(Relays::Custom(vec![url]), true).await;
     assert!(client.online(Duration::from_secs(10)).await);
     let started = std::time::Instant::now();
     client
@@ -137,4 +129,55 @@ async fn direct_first_falls_back_to_the_relay() {
     assert!(started.elapsed() >= WAIT, "it tried direct first");
     let stream = seed.next_stream().await.unwrap();
     assert!(stream.direct_ip.is_none());
+}
+
+/// A relay-only seed (SPEC-seed D8c as changed): its address has no direct
+/// part, so a caller goes straight to the relay, with no direct-first wait,
+/// and arrives relayed.
+#[tokio::test]
+async fn a_relay_only_seed_is_reached_through_its_relay_at_once() {
+    let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
+    let (root, key) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
+    let cert = DeviceCert::issue(&root, &key.public(), "seed", 1).unwrap();
+    let config = Config {
+        relays: Relays::Custom(vec![url.clone()]),
+        services: vec!["ask".into()],
+        relay_only: true,
+        test: TEST_RELAY,
+        ..Config::default()
+    };
+    let seed = Node::start(&key, &cert, config).await.unwrap();
+    assert!(seed.online(Duration::from_secs(10)).await);
+    assert!(seed.bound_sockets().is_empty(), "no socket to reach it by");
+    let addr = seed.addr();
+    assert!(addr.direct.is_empty(), "{addr:?}");
+    assert!(!addr.ticket_with_direct().unwrap().contains("addr="));
+
+    let (client, _) = node(Relays::Custom(vec![url]), false).await;
+    let long = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    client
+        .open_direct_first(&addr, "ask", long)
+        .await
+        .expect("gets through");
+    assert!(started.elapsed() < WAIT, "it waited for a direct path");
+    let stream = seed.next_stream().await.unwrap();
+    assert!(stream.direct_ip.is_none(), "the seed was reached direct");
+    let pong = client.ping(&addr).await.unwrap();
+    assert_eq!(pong.path, Path::Relay);
+}
+
+#[tokio::test]
+async fn relay_only_refuses_a_fixed_port() {
+    let (root, key) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
+    let cert = DeviceCert::issue(&root, &key.public(), "seed", 1).unwrap();
+    let config = Config {
+        relay_only: true,
+        port: Some(7842),
+        ..Config::default()
+    };
+    assert!(matches!(
+        Node::start(&key, &cert, config).await,
+        Err(mesh_transport::TransportError::RelayOnlyWithPort)
+    ));
 }

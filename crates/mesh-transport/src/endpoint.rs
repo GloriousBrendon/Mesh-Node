@@ -76,6 +76,9 @@ impl Node {
         if cert.device() != &device.public() {
             return Err(TransportError::CertNotOurs);
         }
+        if config.relay_only && config.port.is_some() {
+            return Err(TransportError::RelayOnlyWithPort);
+        }
         let relay_mode = match config.relays {
             Relays::Default => RelayMode::Default,
             Relays::Custom(urls) => RelayMode::Custom(RelayMap::from_iter(urls)),
@@ -103,6 +106,7 @@ impl Node {
                     )
                 })
                 .map_err(|e| TransportError::Bind(e.to_string()))?,
+            None if config.relay_only => builder.clear_ip_transports(),
             None => builder,
         };
         #[cfg(feature = "test-utils")]

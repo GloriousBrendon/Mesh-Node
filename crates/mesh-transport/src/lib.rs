@@ -110,6 +110,10 @@ pub struct Config {
     /// address (a seed with a public address, SPEC-seed D8c). `None` lets
     /// iroh pick one, as devices do.
     pub port: Option<u16>,
+    /// No direct paths at all: every connection goes through the relay, and
+    /// the node opens no socket anyone can reach (a seed that mustn't show
+    /// its address, SPEC-seed D8c as changed). Can't go with `port`.
+    pub relay_only: bool,
     #[cfg(feature = "test-utils")]
     pub test: TestOptions,
 }
@@ -121,8 +125,6 @@ pub struct Config {
 pub struct TestOptions {
     /// Accept a relay's self-signed certificate (iroh's in-process test relay).
     pub trust_any_relay: bool,
-    /// No direct paths at all, so traffic has to go through the relay.
-    pub relay_only: bool,
 }
 
 #[cfg(feature = "test-utils")]
@@ -130,9 +132,6 @@ impl TestOptions {
     fn apply(self, mut builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
         if self.trust_any_relay {
             builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
-        }
-        if self.relay_only {
-            builder = builder.clear_ip_transports();
         }
         builder
     }
@@ -240,6 +239,8 @@ pub enum TransportError {
     CertNotOurs,
     #[error("couldn't start networking: {0}")]
     Bind(String),
+    #[error("a relay-only node can't have a fixed port")]
+    RelayOnlyWithPort,
     #[error("couldn't reach that device: {0}")]
     Unreachable(String),
     #[error("that device didn't answer in time")]
