@@ -114,11 +114,36 @@ async fn direct_first_arrives_direct_on_the_first_stream() {
     assert!(stream.direct_ip.is_some(), "the first stream came by relay");
 }
 
+/// A seed's direct address that doesn't answer (a network that drops it):
+/// the caller tries it for the wait, then gets through by the relay.
 #[tokio::test]
 async fn direct_first_falls_back_to_the_relay() {
     let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
+    let (_seed, addr) = fixed_seed(&url).await;
+    let closed = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let unanswered = MeshAddr {
+        direct: vec![closed],
+        ..addr
+    };
+    let (client, _) = node(Relays::Custom(vec![url]), false).await;
+    let started = std::time::Instant::now();
+    client
+        .open_direct_first(&unanswered, "ask", WAIT)
+        .await
+        .expect("gets through");
+    assert!(started.elapsed() >= WAIT, "it tried direct first");
+}
+
+/// A relay-only caller (the helper's throwaway node, SPEC-connection-privacy
+/// P9) can't go direct, so it doesn't wait to try: it goes by the relay at
+/// once, even to a seed whose ticket has a direct address.
+#[tokio::test]
+async fn a_relay_only_caller_skips_the_direct_try() {
+    let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
     let (seed, addr) = fixed_seed(&url).await;
-    // A network that blocks UDP: the client can use the relay only.
     let (client, _) = node(Relays::Custom(vec![url]), true).await;
     assert!(client.online(Duration::from_secs(10)).await);
     let started = std::time::Instant::now();
@@ -126,7 +151,7 @@ async fn direct_first_falls_back_to_the_relay() {
         .open_direct_first(&addr, "ask", WAIT)
         .await
         .expect("gets through");
-    assert!(started.elapsed() >= WAIT, "it tried direct first");
+    assert!(started.elapsed() < WAIT, "it waited for a direct path");
     let stream = seed.next_stream().await.unwrap();
     assert!(stream.direct_ip.is_none());
 }

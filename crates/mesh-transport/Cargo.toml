@@ -20,3 +20,5 @@ test-utils = ["iroh/test-utils"]
 iroh = { workspace = true, features = ["test-utils"] }
 # The crate's own tests turn its test-utils feature on.
 mesh-transport = { path = ".", features = ["test-utils"] }
+# To see the hole-punch candidates iroh receives (tests/candidates.rs).
+tracing = "0.1"

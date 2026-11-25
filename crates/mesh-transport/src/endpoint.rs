@@ -244,14 +244,16 @@ impl Node {
     /// and adds its relay only if that fails. With both from the start, iroh
     /// keeps whichever path answers first, often the relay; a seed with a
     /// fixed address wants callers direct from their first request
-    /// (SPEC-seed D8c). An address with no direct part just uses `open`.
+    /// (SPEC-seed D8c). An address with no direct part just uses `open`,
+    /// and so does a relay-only node, which has no socket to go direct from.
     pub async fn open_direct_first(
         &self,
         addr: &MeshAddr,
         service: &str,
         wait: Duration,
     ) -> Result<(Peer, SendStream, RecvStream), TransportError> {
-        if !addr.direct.is_empty() && addr.relay.is_some() {
+        let can_go_direct = !self.endpoint.bound_sockets().is_empty();
+        if can_go_direct && !addr.direct.is_empty() && addr.relay.is_some() {
             let direct = MeshAddr {
                 relay: None,
                 ..addr.clone()

@@ -337,10 +337,11 @@ fn callers(seed: &mut Seed) -> String {
     seed.line_with(|l| l.contains("callers") && !l.contains("callers 0 direct, 0 relayed, 0 both"))
 }
 
-/// Dialled direct first, a caller arrives direct from its first request, so
-/// it's never counted in the relayed bucket.
+/// The helper calls seeds from a relay-only node (SPEC-connection-privacy
+/// P9), so even a seed with a fixed public address gets every caller by
+/// the relay, and the caller's address never reaches it.
 #[test]
-fn a_fixed_port_seed_counts_its_first_caller_as_direct() {
+fn a_fixed_port_seeds_callers_arrive_relayed() {
     let (dir_s, dir_a) = (temp_dir("fixed-seed"), temp_dir("fixed-a"));
     let relay = Relay::start();
     let (mut seed, ticket, _) = fixed_seed(&dir_s, &relay);
@@ -351,37 +352,9 @@ fn a_fixed_port_seed_counts_its_first_caller_as_direct() {
     a.held_code("1");
     let line = callers(&mut seed);
     assert!(
-        line.contains("callers 1 direct, 0 relayed, 0 both ways"),
+        line.contains("callers 0 direct, 1 relayed, 0 both ways"),
         "{line}"
     );
-    a.quit();
-    seed.stop();
-    for dir in [dir_s, dir_a] {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
-
-/// A caller that can't reach the fixed address in the ticket still gets
-/// through, by the relay, after the short direct-first wait.
-#[test]
-fn a_caller_that_cant_reach_the_fixed_address_goes_by_relay() {
-    let (dir_s, dir_a) = (temp_dir("blocked-seed"), temp_dir("blocked-a"));
-    let relay = Relay::start();
-    let (mut seed, ticket, port) = fixed_seed(&dir_s, &relay);
-    let blocked = ticket.replace(
-        &format!("127.0.0.1:{port}"),
-        &format!("127.0.0.1:{}", free_port()),
-    );
-    let mut a = Helper::start_with(&dir_a, &relay, &["--seed", &blocked]);
-    assert_eq!(a.event().0, "meshIdentity");
-    a.expect("idCreate", &["alice", PASSWORD], "meshIdentity");
-    assert_eq!(a.event().0, "meshCodes");
-    // Got through: the code is held. On one machine iroh then finds the
-    // seed's loopback address through the relay and goes direct, so the
-    // path itself is checked in mesh-transport's relay test, with a client
-    // that can only use the relay.
-    a.held_code("1");
-    callers(&mut seed);
     a.quit();
     seed.stop();
     for dir in [dir_s, dir_a] {

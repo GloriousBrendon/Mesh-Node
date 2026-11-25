@@ -2103,9 +2103,12 @@ async fn throwaway_node(relays: Relays, services: Vec<String>) -> Result<Node, S
         .map_err(|e| format!("no randomness: {e}"))?;
     // A generic name and no date, so it says nothing about this device.
     let cert = DeviceCert::issue(&root, &key.public(), "mesh", 0).map_err(|e| e.to_string())?;
+    // Relay-only, so a seed or the other device never gets this machine's
+    // addresses as hole-punch candidates (SPEC-connection-privacy P9).
     let config = Config {
         relays,
         services,
+        relay_only: true,
         ..Config::default()
     };
     Node::start(&key, &cert, config)
@@ -2430,4 +2433,21 @@ fn device_name() -> String {
         end -= 1;
     }
     name[..end].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The node for seeds and linking opens no socket, so it has no
+    /// addresses to hand out as hole-punch candidates (P9).
+    #[tokio::test]
+    async fn the_throwaway_node_is_relay_only() {
+        // A relay that never answers: enough to start, and nothing is reached.
+        let relays = Relays::Custom(vec!["http://127.0.0.1:9".parse().unwrap()]);
+        let node = throwaway_node(relays, Vec::new()).await.unwrap();
+        assert!(node.bound_sockets().is_empty());
+        assert!(node.addr().direct.is_empty());
+        node.close().await;
+    }
 }
