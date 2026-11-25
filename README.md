@@ -24,3 +24,13 @@ cargo fmt --all --check
 - `crates/mesh-e2ee`: end-to-end encryption: e2ee bundles, 1:1 sessions and
   sender chains (vodozemac), the sealed envelope, its store.
 - `crates/mesh-node`: the binary.
+
+## License
+
+Copyright (C) 2026 GloriousBrendon
+
+Mesh-Node is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See [LICENSE](LICENSE). Contributions: see
+[CONTRIBUTING.md](CONTRIBUTING.md).
