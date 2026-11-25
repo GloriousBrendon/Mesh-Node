@@ -337,10 +337,11 @@ fn callers(seed: &mut Seed) -> String {
     seed.line_with(|l| l.contains("callers") && !l.contains("callers 0 direct, 0 relayed, 0 both"))
 }
 
-/// Dialled direct first, a caller arrives direct from its first request, so
-/// it's never counted in the relayed bucket.
+/// The helper calls seeds from a relay-only node (SPEC-connection-privacy
+/// P9), so even a seed with a fixed public address gets every caller by
+/// the relay, and the caller's address never reaches it.
 #[test]
-fn a_fixed_port_seed_counts_its_first_caller_as_direct() {
+fn a_fixed_port_seeds_callers_arrive_relayed() {
     let (dir_s, dir_a) = (temp_dir("fixed-seed"), temp_dir("fixed-a"));
     let relay = Relay::start();
     let (mut seed, ticket, _) = fixed_seed(&dir_s, &relay);
@@ -351,7 +352,7 @@ fn a_fixed_port_seed_counts_its_first_caller_as_direct() {
     a.held_code("1");
     let line = callers(&mut seed);
     assert!(
-        line.contains("callers 1 direct, 0 relayed, 0 both ways"),
+        line.contains("callers 0 direct, 1 relayed, 0 both ways"),
         "{line}"
     );
     a.quit();
@@ -361,30 +362,113 @@ fn a_fixed_port_seed_counts_its_first_caller_as_direct() {
     }
 }
 
-/// A caller that can't reach the fixed address in the ticket still gets
-/// through, by the relay, after the short direct-first wait.
+/// A count from a seed's report lines: the sum of the number before `what`.
+fn reported(lines: &[String], what: &str) -> u64 {
+    (lines.iter())
+        .filter(|l| l.starts_with("mesh-node seed: last hour ") && !l.contains("last hour mail "))
+        .flat_map(|l| l.split([',', ';', '(']))
+        .filter_map(|part| {
+            let n = part.trim().strip_suffix(what)?.trim_end();
+            n.rsplit(' ').next()?.parse::<u64>().ok()
+        })
+        .sum()
+}
+
+/// The home seed's setup (SPEC-seed D8c as changed): relay-only, so its
+/// ticket shows no address and every caller arrives relayed, and it still
+/// answers pings, codes, friend requests and address records.
 #[test]
-fn a_caller_that_cant_reach_the_fixed_address_goes_by_relay() {
-    let (dir_s, dir_a) = (temp_dir("blocked-seed"), temp_dir("blocked-a"));
+fn a_relay_only_seed_serves_everyone_through_its_relay() {
+    let dirs = ["ro-seed", "ro-a", "ro-b"].map(temp_dir);
     let relay = Relay::start();
-    let (mut seed, ticket, port) = fixed_seed(&dir_s, &relay);
-    let blocked = ticket.replace(
-        &format!("127.0.0.1:{port}"),
-        &format!("127.0.0.1:{}", free_port()),
-    );
-    let mut a = Helper::start_with(&dir_a, &relay, &["--seed", &blocked]);
+    let args = ["--relay-only", "--report-every", "2"];
+    let mut seed = Seed::start_with(&dirs[0], &relay, &args);
+    let ticket = seed.ticket();
+    assert!(!ticket.contains("addr="), "{ticket}");
+    let addr = MeshAddr::from_ticket(&ticket).unwrap();
+    let pong = relay.runtime.block_on(async {
+        let (node, _) = client(&relay).await;
+        node.ping(&addr).await.expect("a ping through the relay")
+    });
+    assert_eq!(pong.path, mesh_transport::Path::Relay);
+
+    // Short records, so they're put again every 2 s.
+    let with_seed = ["--seed", ticket.as_str(), "--record-ttl", "8"];
+    let mut a = Helper::start_with(&dirs[1], &relay, &with_seed);
+    let mut b = Helper::start_with(&dirs[2], &relay, &with_seed);
     assert_eq!(a.event().0, "meshIdentity");
-    a.expect("idCreate", &["alice", PASSWORD], "meshIdentity");
+    assert_eq!(b.event().0, "meshIdentity");
+    let id_a = a.expect("idCreate", &["alice", PASSWORD], "meshIdentity")["id"].clone();
     assert_eq!(a.event().0, "meshCodes");
-    // Got through: the code is held. On one machine iroh then finds the
-    // seed's loopback address through the relay and goes direct, so the
-    // path itself is checked in mesh-transport's relay test, with a client
-    // that can only use the relay.
-    a.held_code("1");
-    callers(&mut seed);
-    a.quit();
-    seed.stop();
-    for dir in [dir_s, dir_a] {
+    let id_b = b.expect("idCreate", &["bob", PASSWORD], "meshIdentity")["id"].clone();
+    assert_eq!(b.event().0, "meshCodes");
+    let code = a.held_code("1");
+    assert_eq!(
+        b.expect("codeResolve", &[&code], "meshResolved")["id"],
+        id_a
+    );
+
+    // Friends: the request and both address records go through the seed.
+    let (id_a, id_b) = (id_a.as_str().unwrap(), id_b.as_str().unwrap());
+    a.expect("friendAdd", &[id_b, ""], "meshSocial");
+    b.expect("friendAdd", &[id_a, ""], "meshSocial");
+    fn friends_with(id: &str) -> impl Fn(&Value) -> bool + '_ {
+        move |s| {
+            s["friends"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == id)
+        }
+    }
+    a.social_until(friends_with(id_b));
+    b.social_until(friends_with(id_a));
+
+    let mut seen = Vec::new();
+    while reported(&seen, "address puts") == 0 || reported(&seen, "address gets") == 0 {
+        seen.push(seed.line_with(|l| l.contains("last hour ")));
+    }
+    let (_, _) = (a.quit(), b.quit());
+    let log = seed.stop();
+    for what in ["address puts", "address gets", "relayed"] {
+        assert!(reported(&log, what) > 0, "no {what}: {log:?}");
+    }
+    assert_eq!(reported(&log, "direct"), 0, "a caller came direct: {log:?}");
+    assert!(log.iter().any(|l| l.contains("relay-only")), "{log:?}");
+    drop(relay.runtime);
+    for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// `--relay-only` won't start with a fixed port or public address, nor
+/// without exactly one relay to put in its ticket.
+#[test]
+fn relay_only_refuses_a_port_and_more_than_one_relay() {
+    let dir = temp_dir("ro-refused");
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mesh-node"))
+            .args(["seed", "--data"])
+            .arg(&dir)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let relay = ["--relay", "https://euc1-1.relay.n0.iroh.link."];
+    for args in [
+        &[&relay[..], &["--relay-only", "--port", "7842"]].concat()[..],
+        &[
+            &relay[..],
+            &["--relay-only", "--public", "203.0.113.5:7842"],
+        ]
+        .concat(),
+        &["--relay-only"],
+        &[&relay[..], &relay, &["--relay-only"]].concat(),
+    ] {
+        let out = run(args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains("--relay-only"), "{args:?}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }

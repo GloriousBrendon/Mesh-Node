@@ -1,35 +1,26 @@
 # A rented server for the second seed: what it needs
 
-Written 2026-11-14, before anything is rented. This lists requirements only,
-not a provider. It covers the seed and relay of `compose.yaml`, run as at
-home: `--mail --mail-max 2147483648`, plus `--port`/`--public` for a fixed
-address (SPEC-seed D8c), for a beta of about ten people. The figures come from
-PLAN-mailbox Task 16 and SPEC-seed unless marked as estimates.
+Written 2026-11-14, before anything is rented; changed 2026-11-25, when the
+home seed became relay-only. This lists requirements only, not a provider.
+It covers the seed of `compose.yaml`, run as at home: `--relay-only --relay
+<n0's EU relay> --mail --mail-max 2147483648` (SPEC-seed D8c as changed), for
+a beta of about ten people. There's no relay of our own any more: callers
+reach the seed through n0's relay. The figures come from PLAN-mailbox Task 16
+and SPEC-seed unless marked as estimates.
 
 ## Must have
 
-- **A public IPv4 address that never changes.** The seed's ticket carries
-  `&addr=<ip:port>` (D8c), and that ticket is compiled into every
-  `mesh-node` (`helper::SEEDS`). A new address means a new release for
-  everyone, so a static or reserved IP is required, not a dynamic one. IPv6
-  is welcome (the seed binds it when present), but not required.
-- **Open ports, inbound:**
-
-  | Port | What it's for |
-  |---|---|
-  | TCP 443 | The relay over HTTPS, behind Caddy or another TLS proxy (D3) |
-  | TCP 80 | Only if the certificate uses the HTTP challenge. With the DNS challenge, as at home, it stays closed. |
-  | UDP, one port | The seed's own `--port` (D8c), any fixed number |
-
-  Nothing else should be open. Admin is ssh over Tailscale (D10), and
-  Tailscale needs only outbound traffic. The relay's QUIC address discovery
-  stays off (D4), so it needs no UDP port of its own.
-- **A domain name for the relay**, with a DNS record pointing at the address,
-  and a certificate for it.
-- **Root or Docker access** to run the two containers. `mesh-seed.service`
-  is there for running without Docker.
-- **Full UDP.** Some cheap hosts filter or rate-limit UDP. The seed's port
-  and every iroh hole-punch depend on it.
+- **Outbound internet only.** A relay-only seed dials out to its relay and
+  opens no port, so it needs no fixed or public address, no port forward
+  and no domain. Its ticket (compiled into every `mesh-node`,
+  `helper::SEEDS`) names its key and its relay, never an address.
+- **Nothing open inbound.** Admin is ssh over Tailscale (D10), which needs
+  only outbound traffic too.
+- **Root or Docker access** to run the container. `mesh-seed.service` is
+  there for running without Docker.
+- A seed that should take callers direct instead runs with `--port` and
+  `--public` (D8c), and then needs a public IPv4 address that never changes
+  and that UDP port open; not the plan for now.
 
 ## Sizes
 
@@ -40,7 +31,6 @@ PLAN-mailbox Task 16 and SPEC-seed unless marked as estimates.
     of MB.
   - A store filled to its 2 GiB cap would hold an index of roughly 1.2 GB.
     That's an estimate, scaled from the measurement.
-  - The relay is small: tens of MB.
   - `mesh-seed.service` caps memory at 512 MB. That's fine for ten people,
     but too little for a full 2 GiB store. Raise it if the store grows.
 - **Building the image on the server needs more memory than running it.** A
@@ -72,26 +62,16 @@ PLAN-mailbox Task 16 and SPEC-seed unless marked as estimates.
   - mail itself: around ten envelopes of about 1 KB.
 
   That's about 1 MB a person a day at most: about 0.3 GB a month for ten.
-- **The relay carries everything that can't go direct.** That is all traffic
-  between two people when hole punching fails, including files of up to
-  100 MB (dm D12). iroh relays only until a direct path is found, so most text
-  traffic goes direct. Heavy file sharing on a network that blocks punching
-  could reach tens of GB a month. Later, `calls` adds about 50 kbit/s per
-  relayed voice stream (roughly 22 MB an hour).
-- **What to ask for:** 100 GB a month or more, with no surprise overage
-  charges. Many plans include 1 TB or more, which covers this many times
-  over.
-- The relay already limits each client to 2 MB/s steady, with bursts to
-  4 MB (`relay.toml`).
+- **Relayed traffic between people goes over n0's relays**, not this
+  server. All of the seed's own traffic goes through its relay too.
+- **What to ask for:** 10 GB a month is plenty; any plan covers it.
 
 ## Region
 
-- **Close to the people using it.** iroh chooses a home relay by latency, so
-  a nearby relay is the one people actually use. Every relayed message, and
-  later every relayed call, crosses it. Clients dial the seed direct for 2 s
-  before falling back to its relay (D8c), and a far server spends more of
-  that on the handshake. Aim for under about 50 ms from most of the beta's
-  homes.
+- **Close to its relay.** Every request to the seed crosses n0's relay
+  first, so a server near the relay's region (the EU one, for now) keeps
+  that leg short. Clients go to the seed's relay at once, with no direct
+  try first (D8c as changed).
 - **On a different network from home.** The point of the second seed is that
   people away from home can reach it, and that it stays up when the home line
   doesn't. Any provider outside your ISP's network meets that.

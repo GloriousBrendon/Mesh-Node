@@ -2,8 +2,7 @@
 //! Mesh-Voice's helper: commands arrive on stdin as `{"fn":..,"args":[..]}`
 //! lines, events go out on stdout as `{"binding":..,"payload":"<json>"}`
 //! lines, the same protocol as mesh-wa and mesh-dc. Logs go to stderr.
-//! `--relay <url>` (repeatable) replaces the built-in relays (ours, then
-//! n0's); `--seed <ticket>` (repeatable) the built-in seed. `--record-ttl <secs>` shortens
+//! `--relay <url>` (repeatable) replaces the built-in relays (n0's); `--seed <ticket>` (repeatable) the built-in seed. `--record-ttl <secs>` shortens
 //! how long address records last, for tests. Without `--seed`, the
 //! `MESH_SEEDS` environment variable (space-separated tickets) is used; set
 //! but empty, there are no seeds.
@@ -11,7 +10,9 @@
 //! `mesh-node seed --data <dir>` is the headless seed (SPEC-seed). On a
 //! machine with a public address, `--port <udp>` fixes its port and
 //! `--public <ip:port>` puts that address in its ticket, so callers reach it
-//! direct (D8c). `--report-every <secs>` shortens the hourly counts, for
+//! direct (D8c). `--relay-only` is the opposite: no direct paths at all, so
+//! its address is never shown; it takes exactly one `--relay`, which its
+//! ticket names, and neither `--port` nor `--public`. `--report-every <secs>` shortens the hourly counts, for
 //! tests. `--mail` turns on the mail services (SPEC-mailbox; off by default);
 //! `--mail-token <secret>` closes them to anyone without it, and
 //! `--mail-max <bytes>` caps what they hold (2 GiB by default).
@@ -164,7 +165,7 @@ fn main() {
         }
     };
     if seed {
-        let options = match seed_options(&args) {
+        let options = match seed_options(&args, &relays) {
             Ok(options) => options,
             Err(e) => {
                 eprintln!("mesh-node seed: {e}");
@@ -227,8 +228,8 @@ fn main() {
     }
 }
 
-/// The seed's `--port`, `--public` and `--report-every`.
-fn seed_options(args: &[String]) -> Result<seed::Options, String> {
+/// The seed's `--port`, `--public`, `--relay-only` and `--report-every`.
+fn seed_options(args: &[String], relays: &Relays) -> Result<seed::Options, String> {
     let value = |flag: &str| {
         args.windows(2)
             .find(|w| w[0] == flag)
@@ -240,6 +241,16 @@ fn seed_options(args: &[String]) -> Result<seed::Options, String> {
     let public = value("--public")
         .map(|a| a.parse().map_err(|_| "--public takes an ip:port"))
         .transpose()?;
+    let relay_only = args.iter().any(|a| a == "--relay-only");
+    if relay_only && (port.is_some() || public.is_some()) {
+        return Err("--relay-only can't go with --port or --public".into());
+    }
+    // One relay, so the ticket names the relay the seed is really on.
+    if relay_only
+        && !matches!(relays, Relays::Custom(r) if r.len() == 1 && args.iter().any(|a| a == "--relay"))
+    {
+        return Err("--relay-only takes exactly one --relay".into());
+    }
     let report = match value("--report-every") {
         None => seed::REPORT_EVERY,
         Some(s) => std::time::Duration::from_secs(
@@ -252,6 +263,7 @@ fn seed_options(args: &[String]) -> Result<seed::Options, String> {
     Ok(seed::Options {
         port,
         public,
+        relay_only,
         report,
         mail: args.iter().any(|a| a == "--mail"),
         mail_settings: mail_settings(value("--mail-token"), value("--mail-max"))?,
@@ -281,16 +293,10 @@ fn mail_settings(token: Option<&str>, max: Option<&str>) -> Result<mailstore::Se
     Ok(mailstore::Settings { token, max })
 }
 
-/// Our relay (on the homelab, SPEC-seed D5), then n0's. iroh makes whichever
-/// answers fastest the home relay.
-// ponytail: ours is home-only (LAN and Tailscale) for now; outside, it never answers and n0's are used.
-pub const OUR_RELAY: &str = "https://relay.nagbreeklabs.co.za";
-
+/// n0's relays; iroh makes whichever answers fastest the home relay. There's
+/// no relay of our own any more (SPEC-seed D5 as changed).
 fn default_relays() -> Vec<RelayUrl> {
-    let ours: RelayUrl = OUR_RELAY.parse().expect("a valid URL");
-    std::iter::once(ours)
-        .chain(mesh_transport::public_relays())
-        .collect()
+    mesh_transport::public_relays()
 }
 
 /// A relay from `--relay`: https, or plain http only on this machine (a
@@ -357,15 +363,17 @@ mod tests {
     #[test]
     fn the_built_in_lists_parse() {
         let relays = default_relays();
-        assert_eq!(relays[0].as_str(), format!("{OUR_RELAY}/"));
-        assert_eq!(relays.len(), 5, "ours, then n0's four");
+        assert_eq!(relays.len(), 4, "n0's four");
+        let eu = &relays[2];
+        assert_eq!(eu.as_str(), "https://euc1-1.relay.n0.iroh.link./");
         for ticket in helper::SEEDS {
             let seed = MeshAddr::from_ticket(ticket).expect("a valid ticket");
             assert_eq!(
                 seed.relay.as_ref(),
-                Some(&relays[0]),
-                "the seed is on our relay"
+                Some(eu),
+                "the seed is on n0's EU relay"
             );
+            assert!(seed.direct.is_empty(), "the seed's address is never shown");
         }
         assert!(relay("http://example.org").is_err());
         assert!(relay("http://127.0.0.1:3340").is_ok());

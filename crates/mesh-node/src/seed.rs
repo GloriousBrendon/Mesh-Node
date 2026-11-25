@@ -62,6 +62,10 @@ pub struct Options {
     pub port: Option<u16>,
     /// The address callers reach that port at, for the ticket.
     pub public: Option<std::net::SocketAddr>,
+    /// No direct paths: callers only ever reach it through its one relay,
+    /// and its address is never shown (D8c as changed). Not with `port`
+    /// or `public`.
+    pub relay_only: bool,
     pub report: Duration,
     /// The mail services are on (`--mail`; off by default).
     pub mail: bool,
@@ -168,6 +172,9 @@ const HANDSHAKES: usize = 128;
 
 pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), String> {
     let (root, device) = key(&dir.join(KEY_FILE))?;
+    if options.relay_only {
+        eprintln!("mesh-node seed: relay-only; callers reach it through its relay, never direct");
+    }
     let cert = DeviceCert::issue(&root, &device.public(), "seed", unix_now())
         .map_err(|e| format!("can't make the seed's certificate: {e}"))?;
     let store = Store::load(&dir.join(STORE_FILE)).map_err(|e| e.to_string())?;
@@ -216,6 +223,7 @@ pub async fn run(dir: &Path, relays: Relays, options: Options) -> Result<(), Str
             ..Limits::default()
         },
         port: options.port,
+        relay_only: options.relay_only,
         ..Config::default()
     };
     let node = Arc::new(

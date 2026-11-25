@@ -147,6 +147,13 @@ fn test_1_clocks_behind() {
     one_to_one("mail1-behind", "-30");
 }
 
+/// Test 1 through a relay-only seed, as the home seed runs (SPEC-seed D8c
+/// as changed).
+#[test]
+fn test_1_through_a_relay_only_seed() {
+    one_to_one_with("mail1-relay-only", "0", &["--mail", "--relay-only"]);
+}
+
 /// Claims the seed refused, by the helper's own count lines.
 fn refused(stderr: &str) -> u64 {
     stderr
@@ -158,9 +165,13 @@ fn refused(stderr: &str) -> u64 {
 }
 
 fn one_to_one(name: &str, clock: &str) {
+    one_to_one_with(name, clock, &["--mail"]);
+}
+
+fn one_to_one_with(name: &str, clock: &str, seed_args: &[&str]) {
     let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("{name}-{n}")));
     let relay = Relay::start();
-    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let mut seed = Seed::start_with(&dirs[0], &relay, seed_args);
     let ticket = seed.ticket();
     // Records long enough to outlast the clocks' gap (routing D4's are 2 h).
     let skewed = ["--clock-offset", clock, "--record-ttl", SKEWED_TTL];
@@ -1924,6 +1935,86 @@ fn mail_records_on_the_seed() {
     });
     seed.stop();
     plain.stop();
+    drop(relay.runtime);
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// The home seed's setup on the real n0 EU relay (SPEC-seed D8c as
+/// changed): a relay-only seed answers a ping, a code hold and lookup, and
+/// one mail round trip, all through that relay, by its ticket alone.
+#[test]
+#[ignore = "uses the internet (n0's EU relay)"]
+fn live_relay_only_seed_on_n0_eu() {
+    const N0_EU: &str = "https://euc1-1.relay.n0.iroh.link.";
+    let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("live-{n}")));
+    let relay = Relay::remote(N0_EU);
+    let mut seed = Seed::start_with(&dirs[0], &relay, &["--relay-only", "--mail"]);
+    let ticket = seed.ticket();
+    eprintln!("live: seed ticket {ticket}");
+    assert!(!ticket.contains("addr="), "{ticket}");
+    let addr = MeshAddr::from_ticket(&ticket).unwrap();
+    assert_eq!(
+        addr.relay.as_ref().map(|r| r.as_str()),
+        Some("https://euc1-1.relay.n0.iroh.link./")
+    );
+
+    let pongs: Vec<_> = relay.runtime.block_on(async {
+        let node = client(&relay).await;
+        let mut pongs = Vec::new();
+        for _ in 0..3 {
+            pongs.push(node.ping(&addr).await.expect("a ping through n0 EU"));
+        }
+        node.close().await;
+        pongs
+    });
+    for pong in &pongs {
+        eprintln!("live: ping {:?} via {:?}", pong.rtt, pong.path);
+        assert_eq!(pong.path, mesh_transport::Path::Relay);
+    }
+
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice", &[]);
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob", &[]);
+    let code = ask(&mut alice, "codeCreate", &["", "1"], "meshCodes")["created"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    until(&mut alice, "meshCodes", |p| {
+        (p["codes"].as_array().unwrap().iter()).any(|c| c["code"] == code && c["held"] == true)
+    });
+    let found = ask(&mut bob, "codeResolve", &[&code], "meshResolved");
+    assert_eq!(found["id"], id_a.as_str());
+    eprintln!("live: code held by Alice and found by Bob");
+
+    alice.expect("friendAdd", &[&id_b, ""], "meshSocial");
+    bob.expect("friendAdd", &[&id_a, ""], "meshSocial");
+    alice.social_until(|s| has(s, "friends", &id_b));
+    bob.social_until(|s| has(s, "friends", &id_a));
+    ask(&mut alice, "dmSend", &[&id_b, "hi"], "meshDmMessages");
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "hi");
+    page_until(&mut alice, &id_b, |p| p["events"][0]["sent"] == true);
+    locks(&mut bob);
+    ask(&mut alice, "dmSend", &[&id_b, "one"], "meshDmMessages");
+    locks(&mut alice);
+    let started = Instant::now();
+    bob.send("idUnlock", &["bob", PASSWORD]);
+    until(&mut bob, "meshDmNotify", |n| n["text"] == "one");
+    eprintln!(
+        "live: mail \"one\" came {:?} after Bob unlocked",
+        started.elapsed()
+    );
+    let alice_log = alice.quit();
+    bob.quit();
+    assert_eq!(mailed(&alice_log), 1, "\"one\" went by mail");
+
+    let log = seed.stop();
+    for line in log
+        .iter()
+        .filter(|l| l.contains("last hour") || l.contains("relay-only"))
+    {
+        eprintln!("live: {line}");
+    }
     drop(relay.runtime);
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
