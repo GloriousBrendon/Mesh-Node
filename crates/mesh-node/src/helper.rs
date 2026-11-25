@@ -86,9 +86,10 @@ const _: () = assert!(REHOLD_EVERY.as_secs() * 7 <= crate::codes::HOLD_LIFE);
 /// A failed publish is tried again after this, doubling up to the refresh.
 const PUBLISH_RETRY: Duration = Duration::from_secs(60);
 /// Seeds every install knows (SPEC-seed D6); `--seed` replaces them.
-/// The homelab seed: relay on the public 443, direct on UDP 7842 (D8c).
+/// The homelab seed: relay-only, on n0's EU relay (the closest n0 region to
+/// it); it takes no direct callers and shows no address (D8c as changed).
 pub const SEEDS: &[&str] = &[
-    "mesh://node/1191ccb55a67bcf6fe9408ccd615fce54ff8af653b19a4909f4dbdc967e9533e?relay=https://relay.nagbreeklabs.co.za/&addr=154.118.246.15:7842",
+    "mesh://node/1191ccb55a67bcf6fe9408ccd615fce54ff8af653b19a4909f4dbdc967e9533e?relay=https://euc1-1.relay.n0.iroh.link./",
 ];
 
 #[derive(Deserialize)]

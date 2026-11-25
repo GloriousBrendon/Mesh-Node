@@ -147,6 +147,13 @@ fn test_1_clocks_behind() {
     one_to_one("mail1-behind", "-30");
 }
 
+/// Test 1 through a relay-only seed, as the home seed runs (SPEC-seed D8c
+/// as changed).
+#[test]
+fn test_1_through_a_relay_only_seed() {
+    one_to_one_with("mail1-relay-only", "0", &["--mail", "--relay-only"]);
+}
+
 /// Claims the seed refused, by the helper's own count lines.
 fn refused(stderr: &str) -> u64 {
     stderr
@@ -158,9 +165,13 @@ fn refused(stderr: &str) -> u64 {
 }
 
 fn one_to_one(name: &str, clock: &str) {
+    one_to_one_with(name, clock, &["--mail"]);
+}
+
+fn one_to_one_with(name: &str, clock: &str, seed_args: &[&str]) {
     let dirs = ["seed", "alice", "bob"].map(|n| temp_dir(&format!("{name}-{n}")));
     let relay = Relay::start();
-    let mut seed = Seed::start_with(&dirs[0], &relay, &["--mail"]);
+    let mut seed = Seed::start_with(&dirs[0], &relay, seed_args);
     let ticket = seed.ticket();
     // Records long enough to outlast the clocks' gap (routing D4's are 2 h).
     let skewed = ["--clock-offset", clock, "--record-ttl", SKEWED_TTL];
