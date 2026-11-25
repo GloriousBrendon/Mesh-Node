@@ -1,13 +1,13 @@
-# mesh-node in seed mode without Docker (a VPS later). Put the relay URL in
-# /etc/mesh-seed.env as MESH_RELAY_URL=https://relay.example.org
+# mesh-node in seed mode without Docker (a VPS later), relay-only through
+# n0's EU relay as in compose.yaml (SPEC-seed D8c as changed): it opens no
+# port. A seed meant to take direct callers uses --port/--public instead.
 [Unit]
 Description=Mesh seed
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-EnvironmentFile=/etc/mesh-seed.env
-ExecStart=/usr/local/bin/mesh-node seed --data /var/lib/mesh-seed --relay ${MESH_RELAY_URL}
+ExecStart=/usr/local/bin/mesh-node seed --data /var/lib/mesh-seed --relay-only --relay https://euc1-1.relay.n0.iroh.link. --mail --mail-max 2147483648
 Restart=on-failure
 DynamicUser=yes
 StateDirectory=mesh-seed

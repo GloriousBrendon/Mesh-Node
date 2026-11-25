@@ -1,13 +1,12 @@
-# Mesh's seed and relay (SPEC-seed). No ports are published: Caddy reaches
-# the relay over the proxy network, and the seed is reached through the
-# relay like any Mesh device (D0).
+# Mesh's seed (SPEC-seed), relay-only (D8c as changed): it only dials out,
+# to n0's EU relay, and callers reach it through that relay alone. No ports
+# are published and nothing needs forwarding; its address is never shown.
 #
-#   cp .env.example .env   # then set MESH_RELAY_URL and PROXY_NETWORK
 #   docker compose up -d --build
 #   docker compose logs seed | grep ticket   # the seed's ticket
 #
 # To update, unpack the new source (`git archive <commit>`) into a fresh
-# folder and carry over deploy/.env and any local compose changes; don't
+# folder and carry over any local compose changes; don't
 # unpack over the old tree, which keeps files the new one deleted. The
 # project name (`name: mesh`) keeps the same seed-data volume and ticket.
 # A rented server for a second seed: what it needs is in SERVER.md.
@@ -21,21 +20,20 @@ x-hardened: &hardened
   user: "65532:65532"
 
 services:
-  relay:
-    <<: *hardened
-    build:
-      context: ..
-      dockerfile: deploy/relay.Dockerfile
-    image: mesh-relay:1.4.1
-    networks: [proxy]
-
   seed:
     <<: *hardened
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     image: mesh-seed
-    command: ["--relay", "${MESH_RELAY_URL:?set MESH_RELAY_URL in .env}"]
+    # The relay is in the built-in ticket (helper::SEEDS): change both together.
+    command:
+      - --relay-only
+      - --relay
+      - https://euc1-1.relay.n0.iroh.link.
+      - --mail
+      - --mail-max
+      - "2147483648"
     volumes:
       - seed-data:/data
     networks: [default]
@@ -43,9 +41,3 @@ services:
 
 volumes:
   seed-data:
-
-networks:
-  # The network Caddy is on, so it can proxy relay.<domain> to relay:3340.
-  proxy:
-    external: true
-    name: ${PROXY_NETWORK:-proxy}
