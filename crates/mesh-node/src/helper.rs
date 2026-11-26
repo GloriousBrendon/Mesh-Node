@@ -277,6 +277,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
                 helper.dial_contacts();
                 helper.sync_own();
                 helper.fetch_keys(None);
+                helper.rotate_if_old();
                 continue;
             }
             _ = collect.tick() => {
@@ -431,6 +432,10 @@ struct Helper {
 
 struct Net {
     node: crate::nodes::Nodes,
+    /// What a rotated direct node starts with (P4), besides its key.
+    direct_config: Config,
+    /// The direct node's loops, stopped when it's replaced.
+    direct_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The throwaway identity's node, for seeds only (D7b).
     anon: Arc<Node>,
     /// Its address gets' budget, shared by every lookup (S14).
@@ -466,6 +471,10 @@ enum Back {
     /// A device told us its direct key (connection-privacy P3): who, the
     /// cert (its device is the one that sent it) and its relay.
     Direct(Box<(MeshId, DirectCert, String)>),
+    /// A rotated direct key's node started (P4).
+    DirectStarted(Box<(Node, DirectCert)>),
+    /// The direct node has a relay now, so friends can be told it.
+    DirectOnline,
     /// A history stream's request (SPEC-spaces S10).
     HistoryAsk(Box<spaces::HistoryAsked>),
     /// One frame of a history pull.
@@ -1315,6 +1324,11 @@ impl Helper {
                 let (id, cert, relay) = *told;
                 return self.direct_heard(&id, &cert, &relay);
             }
+            Back::DirectOnline => return self.tell_direct_all(),
+            Back::DirectStarted(started) => {
+                let (node, cert) = *started;
+                return self.direct_started(node, cert);
+            }
             Back::Presence(heard) => {
                 let (id, device, heard, name) = *heard;
                 if heard.is_some() {
@@ -1911,7 +1925,7 @@ impl Helper {
         };
         let started = async {
             let relay = Node::start(store.device_key(), cert, config).await;
-            let direct = Node::start(&direct_key, cert, direct_config).await;
+            let direct = Node::start(&direct_key, cert, direct_config.clone()).await;
             let anon = anon_node(self.relays.clone()).await?;
             Ok::<_, String>((
                 relay.map_err(|e| e.to_string())?,
@@ -1932,22 +1946,27 @@ impl Helper {
                     keys.clone(),
                     self.back.clone(),
                 ));
+                let peers = tokio::spawn(watch_peers(relay.clone(), self.back.clone()));
+                let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
+                let streams = tokio::spawn(serve_streams(
+                    relay,
+                    own,
+                    self.blobs_dir(),
+                    self.back.clone(),
+                ));
+                // Friends who connect before the direct node has a relay
+                // aren't told it then; they are once it has one.
                 let back = self.back.clone();
-                let peers = tokio::spawn({
-                    let (relay, direct) = (relay.clone(), direct.clone());
-                    async move {
-                        tokio::join!(watch_peers(relay, back.clone()), watch_peers(direct, back));
+                let waiting = direct.clone();
+                tokio::spawn(async move {
+                    if waiting.online(Duration::from_secs(30)).await {
+                        let _ = back.send(Back::DirectOnline);
                     }
                 });
-                let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
-                let (blobs, back) = (self.blobs_dir(), self.back.clone());
-                let streams = tokio::spawn(async move {
-                    tokio::join!(
-                        serve_streams(relay, own, blobs.clone(), back.clone()),
-                        serve_streams(direct, own, blobs, back)
-                    );
-                });
+                let direct_tasks = self.direct_tasks(direct);
                 self.net = Some(Net {
+                    direct_config,
+                    direct_tasks,
                     node,
                     anon: Arc::new(anon),
                     gets: routing::Gets::default(),
@@ -1968,14 +1987,122 @@ impl Helper {
         }
     }
 
+    /// The loops a direct node needs: who connects, and their streams.
+    fn direct_tasks(&self, direct: Arc<Node>) -> Vec<tokio::task::JoinHandle<()>> {
+        let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
+        vec![
+            tokio::spawn(watch_peers(direct.clone(), self.back.clone())),
+            tokio::spawn(serve_streams(
+                direct,
+                own,
+                self.blobs_dir(),
+                self.back.clone(),
+            )),
+        ]
+    }
+
+    /// A new direct key (P4): when someone stops being a friend, and every
+    /// 7 days. The new node starts in the background (`Back::DirectStarted`).
+    fn rotate_direct(&self) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        if net.node.direct().is_none() {
+            return;
+        }
+        let now = unix_now();
+        let path = self.path.with_file_name("direct-issued");
+        if let Err(e) = std::fs::write(&path, now.to_string()) {
+            eprintln!("mesh-node: couldn't keep the direct key's time: {e}");
+        }
+        let this = store.device_key().public();
+        let Some(cert) = (store.devices().devices().iter())
+            .find(|d| *d.device() == this)
+            .cloned()
+        else {
+            return;
+        };
+        let (key, direct) = DirectCert::issue(store.device_key(), now);
+        let config = Config {
+            direct: Some(direct.clone()),
+            ..net.direct_config.clone()
+        };
+        let back = self.back.clone();
+        tokio::spawn(async move {
+            match Node::start(&key, &cert, config).await {
+                // Friends are told its relay, so it needs one first.
+                Ok(node) if node.online(Duration::from_secs(10)).await => {
+                    let _ = back.send(Back::DirectStarted(Box::new((node, direct))));
+                }
+                Ok(node) => {
+                    eprintln!("mesh-node: the new direct key's node found no relay");
+                    node.close().await;
+                }
+                Err(e) => eprintln!("mesh-node: the new direct key's node didn't start: {e}"),
+            }
+        });
+    }
+
+    /// The rotated direct node is up: it replaces the old one, friends and
+    /// our devices are told, and the old one closes once they've heard.
+    fn direct_started(&mut self, node: Node, cert: DirectCert) {
+        if self.net.is_none() {
+            // Locked meanwhile.
+            return;
+        }
+        let node = Arc::new(node);
+        let tasks = self.direct_tasks(node.clone());
+        let net = self.net.as_mut().expect("checked");
+        let old = net.node.swap_direct(Some(node));
+        let old_tasks = std::mem::replace(&mut net.direct_tasks, tasks);
+        self.direct_cert = Some(cert);
+        self.tell_direct_all();
+        // Friends were just told the new key; the old one reaches nothing now.
+        tokio::spawn(async move {
+            for task in old_tasks {
+                task.abort();
+            }
+            if let Some(old) = old {
+                old.close().await;
+            }
+        });
+    }
+
+    /// Tells our connected devices and friends our direct key (P3).
+    fn tell_direct_all(&self) {
+        let told: Vec<MeshId> = self
+            .store
+            .iter()
+            .flat_map(|store| {
+                std::iter::once(store.id()).chain(
+                    (store.account().entries().iter())
+                        .filter(|e| e.kind == Kind::Friend)
+                        .map(|e| e.id()),
+                )
+            })
+            .collect();
+        for id in &told {
+            self.tell_direct(id);
+        }
+    }
+
+    /// Rotates the direct key once it's 7 days old (P4).
+    fn rotate_if_old(&self) {
+        let issued = self.direct_cert.as_ref().map(DirectCert::issued_at);
+        if issued.is_some_and(|at| unix_now().saturating_sub(at) >= DIRECT_LIFE) {
+            self.rotate_direct();
+        }
+    }
+
     /// When the direct key in use was issued (P4): kept beside the identity,
     /// so the key stays the same across restarts. A missing or unreadable
-    /// file starts a new key, which is the safe side.
+    /// file, or a key 7 days old, starts a new key, which is the safe side.
     fn direct_issued(&self) -> u64 {
         let path = self.path.with_file_name("direct-issued");
         let kept = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok());
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|at| unix_now().saturating_sub(*at) < DIRECT_LIFE);
         kept.unwrap_or_else(|| {
             let now = unix_now();
             if let Err(e) = std::fs::write(&path, now.to_string()) {
@@ -1993,6 +2120,9 @@ impl Helper {
             net.watch.abort();
             net.peers.abort();
             net.streams.abort();
+            for task in &net.direct_tasks {
+                task.abort();
+            }
             net.anon.close().await;
             net.node.close().await;
             self.held.clear();
@@ -2046,11 +2176,24 @@ impl Helper {
                     .map(|e| e.id().to_bytes()),
             )
         });
-        let friends = friends.take(if self.cut_live { 1 } else { usize::MAX });
-        *self
-            .friends
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = friends.collect();
+        let friends: HashSet<[u8; 32]> = friends
+            .take(if self.cut_live { 1 } else { usize::MAX })
+            .collect();
+        let before = std::mem::replace(
+            &mut *self
+                .friends
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            friends.clone(),
+        );
+        // Someone stopped being a friend: they knew the direct key (P4, P5).
+        if before.iter().any(|id| !friends.contains(id)) {
+            if let Some(net) = &self.net {
+                net.node
+                    .forget_all_but(|id| friends.contains(&id.to_bytes()));
+            }
+            self.rotate_direct();
+        }
         if let Some(net) = &self.net {
             net.node.prune();
         }
@@ -2274,6 +2417,9 @@ fn emit_fail(func: &str, kind: &str, message: &str) {
         json!({ "fn": func, "kind": kind, "message": message }),
     );
 }
+
+/// How long a direct key lasts before it's replaced (P4).
+const DIRECT_LIFE: u64 = 7 * 86_400;
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)

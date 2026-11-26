@@ -145,3 +145,113 @@ fn friends_go_direct_and_space_strangers_stay_relayed() {
     }
     seed.stop();
 }
+
+/// One `netPingId`: the path, or `None` if it was refused or unreachable.
+fn ping_once(from: &mut Helper, to: &str) -> Option<String> {
+    from.send("netPingId", &[to]);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(40) {
+        let (got, payload) = from.event();
+        match got.as_str() {
+            "meshPing" => return payload["path"].as_str().map(str::to_owned),
+            "meshError" if payload["fn"] == "netPingId" => return None,
+            _ => {}
+        }
+    }
+    fail("netPingId: no answer");
+}
+
+/// The direct key's issue time `h` (in `dir`) keeps, waiting up to 15 s
+/// for it to differ from `not`.
+fn issued(dir: &std::path::Path, not: &str) -> String {
+    let started = Instant::now();
+    loop {
+        let now = std::fs::read_to_string(dir.join("direct-issued")).unwrap_or_default();
+        if now != not || started.elapsed() > Duration::from_secs(15) {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Three people: O is friends with B and C, and both are direct with O.
+fn three(name: &str) -> (Relay, Seed, [std::path::PathBuf; 4], [(Helper, String); 3]) {
+    let dirs = ["seed", "o", "b", "c"].map(|n| temp_dir(&format!("{name}-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut o, id_o) = helper(&dirs[1], &relay, &ticket, "owen");
+    let (mut b, id_b) = helper(&dirs[2], &relay, &ticket, "bea");
+    let (mut c, id_c) = helper(&dirs[3], &relay, &ticket, "cal");
+    befriend(&mut o, &id_o, &mut b, &id_b);
+    befriend(&mut o, &id_o, &mut c, &id_c);
+    assert_eq!(ping_until(&mut b, &id_o, "direct"), "direct");
+    assert_eq!(ping_until(&mut c, &id_o, "direct"), "direct");
+    (relay, seed, dirs, [(o, id_o), (b, id_b), (c, id_c)])
+}
+
+#[test]
+fn unfriending_and_blocking_rotate_the_direct_key() {
+    let (_relay, seed, dirs, [(mut o, id_o), (mut b, id_b), (mut c, id_c)]) = three("rotate");
+    let first = issued(&dirs[1], "");
+    assert!(!first.is_empty(), "no direct-issued beside O's identity");
+
+    // O removes C: a new key, B (still a friend) moves to it, C gets nothing.
+    std::thread::sleep(Duration::from_secs(1));
+    ask(&mut o, "friendRemove", &[&id_c], "meshSocial");
+    let second = issued(&dirs[1], &first);
+    assert_ne!(
+        second, first,
+        "removing a friend didn't rotate the direct key"
+    );
+    assert_eq!(
+        ping_until(&mut b, &id_o, "direct"),
+        "direct",
+        "B didn't move to the new key"
+    );
+    assert_ne!(
+        ping_once(&mut c, &id_o).as_deref(),
+        Some("direct"),
+        "C still goes direct"
+    );
+
+    // O blocks B: another key, and B never goes direct again.
+    std::thread::sleep(Duration::from_secs(1));
+    ask(&mut o, "block", &[&id_b], "meshSocial");
+    let third = issued(&dirs[1], &second);
+    assert_ne!(third, second, "blocking didn't rotate the direct key");
+    assert_ne!(
+        ping_once(&mut b, &id_o).as_deref(),
+        Some("direct"),
+        "B still goes direct"
+    );
+
+    for h in [o, b, c] {
+        h.quit();
+    }
+    seed.stop();
+}
+
+#[test]
+fn a_week_old_direct_key_is_replaced_and_friends_follow() {
+    let (_relay, seed, dirs, [(mut o, id_o), (mut b, _), (c, _)]) = three("week");
+    o.send("idLock", &[]);
+    until(&mut o, "meshIdentity", |i| i["state"] == "locked");
+    // As if O's key were issued 8 days ago.
+    let old = (mesh_identity::unix_now() - 8 * 86_400).to_string();
+    std::fs::write(dirs[1].join("direct-issued"), &old).unwrap();
+    o.send("idUnlock", &["owen", PASSWORD]);
+    until(&mut o, "meshIdentity", |i| i["state"] == "unlocked");
+    let new = issued(&dirs[1], &old);
+    assert_ne!(new, old, "the week-old key was kept");
+    assert_eq!(
+        ping_until(&mut b, &id_o, "direct"),
+        "direct",
+        "B didn't reach O's new key"
+    );
+
+    for h in [o, b, c] {
+        h.quit();
+    }
+    seed.stop();
+}

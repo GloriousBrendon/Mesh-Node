@@ -6,43 +6,54 @@
 //! the same way whichever node carries it.
 //!
 //! `open` and `ping` to a device go over the direct node when it already has
-//! a connection to that device, or knows its direct key; otherwise, and if
-//! that fails, over the relay node. `relayed()` is the same pair for Space
+//! a connection to that device; otherwise over the relay node, while the
+//! direct node dials the device's direct key (if known) in the background,
+//! for next time. So a direct key that's stale or not up yet (a friend who
+//! just restarted) never slows a message down. `relayed()` is the same pair for Space
 //! traffic (P14): direct only with our own devices, relayed with everyone
-//! else, friends included.
+//! else, friends included. The direct node is swapped on rotation (P4), for
+//! every holder at once.
 
 use mesh_identity::{DirectCert, MeshId};
 use mesh_transport::{
     MeshAddr, Node, Peer, Pong, PublicKey, RecvStream, SendStream, Status, TransportError,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// The service a device tells a friend its direct key on: one frame, the
 /// `DirectCert` then the direct node's relay URL. Sent again on rotation.
 pub const DIRECT: &str = "direct";
 
-/// Friends' and own devices' direct addresses, by device key, and whether
-/// the device is one of ours.
-type Directs = Arc<Mutex<HashMap<[u8; 32], (MeshAddr, bool)>>>;
+/// One friend's or own device's direct address.
+#[derive(Clone)]
+struct Known {
+    addr: MeshAddr,
+    id: MeshId,
+    own: bool,
+}
 
 #[derive(Clone)]
 pub struct Nodes {
     pub relay: Arc<Node>,
     /// `None` with Hide my IP on (P6).
-    pub direct: Option<Arc<Node>>,
-    directs: Directs,
+    direct: Arc<RwLock<Option<Arc<Node>>>>,
+    /// By device key.
+    directs: Arc<Mutex<HashMap<[u8; 32], Known>>>,
     /// `relayed()`: the direct node is for our own devices only.
     own_only: bool,
+    /// Devices a background direct dial is under way to.
+    dialling: Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
 }
 
 impl Nodes {
     pub fn new(relay: Arc<Node>, direct: Option<Arc<Node>>) -> Self {
         Self {
             relay,
-            direct,
-            directs: Directs::default(),
+            direct: Arc::new(RwLock::new(direct)),
+            directs: Arc::default(),
             own_only: false,
+            dialling: Arc::default(),
         }
     }
 
@@ -55,42 +66,56 @@ impl Nodes {
         }
     }
 
-    /// Remembers a friend's or own (`own`) device's direct address, from a
-    /// `direct` frame `cert`'s device sent. The caller checks whose it is.
-    pub fn learn(&self, cert: &DirectCert, relay: &str, own: bool) -> bool {
+    pub fn direct(&self) -> Option<Arc<Node>> {
+        read(&self.direct).clone()
+    }
+
+    /// Puts in a new direct node (rotation, P4), returning the old one.
+    pub fn swap_direct(&self, new: Option<Arc<Node>>) -> Option<Arc<Node>> {
+        let mut direct = (self.direct.write()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut direct, new)
+    }
+
+    /// Remembers `id`'s device's direct address, from a `direct` frame that
+    /// `cert`'s device sent; `own` if `id` is us. The caller checks it's us
+    /// or a friend.
+    pub fn learn(&self, id: &MeshId, cert: &DirectCert, relay: &str, own: bool) -> bool {
         let Some(addr) = MeshAddr::from_parts(cert.direct().as_bytes(), relay) else {
             return false;
         };
-        lock(&self.directs).insert(*cert.device().as_bytes(), (addr, own));
+        let known = Known { addr, id: *id, own };
+        lock(&self.directs).insert(*cert.device().as_bytes(), known);
         true
     }
 
-    /// Forgets every direct address of `devices` (unfriended or blocked).
-    pub fn forget(&self, devices: impl IntoIterator<Item = [u8; 32]>) {
-        let mut directs = lock(&self.directs);
-        for device in devices {
-            directs.remove(&device);
-        }
+    /// Forgets the direct addresses of everyone `keep` says no to (no longer
+    /// a friend: removed or blocked).
+    pub fn forget_all_but(&self, keep: impl Fn(&MeshId) -> bool) {
+        lock(&self.directs).retain(|_, k| keep(&k.id));
     }
 
-    /// The direct node and the address to use on it for `addr`'s device.
-    fn pick(&self, addr: &MeshAddr) -> Option<(&Node, MeshAddr)> {
-        self.direct_for(&addr.device)
-            .map(|(d, known)| (d, known.unwrap_or_else(|| addr.clone())))
-    }
-
-    /// The direct node if `device` may use it here, and its direct address
-    /// when there's no open connection to reuse.
-    fn direct_for(&self, device: &PublicKey) -> Option<(&Node, Option<MeshAddr>)> {
-        let direct = self.direct.as_deref()?;
-        let known = lock(&self.directs).get(device.as_bytes()).cloned();
-        if self.own_only && !known.as_ref().is_some_and(|(_, own)| *own) {
+    /// The direct node if it has a connection to `addr`'s device that may
+    /// be used here. With none, a background dial to its direct key, once.
+    fn pick(&self, addr: &MeshAddr) -> Option<Arc<Node>> {
+        let direct = self.direct()?;
+        let known = lock(&self.directs).get(addr.device.as_bytes()).cloned();
+        if self.own_only && !known.as_ref().is_some_and(|k| k.own) {
             return None;
         }
-        if direct.has(device) {
-            return Some((direct, None));
+        if direct.has(&addr.device) {
+            return Some(direct);
         }
-        known.map(|(addr, _)| (direct, Some(addr)))
+        let device = *addr.device.as_bytes();
+        if let Some(known) = known
+            && lock(&self.dialling).insert(device)
+        {
+            let dialling = self.dialling.clone();
+            tokio::spawn(async move {
+                let _ = direct.dial(&known.addr).await;
+                lock(&dialling).remove(&device);
+            });
+        }
+        None
     }
 
     pub async fn open(
@@ -98,8 +123,8 @@ impl Nodes {
         addr: &MeshAddr,
         service: &str,
     ) -> Result<(Peer, SendStream, RecvStream), TransportError> {
-        if let Some((direct, at)) = self.pick(addr)
-            && let Ok(opened) = direct.open(&at, service).await
+        if let Some(direct) = self.pick(addr)
+            && let Ok(opened) = direct.open(addr, service).await
         {
             return Ok(opened);
         }
@@ -107,8 +132,8 @@ impl Nodes {
     }
 
     pub async fn ping(&self, addr: &MeshAddr) -> Result<Pong, TransportError> {
-        if let Some((direct, at)) = self.pick(addr)
-            && let Ok(pong) = direct.ping(&at).await
+        if let Some(direct) = self.pick(addr)
+            && let Ok(pong) = direct.ping(addr).await
         {
             return Ok(pong);
         }
@@ -116,11 +141,7 @@ impl Nodes {
     }
 
     pub fn send_datagram(&self, device: &PublicKey, data: Vec<u8>) -> bool {
-        let direct = self
-            .direct_for(device)
-            .filter(|(d, _)| d.has(device))
-            .map(|(d, _)| d);
-        match direct {
+        match MeshAddr::from_device(device.as_bytes()).and_then(|a| self.pick(&a)) {
             Some(direct) => direct.send_datagram(device, data),
             None => self.relay.send_datagram(device, data),
         }
@@ -128,7 +149,7 @@ impl Nodes {
 
     /// The next datagram from either node.
     pub async fn next_datagram(&self) -> Option<(Peer, Vec<u8>)> {
-        match &self.direct {
+        match self.direct() {
             Some(direct) => tokio::select! {
                 got = self.relay.next_datagram() => got,
                 got = direct.next_datagram() => got,
@@ -140,7 +161,7 @@ impl Nodes {
     /// `id`'s devices with an open connection on either node, by device key.
     pub fn connected(&self, id: &MeshId) -> Vec<MeshAddr> {
         let mut all = self.relay.connected(id);
-        for addr in self.direct.iter().flat_map(|d| d.connected(id)) {
+        for addr in self.direct().iter().flat_map(|d| d.connected(id)) {
             if !all.iter().any(|a| a.device == addr.device) {
                 all.push(addr);
             }
@@ -161,14 +182,14 @@ impl Nodes {
     }
 
     pub fn open_connections(&self) -> usize {
-        self.relay.open_connections() + self.direct.as_ref().map_or(0, |d| d.open_connections())
+        self.relay.open_connections() + self.direct().map_or(0, |d| d.open_connections())
     }
 
     /// The relay node's state, `direct` if either has a direct path, and the
     /// devices connected on both.
     pub fn status(&self) -> Status {
         let mut status = self.relay.status();
-        if let Some(direct) = &self.direct {
+        if let Some(direct) = self.direct() {
             let theirs = direct.status();
             status.direct |= theirs.direct;
             status.connections += theirs.connections;
@@ -182,7 +203,7 @@ impl Nodes {
     }
 
     pub async fn close(&self) {
-        if let Some(direct) = &self.direct {
+        if let Some(direct) = self.swap_direct(None) {
             direct.close().await;
         }
         self.relay.close().await;
@@ -190,12 +211,16 @@ impl Nodes {
 
     fn each(&self, f: impl Fn(&Node)) {
         f(&self.relay);
-        if let Some(direct) = &self.direct {
-            f(direct);
+        if let Some(direct) = self.direct() {
+            f(&direct);
         }
     }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

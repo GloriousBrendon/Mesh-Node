@@ -299,7 +299,7 @@ impl Helper {
     /// (Hide my IP) or it has no relay yet.
     pub(super) fn direct_frame(&self) -> Option<Vec<u8>> {
         let cert = self.direct_cert.as_ref()?;
-        let relay = self.net.as_ref()?.node.direct.as_ref()?.addr().relay?;
+        let relay = self.net.as_ref()?.node.direct()?.addr().relay?;
         Some([cert.to_bytes(), relay.to_string().into_bytes()].concat())
     }
 
@@ -326,7 +326,7 @@ impl Helper {
         };
         let own = *id == store.id();
         if own || store.account().kind(id) == Some(Kind::Friend) {
-            net.node.learn(cert, relay, own);
+            net.node.learn(id, cert, relay, own);
         }
     }
 
@@ -446,7 +446,13 @@ impl Helper {
             return false;
         };
         match store.connected(id) {
-            Ok(changed) => changed,
+            Ok(changed) => {
+                // A new friend: the direct node lets them in from now (P3).
+                if changed {
+                    self.allow_contacts();
+                }
+                changed
+            }
             Err(e) => {
                 eprintln!("mesh-node: couldn't save a new friend: {e}");
                 false
