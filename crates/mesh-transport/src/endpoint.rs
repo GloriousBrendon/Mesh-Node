@@ -312,6 +312,12 @@ impl Node {
             .collect()
     }
 
+    /// Whether a connection to `device` is open: its device key, or the key
+    /// it's really on (a direct key).
+    pub fn has(&self, device: &iroh::PublicKey) -> bool {
+        self.shared.open(device).is_some()
+    }
+
     /// Open connections, to anyone.
     pub fn open_connections(&self) -> usize {
         (lock(&self.shared.conns).values())

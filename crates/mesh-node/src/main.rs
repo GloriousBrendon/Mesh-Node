@@ -40,6 +40,7 @@ mod maillog;
 mod mailstore;
 #[cfg(feature = "audio")]
 mod media;
+mod nodes;
 mod routing;
 mod saved;
 mod seed;

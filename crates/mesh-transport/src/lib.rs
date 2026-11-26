@@ -10,7 +10,8 @@ pub mod ticket;
 
 pub use endpoint::Node;
 pub use handshake::{ALPN, HandshakeError};
-pub use iroh::RelayUrl;
+pub use iroh::endpoint::{RecvStream, SendStream};
+pub use iroh::{PublicKey, RelayUrl};
 
 use mesh_identity::{DeviceKey, MeshId};
 use std::net::SocketAddr;

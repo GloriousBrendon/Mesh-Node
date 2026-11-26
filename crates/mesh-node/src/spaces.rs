@@ -802,7 +802,7 @@ impl Helper {
         let others = (v.state.members.keys()).filter(|p| **p != me);
         for person in others.filter_map(|p| MeshId::from_bytes(p).ok()) {
             for addr in net.node.connected(&person) {
-                let (node, frame) = (net.node.clone(), frame.clone());
+                let (node, frame) = (net.node.relayed(), frame.clone());
                 tokio::spawn(async move {
                     if let Ok((_, mut send, _)) = node.open(&addr, dm::TYPING).await {
                         let _ = mesh_transport::frame::write_frame(&mut send, &frame).await;
@@ -1102,7 +1102,7 @@ impl Helper {
         self.peer_used(id);
         let Some(net) = &self.net else { return };
         self.space_flight.insert(device);
-        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        let (node, back, id) = (net.node.relayed(), self.back.clone(), *id);
         tokio::spawn(async move {
             let frames: Vec<Vec<u8>> = (envelopes.iter())
                 .map(|e| [&[dm::ANSWER][..], e].concat())
@@ -1569,7 +1569,7 @@ impl Helper {
         pull.under_way = true;
         let mut parts: Vec<Option<ChannelId>> = vec![None];
         parts.extend(v.state.channels.keys().copied().map(Some));
-        let (node, back, space) = (net.node.clone(), self.back.clone(), *space);
+        let (node, back, space) = (net.node.relayed(), self.back.clone(), *space);
         tokio::spawn(async move {
             if let Ok((_, mut send, mut recv)) = node.open(&addr, SPACE_HISTORY).await {
                 'parts: for part in parts {
@@ -2329,7 +2329,7 @@ impl Helper {
         let Some(target) = Target::of(store, id).filter(|t| t.last.is_some()) else {
             return;
         };
-        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        let (node, back, id) = (net.node.relayed(), self.back.clone(), *id);
         tokio::spawn(async move {
             if let Some(Reached { last, list, .. }) = routing::reach_known(&node, &target).await {
                 let _ = back.send(Back::Reached(Box::new((id, last, list))));
@@ -2362,7 +2362,7 @@ impl Helper {
             }
             return;
         }
-        let (node, anon) = (net.node.clone(), net.anon.clone());
+        let (node, anon) = (net.node.relayed(), net.anon.clone());
         // The hello takes only spare gets: sends and key lookups go first.
         let gets = if hello {
             net.gets.spare()
