@@ -62,6 +62,8 @@ mod link;
 mod mail;
 #[path = "mailrec.rs"]
 mod mailrec;
+#[path = "reports.rs"]
+mod reports;
 #[path = "social.rs"]
 mod social;
 #[path = "spaces.rs"]
@@ -281,6 +283,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
                 helper.sync_own();
                 helper.fetch_keys(None);
                 helper.rotate_if_old();
+                helper.report_retry();
                 continue;
             }
             _ = collect.tick() => {
@@ -341,6 +344,8 @@ struct Helper {
     /// Who may connect: our ID and our contacts', each with the devices its
     /// newest known list removed (D9; audit finding 2).
     allowed: Arc<RwLock<Allowed>>,
+    /// Reports waiting for a Space's owner, and those we hold as one (P11).
+    reports: reports::Reports,
     /// Who the direct node lets in: our ID and our friends' (P3).
     friends: Arc<RwLock<HashSet<[u8; 32]>>>,
     /// The direct key's certificate while networking runs: what friends are told.
@@ -478,6 +483,8 @@ enum Back {
     Direct(Box<(MeshId, DirectCert, String)>),
     /// A rotated direct key's node started (P4).
     DirectStarted(Box<(Node, DirectCert)>),
+    /// One of this owner's devices took these reports (P11).
+    ReportTaken(Box<(MeshId, Vec<reports::Report>)>),
     /// The direct node has a relay now, so friends can be told it.
     DirectOnline,
     /// A history stream's request (SPEC-spaces S10).
@@ -582,6 +589,7 @@ impl Helper {
             back,
             allowed: Arc::default(),
             friends: Arc::default(),
+            reports: reports::Reports::default(),
             direct_cert: None,
             record_ttl: routing::RECORD_TTL,
             cut: None,
@@ -1192,6 +1200,7 @@ impl Helper {
                 // never met: their keys come only from records).
                 for id in learned {
                     self.space_deliver(&id);
+                    self.report_deliver(&id);
                 }
                 return;
             }
@@ -1318,6 +1327,7 @@ impl Helper {
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
                 self.space_deliver(&id);
+                self.report_deliver(&id);
                 self.history_again(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
@@ -1345,6 +1355,10 @@ impl Helper {
                 return self.direct_heard(&id, &cert, &relay);
             }
             Back::DirectOnline => return self.tell_direct_all(),
+            Back::ReportTaken(taken) => {
+                let (owner, sent) = *taken;
+                return self.report_taken(&owner, &sent);
+            }
             Back::DirectStarted(started) => {
                 let (node, cert) = *started;
                 return self.direct_started(node, cert);
@@ -1579,6 +1593,7 @@ impl Helper {
         let mut events = Vec::new();
         let mut synced = Vec::new();
         let mut space_in = Vec::new();
+        let mut reports_in = Vec::new();
         let (mut unknown, mut fresh) = (false, false);
         let envelopes: Vec<Vec<u8>> = frames.iter().map(|(_, e)| e.clone()).collect();
         // One save for the whole stream (PLAN-dm Task 8).
@@ -1621,6 +1636,10 @@ impl Helper {
                         if opened.kind == NoteKind::Message {
                             // A Space event (SPEC-spaces): its own layout.
                             let first = opened.body.first().copied();
+                            if first == Some(reports::REPORT_LAYOUT) {
+                                reports_in.push(opened.body);
+                                continue;
+                            }
                             if first == Some(mesh_dm::space_store::SPACE_LAYOUT)
                                 || first == Some(mesh_dm::space_store::SPACE_BATCH)
                             {
@@ -1678,6 +1697,9 @@ impl Helper {
         }
         if !synced.is_empty() {
             self.dm_take_synced(&device, synced, &mut answers);
+        }
+        for body in reports_in {
+            self.report_heard(&id, &body);
         }
         if !space_in.is_empty() {
             self.space_take(&id, &device, space_in, &mut answers);
@@ -1885,6 +1907,7 @@ impl Helper {
             .ok();
         self.open_dm();
         self.open_spaces();
+        self.reports_load();
         let Some(store) = &self.store else { return };
         let this = store.device_key().public();
         let Some(cert) = store

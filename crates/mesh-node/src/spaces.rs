@@ -550,7 +550,7 @@ fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
-fn hex16(bytes: &[u8; 16]) -> String {
+pub(super) fn hex16(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -2076,6 +2076,9 @@ impl Helper {
                     members,
                 )?;
             }
+            "spaceReport" => self.space_report(args)?,
+            "spaceReports" => self.emit_reports(&parse16(arg(0)?, "Space")?),
+            "spaceReportDismiss" => self.report_dismiss(args)?,
             "spaceTyping" => {
                 let space = parse16(arg(0)?, "Space")?;
                 let channel = parse16(arg(1)?, "channel")?;

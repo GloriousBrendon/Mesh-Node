@@ -337,3 +337,75 @@ fn hide_my_ip_relays_friends_too() {
     }
     seed.stop();
 }
+
+#[test]
+fn a_report_reaches_the_owner_only_and_waits_for_them() {
+    let dirs = ["seed", "o", "b", "c"].map(|n| temp_dir(&format!("report-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut o, id_o) = helper(&dirs[1], &relay, &ticket, "owen");
+    let (mut b, id_b) = helper(&dirs[2], &relay, &ticket, "bea");
+    let (mut c, id_c) = helper(&dirs[3], &relay, &ticket, "cal");
+    befriend(&mut o, &id_o, &mut b, &id_b);
+    befriend(&mut o, &id_o, &mut c, &id_c);
+    let made = ask(&mut o, "spaceCreate", &["club"], "meshSpaces");
+    let club = |v: &Value| {
+        (v["spaces"].as_array().unwrap().iter())
+            .find(|s| s["name"] == "club")
+            .cloned()
+    };
+    let s = club(&made).unwrap()["id"].as_str().unwrap().to_owned();
+    ask(&mut o, "spaceAdd", &[&s, &id_b], "meshSpaces");
+    ask(&mut o, "spaceAdd", &[&s, &id_c], "meshSpaces");
+    for h in [&mut b, &mut c] {
+        until(h, "meshSpaces", |v| {
+            club(v).is_some_and(|s| s["members"].as_array().is_some_and(|m| m.len() == 3))
+        });
+    }
+
+    // The owner is away; B reports C, with one of C's messages.
+    o.send("idLock", &[]);
+    until(&mut o, "meshIdentity", |i| i["state"] == "locked");
+    ask(
+        &mut b,
+        "spaceReport",
+        &[&s, &id_c, "spam", "buy now"],
+        "meshDone",
+    );
+    let err = ask(&mut b, "spaceReport", &[&s, &id_b, "me"], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+
+    // Back: the report comes, from B, about C.
+    o.send("idUnlock", &["owen", PASSWORD]);
+    let got = until(&mut o, "meshSpaceReports", |r| {
+        r["reports"].as_array().is_some_and(|a| !a.is_empty())
+    });
+    let r = &got["reports"][0];
+    assert_eq!(
+        (r["from"].as_str(), r["about"].as_str()),
+        (Some(&*id_b), Some(&*id_c)),
+        "{got}"
+    );
+    assert_eq!(
+        (r["reason"].as_str(), r["quoted"][0].as_str()),
+        (Some("spam"), Some("buy now"))
+    );
+
+    // Nobody else holds one; the owner dismisses it.
+    let none = ask(&mut c, "spaceReports", &[&s], "meshSpaceReports");
+    assert_eq!(none["reports"], serde_json::json!([]), "C holds a report");
+    let at = r["at"].to_string();
+    let left = ask(
+        &mut o,
+        "spaceReportDismiss",
+        &[&s, &id_b, &at],
+        "meshSpaceReports",
+    );
+    assert_eq!(left["reports"], serde_json::json!([]));
+
+    for h in [o, b, c] {
+        h.quit();
+    }
+    seed.stop();
+}
