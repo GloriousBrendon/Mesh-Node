@@ -38,6 +38,7 @@ mod audio;
 mod codes;
 mod e2ee;
 mod fx;
+mod fxscan;
 mod helper;
 mod knocks;
 mod maillog;

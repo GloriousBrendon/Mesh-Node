@@ -948,6 +948,7 @@ impl Helper {
             "e2eeNote" => self.note(arg(0)?, arg(1)?, args.get(2).map(String::as_str))?,
             "deviceRemove" => self.remove_device(arg(0)?)?,
             "linkStart" => self.link_start()?,
+            "fxScan" => self.fx_scan(args.first().map_or("{}", String::as_str))?,
             f if f.starts_with("dm") => self.dm_command(f, args)?,
             f if f.starts_with("call") || f.starts_with("voice") || f == "audioTest" => {
                 self.call_command(f, args)?
@@ -2327,6 +2328,49 @@ impl Helper {
     }
 
     /// `meshIdentity`: nothing about the identity unless it's unlocked.
+    /// `fxScan {"dirs": [...], "fresh": bool}`: finds plugins in the
+    /// standard folders and `dirs` on a thread of its own, then
+    /// `meshFxPlugins`. `fresh` forgets the cache (Rescan).
+    fn fx_scan(&self, options: &str) -> Result<(), Fail> {
+        static SCANNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let options: Value = serde_json::from_str(options)
+            .map_err(|e| Fail("bad-argument", format!("fxScan takes a JSON object: {e}")))?;
+        if SCANNING.swap(true, Ordering::SeqCst) {
+            return Err(Fail("busy", "a plugin scan is already running".into()));
+        }
+        let mut dirs = crate::fxscan::standard_dirs();
+        dirs.extend(
+            options["dirs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from),
+        );
+        let cache_file = self.path.with_file_name("fx").join("scan.json");
+        let fresh = options["fresh"] == true;
+        std::thread::spawn(move || {
+            let cache = std::fs::read(&cache_file)
+                .ok()
+                .filter(|_| !fresh)
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let files = crate::fxscan::find(&dirs);
+            let scanner = crate::fx::mesh_fx_path();
+            let (cache, _) =
+                crate::fxscan::scan(&scanner, &files, &cache, crate::fxscan::SCAN_LIMIT);
+            if let Some(dir) = cache_file.parent()
+                && let Err(e) = std::fs::create_dir_all(dir)
+                    .and_then(|()| std::fs::write(&cache_file, cache.to_string()))
+            {
+                eprintln!("mesh-node: couldn't save the plugin scan: {e}");
+            }
+            emit("meshFxPlugins", crate::fxscan::event(&cache));
+            SCANNING.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+
     fn emit_identity(&self) {
         let keyring = self.keyring.as_ref().err();
         let Some(store) = &self.store else {

@@ -29,6 +29,15 @@ pub enum FxError {
     Dead,
 }
 
+/// `mesh-fx`: `MESH_FX` if set (tests, development), else beside us.
+pub fn mesh_fx_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("MESH_FX") {
+        return p.into();
+    }
+    let me = std::env::current_exe().unwrap_or_default();
+    me.with_file_name(format!("mesh-fx{}", std::env::consts::EXE_SUFFIX))
+}
+
 pub struct Fx {
     child: Child,
     to: SyncSender<Msg>,

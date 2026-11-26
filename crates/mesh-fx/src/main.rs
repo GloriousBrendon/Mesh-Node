@@ -2,6 +2,7 @@
 //! mesh-node's process (SPEC-voice-quality F2). Spike commands for now:
 //!
 //! mesh-fx list <file>                 the plugins in a .clap or .vst3
+//! mesh-fx scan <file>                 the same as one JSON line, for mesh-node (Task 3)
 //! mesh-fx gain <file> <id>            1 s of 440 Hz at -20 dBFS through it: dB change, block times
 //! mesh-fx edit <file> <id> [secs]     opens its editor for secs (default 10)
 //! mesh-fx serve                       mesh-node's end: messages on stdin/stdout (proto.rs)
@@ -52,6 +53,22 @@ fn run(args: &[String]) -> Result<(), String> {
             for p in list {
                 println!("{}\t{}\t{}", p.id, p.name, p.vendor);
             }
+        }
+        "scan" => {
+            let list = if vst3 {
+                vst3host::list(file)?
+            } else {
+                clap::list(file)?
+            };
+            let plugins: Vec<_> = list
+                .iter()
+                .map(|p| serde_json::json!({"id": p.id, "name": p.name, "vendor": p.vendor}))
+                .collect();
+            let format = if vst3 { "vst3" } else { "clap" };
+            println!(
+                "{}",
+                serde_json::json!({"format": format, "plugins": plugins})
+            );
         }
         "gain" => {
             let input = tone();
