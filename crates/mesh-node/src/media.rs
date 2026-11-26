@@ -802,8 +802,15 @@ impl Jitter {
             return;
         }
         self.packets.insert(seq, opus);
-        while self.packets.len() > JITTER_HOLD {
-            self.packets.pop_first();
+        if self.packets.len() > JITTER_HOLD {
+            // Playback stalled: keep the newest `target` frames and play from
+            // them; trailing a full window would conceal until the speaker paused.
+            let newest = *self.packets.keys().next_back().unwrap_or(&seq);
+            let from = newest.saturating_sub(self.target as u32 - 1);
+            self.packets = self.packets.split_off(&from);
+            if self.next.is_some() {
+                self.next = Some(from);
+            }
         }
     }
 
@@ -880,6 +887,32 @@ mod tests {
         assert_eq!(j.next, Some(2), "starts at the first");
         assert!(j.pop().is_some() && j.pop().is_some());
         assert!(j.pop().is_none(), "dry: gathers again");
+    }
+
+    /// Playback stalls past the hold while someone keeps talking: it skips to
+    /// the newest frames instead of concealing forever behind the window.
+    #[test]
+    fn a_stall_skips_to_the_newest() {
+        let packets = encoded(1);
+        let mut j = jitter();
+        for seq in 1..=3 {
+            j.push(seq, packets[0].clone());
+        }
+        assert!(j.pop().is_some());
+        // Stalled: frames 4..=100 arrive with nothing played.
+        for seq in 4..=100 {
+            j.push(seq, packets[0].clone());
+        }
+        let next = j.next.unwrap();
+        assert!(next > 100 - JITTER_HOLD as u32, "{next} trails the window");
+        assert!(j.packets.contains_key(&next), "{next} was dropped");
+        // From here, arrivals and plays keep pace and every play is real.
+        for seq in 101..=120 {
+            j.push(seq, packets[0].clone());
+            let next = j.next.unwrap();
+            assert!(j.packets.contains_key(&next), "{next} is real audio");
+            assert!(j.pop().is_some());
+        }
     }
 
     /// A lost frame is concealed, not skipped; a late one grows the buffer.
