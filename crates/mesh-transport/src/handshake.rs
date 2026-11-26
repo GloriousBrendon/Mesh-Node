@@ -5,7 +5,7 @@
 use crate::Peer;
 use crate::frame::{self, FrameError};
 use iroh::endpoint::{Connection, ConnectionError, VarInt};
-use mesh_identity::DeviceCert;
+use mesh_identity::{DIRECT_CERT_LEN, DeviceCert, DirectCert};
 
 /// Mesh's QUIC protocol, version 1.
 pub const ALPN: &[u8] = b"mesh/1";
@@ -58,15 +58,36 @@ impl HandshakeError {
 
 /// Checks a peer's hello: its certificate must be signed by its root and name
 /// the same device key iroh authenticated, or someone holding one device's key
-/// is presenting another identity's certificate.
-pub(crate) fn check_hello(cert: &[u8], remote: &iroh::PublicKey) -> Result<Peer, HandshakeError> {
-    let cert = DeviceCert::from_bytes(cert).map_err(|_| HandshakeError::BadCert)?;
-    if cert.device().as_bytes() != remote.as_bytes() {
+/// is presenting another identity's certificate. A direct node's hello adds
+/// a `DirectCert` (SPEC-connection-privacy P3): then iroh authenticated the
+/// direct key, the device key must have signed it, and the peer is reported
+/// by its device key, as on the relay endpoint.
+pub(crate) fn check_hello(hello: &[u8], remote: &iroh::PublicKey) -> Result<Peer, HandshakeError> {
+    fn bad<E>(_: E) -> HandshakeError {
+        HandshakeError::BadCert
+    }
+    let (cert, direct) = match DeviceCert::from_bytes(hello) {
+        Ok(cert) => (cert, None),
+        Err(_) if hello.len() > DIRECT_CERT_LEN => {
+            let (head, tail) = hello.split_at(hello.len() - DIRECT_CERT_LEN);
+            let (cert, direct) = (
+                DeviceCert::from_bytes(head).map_err(bad)?,
+                DirectCert::from_bytes(tail).map_err(bad)?,
+            );
+            if direct.device() != cert.device() {
+                return Err(HandshakeError::KeyMismatch);
+            }
+            (cert, Some(direct))
+        }
+        Err(_) => return Err(HandshakeError::BadCert),
+    };
+    let key = direct.as_ref().map_or(cert.device(), |d| d.direct());
+    if key.as_bytes() != remote.as_bytes() {
         return Err(HandshakeError::KeyMismatch);
     }
     Ok(Peer {
         id: cert.root(),
-        device: *remote,
+        device: iroh::PublicKey::from_bytes(cert.device().as_bytes()).map_err(bad)?,
         name: cert.name().to_owned(),
     })
 }
@@ -166,6 +187,42 @@ mod tests {
         forged[last] ^= 1;
         assert_eq!(check_hello(&forged, &key), Err(HandshakeError::BadCert));
         assert_eq!(check_hello(b"garbage", &key), Err(HandshakeError::BadCert));
+    }
+
+    #[test]
+    fn a_direct_hello_reports_the_device_key() {
+        let (root, device) = (RootKey::generate().unwrap(), DeviceKey::generate().unwrap());
+        let (direct, dcert) = DirectCert::issue(&device, 1);
+        let hello = [cert(&root, &device), dcert.to_bytes()].concat();
+        let direct_key = crate::secret_key(&direct).public();
+        let peer = check_hello(&hello, &direct_key).expect("valid");
+        assert_eq!(peer.device, crate::secret_key(&device).public());
+        assert_eq!(peer.id, root.id());
+
+        // The same hello from any other key, the device key included.
+        let device_key = crate::secret_key(&device).public();
+        assert_eq!(
+            check_hello(&hello, &device_key),
+            Err(HandshakeError::KeyMismatch)
+        );
+
+        // Another device's direct cert after this device's cert.
+        let other = DeviceKey::generate().unwrap();
+        let (other_direct, other_cert) = DirectCert::issue(&other, 1);
+        let mixed = [cert(&root, &device), other_cert.to_bytes()].concat();
+        assert_eq!(
+            check_hello(&mixed, &crate::secret_key(&other_direct).public()),
+            Err(HandshakeError::KeyMismatch)
+        );
+
+        // A damaged direct cert.
+        let mut forged = hello.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert_eq!(
+            check_hello(&forged, &direct_key),
+            Err(HandshakeError::BadCert)
+        );
     }
 
     #[test]

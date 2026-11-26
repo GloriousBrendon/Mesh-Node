@@ -114,6 +114,11 @@ pub struct Config {
     /// the node opens no socket anyone can reach (a seed that mustn't show
     /// its address, SPEC-seed D8c as changed). Can't go with `port`.
     pub relay_only: bool,
+    /// This node runs on the device's direct key, not its device key
+    /// (SPEC-connection-privacy P3): the key passed to `Node::start` is the
+    /// direct key, and the hello adds this certificate, so peers still see
+    /// the device key in `Peer::device`.
+    pub direct: Option<mesh_identity::DirectCert>,
     #[cfg(feature = "test-utils")]
     pub test: TestOptions,
 }

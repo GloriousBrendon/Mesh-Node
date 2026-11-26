@@ -73,9 +73,15 @@ impl Node {
         cert: &DeviceCert,
         config: Config,
     ) -> Result<Self, TransportError> {
-        if cert.device() != &device.public() {
-            return Err(TransportError::CertNotOurs);
-        }
+        // On a direct node `device` is the direct key, and the hello carries
+        // the certificate that ties it to the device key.
+        let hello = match &config.direct {
+            Some(d) if d.direct() == &device.public() && d.device() == cert.device() => {
+                [cert.to_bytes(), d.to_bytes()].concat()
+            }
+            None if cert.device() == &device.public() => cert.to_bytes(),
+            _ => return Err(TransportError::CertNotOurs),
+        };
         if config.relay_only && config.port.is_some() {
             return Err(TransportError::RelayOnlyWithPort);
         }
@@ -119,7 +125,7 @@ impl Node {
         let (streams_tx, streams_rx) = mpsc::channel(STREAM_QUEUE);
         let (datagrams_tx, datagrams_rx) = mpsc::channel(DATAGRAM_QUEUE);
         let shared = Arc::new(Shared {
-            cert: cert.to_bytes(),
+            cert: hello,
             conns: Mutex::new(HashMap::new()),
             pending: AtomicUsize::new(0),
             limits: config.limits,
@@ -389,12 +395,14 @@ impl Node {
 }
 
 impl Shared {
+    /// The open connection to `device`: its device key, or the key the
+    /// connection is really with (a direct key, when dialling one).
     fn open(&self, device: &iroh::PublicKey) -> Option<(Peer, Connection)> {
         let mut conns = lock(&self.conns);
         conns.retain(|_, (_, conn)| conn.close_reason().is_none());
         conns
             .iter()
-            .find(|((d, _), _)| d == device)
+            .find(|((d, _), (_, conn))| d == device || conn.remote_id() == *device)
             .map(|(_, (peer, conn))| (peer.clone(), conn.clone()))
     }
 
