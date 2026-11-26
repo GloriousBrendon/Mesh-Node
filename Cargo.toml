@@ -72,3 +72,21 @@ mesh-transport = { path = "crates/mesh-transport" }
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+# Call audio runs in real time; unoptimised, the processing falls behind on
+# CI's 4 cores and call tests hear stale audio.
+[profile.dev.package.sonora]
+opt-level = 3
+[profile.dev.package.sonora-aec3]
+opt-level = 3
+[profile.dev.package.sonora-agc2]
+opt-level = 3
+[profile.dev.package.sonora-common-audio]
+opt-level = 3
+[profile.dev.package.sonora-fft]
+opt-level = 3
+[profile.dev.package.sonora-ns]
+opt-level = 3
+[profile.dev.package.sonora-simd]
+opt-level = 3
+[profile.dev.package.nnnoiseless]
+opt-level = 3
