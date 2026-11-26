@@ -193,6 +193,13 @@ impl Nodes {
             let theirs = direct.status();
             status.direct |= theirs.direct;
             status.connections += theirs.connections;
+            for (id, path) in theirs.paths {
+                match status.paths.binary_search_by_key(&id, |(i, _)| *i) {
+                    Ok(at) if path == mesh_transport::Path::Direct => status.paths[at].1 = path,
+                    Ok(_) => {}
+                    Err(at) => status.paths.insert(at, (id, path)),
+                }
+            }
         }
         status
     }

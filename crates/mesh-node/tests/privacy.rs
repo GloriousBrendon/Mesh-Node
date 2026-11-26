@@ -11,7 +11,19 @@ use common::{Helper, Relay, Seed, fail, temp_dir};
 const PASSWORD: &str = "correct horse battery staple";
 
 fn helper(dir: &std::path::Path, relay: &Relay, seed: &str, name: &str) -> (Helper, String) {
-    let args = ["--seed", seed, "--peer-idle", "3", "--record-ttl", "8"];
+    helper_with(dir, relay, seed, name, &[])
+}
+
+/// `helper`, started with `extra` arguments too.
+fn helper_with(
+    dir: &std::path::Path,
+    relay: &Relay,
+    seed: &str,
+    name: &str,
+    extra: &[&str],
+) -> (Helper, String) {
+    let mut args = vec!["--seed", seed, "--peer-idle", "3", "--record-ttl", "8"];
+    args.extend(extra);
     let mut h = Helper::start_with(dir, relay, &args);
     assert_eq!(h.event().0, "meshIdentity");
     let id = h.expect("idCreate", &[name, PASSWORD], "meshIdentity")["id"]
@@ -251,6 +263,58 @@ fn a_week_old_direct_key_is_replaced_and_friends_follow() {
     );
 
     for h in [o, b, c] {
+        h.quit();
+    }
+    seed.stop();
+}
+
+/// `h`'s next `meshNet` whose path for `id` is `want`, within 60 s.
+fn net_path(h: &mut Helper, id: &str, want: &str) -> Value {
+    until(h, "meshNet", |n| n["paths"][id] == want)
+}
+
+#[test]
+fn hide_my_ip_relays_friends_too() {
+    let dirs = ["seed", "o", "b"].map(|n| temp_dir(&format!("hide-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut o, id_o) = helper_with(&dirs[1], &relay, &ticket, "owen", &["--hide-ip"]);
+    let (mut b, id_b) = helper(&dirs[2], &relay, &ticket, "bea");
+    befriend(&mut o, &id_o, &mut b, &id_b);
+
+    // On from the start: friends are relayed, and O's status says so.
+    assert_eq!(
+        ping_until(&mut b, &id_o, "direct"),
+        "relay",
+        "B went direct to a hidden O"
+    );
+    o.send("netStatus", &[]);
+    let net = net_path(&mut o, &id_b, "relay");
+    assert_eq!(net["hideIp"], true, "{net}");
+    assert_eq!(net["directCount"], 0, "{net}");
+
+    // Off: a direct key, which B is told, and they go direct.
+    ask(&mut o, "netPrivacy", &["false"], "meshDone");
+    assert_eq!(
+        ping_until(&mut b, &id_o, "direct"),
+        "direct",
+        "B never went direct"
+    );
+    let net = net_path(&mut o, &id_b, "direct");
+    assert_eq!(net["hideIp"], false, "{net}");
+
+    // On again: the direct node closes, and B is relayed again.
+    ask(&mut o, "netPrivacy", &["true"], "meshDone");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        ping_until(&mut b, &id_o, "direct"),
+        "relay",
+        "B still went direct"
+    );
+    net_path(&mut o, &id_b, "relay");
+
+    for h in [o, b] {
         h.quit();
     }
     seed.stop();

@@ -198,6 +198,8 @@ pub struct Options {
     /// `--no-calls` (tests only): no `call` service, as an engine from
     /// before calls (SPEC-calls C11).
     pub no_calls: bool,
+    /// `--hide-ip`: start with Hide my IP on (P6); `netPrivacy` changes it.
+    pub hide_ip: bool,
     /// `--tone`, `--heard` and `--drop` (tests only, SPEC-calls).
     #[cfg(feature = "audio")]
     pub audio: crate::media::Io,
@@ -213,6 +215,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     helper.cut_live = options.cut.live;
     helper.crash_at_records = options.crash_at_records;
     helper.no_calls = options.no_calls;
+    helper.hide_ip = options.hide_ip;
     #[cfg(feature = "audio")]
     {
         helper.calls.io = options.audio;
@@ -423,6 +426,8 @@ struct Helper {
     calls: calls::Calls,
     /// `--no-calls`.
     no_calls: bool,
+    /// Hide my IP (P6): no direct node, everyone relayed.
+    hide_ip: bool,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -618,6 +623,7 @@ impl Helper {
             mail: mail::Mail::default(),
             calls: calls::Calls::default(),
             no_calls: false,
+            hide_ip: false,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -942,6 +948,20 @@ impl Helper {
             "linkCancel" => self.link_cancel()?,
             "linkFinish" => self.link_finish(arg(0)?, arg(1)?).await?,
             "netStatus" => self.emit_net(),
+            "netPrivacy" => {
+                let hide = match arg(0)? {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(Fail(
+                            "bad-argument",
+                            "netPrivacy takes true or false".into(),
+                        ));
+                    }
+                };
+                self.set_hide_ip(hide);
+                emit("meshDone", json!({ "fn": func }));
+            }
             "netTicket" => {
                 let ticket = self
                     .node()?
@@ -1923,21 +1943,26 @@ impl Helper {
             direct: Some(direct_cert.clone()),
             ..config.clone()
         };
+        let hide_ip = self.hide_ip;
         let started = async {
             let relay = Node::start(store.device_key(), cert, config).await;
-            let direct = Node::start(&direct_key, cert, direct_config.clone()).await;
+            // Hide my IP (P6): no direct node at all, so nothing can reach one.
+            let direct = match hide_ip {
+                true => None,
+                false => Some(Node::start(&direct_key, cert, direct_config.clone()).await),
+            };
             let anon = anon_node(self.relays.clone()).await?;
             Ok::<_, String>((
                 relay.map_err(|e| e.to_string())?,
-                direct.map_err(|e| e.to_string())?,
+                direct.transpose().map_err(|e| e.to_string())?,
                 anon,
             ))
         };
         match started.await {
             Ok((relay, direct, anon)) => {
-                let (relay, direct) = (Arc::new(relay), Arc::new(direct));
-                let node = crate::nodes::Nodes::new(relay.clone(), Some(direct.clone()));
-                self.direct_cert = Some(direct_cert);
+                let (relay, direct) = (Arc::new(relay), direct.map(Arc::new));
+                let node = crate::nodes::Nodes::new(relay.clone(), direct.clone());
+                self.direct_cert = direct.is_some().then_some(direct_cert);
                 let published = Arc::new(AtomicBool::new(false));
                 let keys = Arc::new(AtomicBool::new(false));
                 let watch = tokio::spawn(watch_net(
@@ -1956,14 +1981,18 @@ impl Helper {
                 ));
                 // Friends who connect before the direct node has a relay
                 // aren't told it then; they are once it has one.
-                let back = self.back.clone();
-                let waiting = direct.clone();
-                tokio::spawn(async move {
-                    if waiting.online(Duration::from_secs(30)).await {
-                        let _ = back.send(Back::DirectOnline);
+                let direct_tasks = match direct {
+                    Some(direct) => {
+                        let (back, waiting) = (self.back.clone(), direct.clone());
+                        tokio::spawn(async move {
+                            if waiting.online(Duration::from_secs(30)).await {
+                                let _ = back.send(Back::DirectOnline);
+                            }
+                        });
+                        self.direct_tasks(direct)
                     }
-                });
-                let direct_tasks = self.direct_tasks(direct);
+                    None => Vec::new(),
+                };
                 self.net = Some(Net {
                     direct_config,
                     direct_tasks,
@@ -2007,7 +2036,7 @@ impl Helper {
         let (Some(store), Some(net)) = (&self.store, &self.net) else {
             return;
         };
-        if net.node.direct().is_none() {
+        if self.hide_ip {
             return;
         }
         let now = unix_now();
@@ -2046,8 +2075,9 @@ impl Helper {
     /// The rotated direct node is up: it replaces the old one, friends and
     /// our devices are told, and the old one closes once they've heard.
     fn direct_started(&mut self, node: Node, cert: DirectCert) {
-        if self.net.is_none() {
-            // Locked meanwhile.
+        if self.net.is_none() || self.hide_ip {
+            // Locked, or Hide my IP turned on, meanwhile.
+            tokio::spawn(async move { node.close().await });
             return;
         }
         let node = Arc::new(node);
@@ -2066,6 +2096,33 @@ impl Helper {
                 old.close().await;
             }
         });
+    }
+
+    /// Hide my IP on or off (P6). On: the direct node closes, so the key
+    /// friends hold reaches nothing, and everyone is relayed. Off: a new
+    /// direct key (rotation's path), which friends are told.
+    fn set_hide_ip(&mut self, hide: bool) {
+        if hide == self.hide_ip {
+            return;
+        }
+        self.hide_ip = hide;
+        let Some(net) = &mut self.net else { return };
+        if hide {
+            let old = net.node.swap_direct(None);
+            let tasks = std::mem::take(&mut net.direct_tasks);
+            self.direct_cert = None;
+            tokio::spawn(async move {
+                for task in tasks {
+                    task.abort();
+                }
+                if let Some(old) = old {
+                    old.close().await;
+                }
+            });
+        } else {
+            self.rotate_direct();
+        }
+        self.emit_net();
     }
 
     /// Tells our connected devices and friends our direct key (P3).
@@ -2128,7 +2185,7 @@ impl Helper {
             self.held.clear();
             self.publish_retry = PUBLISH_RETRY;
             self.presence.clear();
-            emit_net(None, false, false);
+            emit_net(None, false, false, self.hide_ip);
         }
         self.e2ee = None;
         if self.dm.take().is_some() {
@@ -2238,8 +2295,9 @@ impl Helper {
                 Some(&net.node.status()),
                 net.published.load(Ordering::Relaxed),
                 net.keys.load(Ordering::Relaxed),
+                self.hide_ip,
             ),
-            None => emit_net(None, false, false),
+            None => emit_net(None, false, false, self.hide_ip),
         }
     }
 
@@ -2592,7 +2650,7 @@ async fn watch_net(
             }
         }
         if last.as_ref() != Some(&now) {
-            emit_net(Some(&now.0), now.1, now.2);
+            emit_net(Some(&now.0), now.1, now.2, node.direct().is_none());
             last = Some(now);
         }
         tokio::time::sleep(NET_POLL).await;
@@ -2601,20 +2659,46 @@ async fn watch_net(
 
 /// `meshNet`: never any IP address (SPEC-transport "Endpoint"). `keys`:
 /// our published records carry our e2ee keys (SPEC-e2ee).
-fn emit_net(status: Option<&Status>, published: bool, keys: bool) {
+/// `meshNet`. `paths` is each connected person's path, `direct` or `relay`
+/// (connection-privacy P8), and `hideIp` whether Hide my IP is on; never
+/// an address.
+fn emit_net(status: Option<&Status>, published: bool, keys: bool, hide_ip: bool) {
     let payload = match status {
         None => json!({
             "state": "off", "relay": null, "direct": false, "connections": 0, "published": false,
-            "keys": false,
+            "keys": false, "directCount": 0, "relayedCount": 0, "paths": {}, "hideIp": hide_ip,
         }),
-        Some(s) => json!({
-            "state": if s.online { "online" } else { "connecting" },
-            "relay": s.relay.as_ref().map(ToString::to_string),
-            "direct": s.direct,
-            "connections": s.connections,
-            "published": published,
-            "keys": keys,
-        }),
+        Some(s) => {
+            let path = |p: &NetPath| {
+                if *p == NetPath::Direct {
+                    "direct"
+                } else {
+                    "relay"
+                }
+            };
+            let paths: serde_json::Map<String, Value> = (s.paths.iter())
+                .filter_map(|(id, p)| {
+                    Some((MeshId::from_bytes(id).ok()?.to_string(), json!(path(p))))
+                })
+                .collect();
+            let direct = s
+                .paths
+                .iter()
+                .filter(|(_, p)| *p == NetPath::Direct)
+                .count();
+            json!({
+                "state": if s.online { "online" } else { "connecting" },
+                "relay": s.relay.as_ref().map(ToString::to_string),
+                "direct": s.direct,
+                "connections": s.connections,
+                "published": published,
+                "keys": keys,
+                "directCount": direct,
+                "relayedCount": s.paths.len() - direct,
+                "paths": paths,
+                "hideIp": hide_ip,
+            })
+        }
     };
     emit("meshNet", payload);
 }

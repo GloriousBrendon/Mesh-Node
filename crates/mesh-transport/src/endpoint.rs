@@ -178,11 +178,19 @@ impl Node {
             .filter(|(_, c)| c.close_reason().is_none())
             .collect();
         let devices: std::collections::HashSet<_> = open.iter().map(|(p, _)| p.device).collect();
+        let mut paths = std::collections::BTreeMap::new();
+        for (peer, conn) in &open {
+            let best = paths.entry(peer.id.to_bytes()).or_insert(Path::Relay);
+            if path(conn) == Path::Direct {
+                *best = Path::Direct;
+            }
+        }
         Status {
             online: relay.is_some(),
             relay,
             direct: open.iter().any(|(_, c)| path(c) == Path::Direct),
             connections: devices.len(),
+            paths: paths.into_iter().collect(),
         }
     }
 

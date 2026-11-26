@@ -207,6 +207,9 @@ pub struct Status {
     /// At least one open connection is on a direct path.
     pub direct: bool,
     pub connections: usize,
+    /// Each connected person's best path (direct if any device of theirs
+    /// is), by ID bytes, sorted (SPEC-connection-privacy P8). No addresses.
+    pub paths: Vec<([u8; 32], Path)>,
 }
 
 /// A connection's current path.

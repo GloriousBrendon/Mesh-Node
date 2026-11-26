@@ -24,6 +24,9 @@
 //! with its contacts, until a `cutOff` command. `--crash-at records`, for
 //! tests only, exits between a record read's two saves (SPEC-mailbox M15).
 //!
+//! `--hide-ip` starts the helper with Hide my IP on (SPEC-connection-privacy
+//! P6): no direct node, everyone relayed; `netPrivacy` changes it.
+//!
 //! `--holder <ticket>` (repeatable, up to three) names the seeds that keep
 //! this device's mail (SPEC-mailbox, *Choosing your own holder*); without
 //! it, `MESH_HOLDERS` (space-separated tickets); with neither, the first
@@ -222,6 +225,7 @@ fn main() {
                 .windows(2)
                 .any(|w| w[0] == "--crash-at" && w[1] == "records"),
             no_calls: args.iter().any(|a| a == "--no-calls"),
+            hide_ip: args.iter().any(|a| a == "--hide-ip"),
             #[cfg(feature = "audio")]
             audio: audio_options(&args),
         };
