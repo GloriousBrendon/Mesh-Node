@@ -140,6 +140,8 @@ impl Nodes {
         self.relay.ping(addr).await
     }
 
+    // Calls are the only users of datagrams (feature `audio`).
+    #[cfg_attr(not(feature = "audio"), allow(dead_code))]
     pub fn send_datagram(&self, device: &PublicKey, data: Vec<u8>) -> bool {
         match MeshAddr::from_device(device.as_bytes()).and_then(|a| self.pick(&a)) {
             Some(direct) => direct.send_datagram(device, data),
@@ -148,6 +150,7 @@ impl Nodes {
     }
 
     /// The next datagram from either node.
+    #[cfg_attr(not(feature = "audio"), allow(dead_code))]
     pub async fn next_datagram(&self) -> Option<(Peer, Vec<u8>)> {
         match self.direct() {
             Some(direct) => tokio::select! {

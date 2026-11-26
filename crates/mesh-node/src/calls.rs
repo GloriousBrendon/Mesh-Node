@@ -136,6 +136,14 @@ pub struct Calls {
     ptt: u8,
     /// Input volume in percent, once the app set one; `None` is 100.
     gain: Option<u32>,
+    /// The switches and sensitivity (SPEC-audio A3).
+    #[cfg(feature = "audio")]
+    audio: crate::media::Audio,
+    /// Each person's volume, in percent, by ID (SPEC-audio A6).
+    volumes: HashMap<[u8; 32], u32>,
+    /// The mic test while it runs (SPEC-audio A5).
+    #[cfg(feature = "audio")]
+    test: Option<crate::media::Media>,
     /// Who's speaking in the current call, by device.
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
@@ -233,6 +241,66 @@ impl Helper {
             // Push-to-talk (C10): `off`, `up` (on, the key released) or `down`.
             // Input volume, 0 to 200 percent (SPEC-audio A3), now and for
             // the calls after.
+            // The switches and sensitivity, as JSON: any of `echo`, `noise`,
+            // `gain` (true/false) and `threshold` (a dBFS number, or null for
+            // Automatic); what's left out stays as it was.
+            "callAudio" => {
+                let v: serde_json::Value = serde_json::from_str(arg(0)?)
+                    .map_err(|_| Fail("bad-args", "callAudio takes a JSON object".into()))?;
+                #[cfg(feature = "audio")]
+                {
+                    let a = &mut self.calls.audio;
+                    let flag = |k: &str, was: bool| v[k].as_bool().unwrap_or(was);
+                    (a.echo, a.noise, a.gain) = (
+                        flag("echo", a.echo),
+                        flag("noise", a.noise),
+                        flag("gain", a.gain),
+                    );
+                    if let Some(t) = v.get("threshold") {
+                        a.threshold = t.as_f64().map(|db| db.clamp(-90.0, 0.0) as f32);
+                    }
+                    if let Some(o) = v["output"].as_u64() {
+                        a.output = (o as u32).min(200);
+                    }
+                    let audio = *a;
+                    if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
+                        m.set_audio(audio);
+                    }
+                }
+                let _ = v;
+            }
+            // The mic test (A5): `on` or `off`, and with `on`, `hear` to
+            // play it back. A call stops it.
+            "audioTest" => {
+                #[cfg(feature = "audio")]
+                {
+                    self.calls.test = None;
+                    if arg(0)? == "on" {
+                        let hear = args.get(1).is_some_and(|a| a == "hear");
+                        let test = crate::media::Media::test(&self.calls.io, hear, emit_level)
+                            .map_err(|e| {
+                                Fail("unavailable", format!("couldn't open the mic: {e}"))
+                            })?;
+                        test.set_gain(self.calls.gain.unwrap_or(100));
+                        test.set_audio(self.calls.audio);
+                        self.calls.test = Some(test);
+                    }
+                }
+                #[cfg(not(feature = "audio"))]
+                return Err(Fail(
+                    "unavailable",
+                    "this Mesh was built without calls".into(),
+                ));
+            }
+            // One person's volume for us, 0 to 200 percent (A6), kept for
+            // this run; Aflos sends what it keeps at each call's start.
+            "callVolume" => {
+                let id = parse_id(arg(0)?)?;
+                let percent: u32 = (arg(1)?.parse())
+                    .map_err(|_| Fail("bad-args", "a percentage, 0 to 200".into()))?;
+                self.calls.volumes.insert(id.to_bytes(), percent.min(200));
+                self.push_volumes();
+            }
             "callGain" => {
                 let percent: u32 = (arg(0)?.parse())
                     .map_err(|_| Fail("bad-args", "a percentage, 0 to 200".into()))?;
@@ -421,6 +489,8 @@ impl Helper {
     fn call_media(&mut self) -> Result<(), Fail> {
         #[cfg(feature = "audio")]
         {
+            // One user of the mic at a time: a call ends the mic test.
+            self.calls.test = None;
             let (Some(net), Some(store)) = (&self.net, &self.store) else {
                 return Err(Fail("unavailable", "not connected".into()));
             };
@@ -430,16 +500,27 @@ impl Helper {
             };
             let back = self.back.clone();
             let me = store.device_key().public().to_bytes();
-            let media =
-                crate::media::Media::start(nodes, call.id, me, &self.calls.io, move |who| {
+            let media = crate::media::Media::start(
+                nodes,
+                call.id,
+                me,
+                &self.calls.io,
+                move |who| {
                     let _ = back.send(Back::Speaking(who));
-                })
-                .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
+                },
+                emit_level,
+            )
+            .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
             media.set_peers(call.devices.iter().copied());
+            media.set_volumes(self.device_volumes());
+            let Some(call) = self.calls.current.as_mut() else {
+                return Ok(());
+            };
             media.set_muted(self.calls.muted);
             media.set_deafened(self.calls.deafened);
             media.set_ptt(self.calls.ptt);
             media.set_gain(self.calls.gain.unwrap_or(100));
+            media.set_audio(self.calls.audio);
             call.media = Some(media);
         }
         Ok(())
@@ -870,6 +951,32 @@ impl Helper {
             }
             call.devices = devices;
         }
+        self.push_volumes();
+    }
+
+    /// Each of the current call's devices at its person's volume, where
+    /// that isn't 100.
+    fn device_volumes(&self) -> HashMap<[u8; 32], u32> {
+        let Some(call) = &self.calls.current else {
+            return HashMap::new();
+        };
+        let owner = |device: &[u8; 32]| match call.stage {
+            Stage::Voice { space, channel } => (self.calls.voice.get(&(space, channel)))
+                .and_then(|m| m.get(device))
+                .map(|(id, ..)| *id),
+            _ => Some(call.with),
+        };
+        (call.devices.iter())
+            .filter_map(|d| Some((*d, *self.calls.volumes.get(&owner(d)?.to_bytes())?)))
+            .collect()
+    }
+
+    /// Tells the current call's media the volumes (A6).
+    fn push_volumes(&self) {
+        #[cfg(feature = "audio")]
+        if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
+            m.set_volumes(self.device_volumes());
+        }
     }
 
     /// Every second: stale and removed participants go; in a voice channel,
@@ -1009,6 +1116,14 @@ pub async fn serve(
         let _ = mesh_transport::frame::write_frame(&mut stream.send, &[1]).await;
         let _ = stream.send.finish();
     }
+}
+
+/// `meshAudioLevel`: the mic's level after the chain (dBFS) and whether
+/// it goes out, about 15 times a second in a call or the mic test.
+#[cfg(feature = "audio")]
+fn emit_level(level: f32, open: bool) {
+    let level = (f64::from(level) * 10.0).round() / 10.0;
+    emit("meshAudioLevel", json!({ "level": level, "open": open }));
 }
 
 #[cfg(test)]

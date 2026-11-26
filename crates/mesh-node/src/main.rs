@@ -44,6 +44,8 @@ mod mailstore;
 #[cfg(feature = "audio")]
 mod media;
 mod nodes;
+#[cfg(feature = "audio")]
+mod processing;
 mod routing;
 mod saved;
 mod seed;
@@ -356,6 +358,13 @@ fn audio_options(args: &[String]) -> media::Io {
         drop: value("--drop").map_or(0, |v| match v.parse::<u8>() {
             Ok(p) if p <= 100 => p,
             _ => fail("--drop takes 0 to 100"),
+        }),
+        mic_file: value("--mic-file").map(PathBuf::from),
+        echo: value("--echo").map(|v| {
+            let parsed = v
+                .split_once(',')
+                .and_then(|(ms, at)| Some((ms.parse().ok()?, at.parse().ok()?)));
+            parsed.unwrap_or_else(|| fail("--echo takes <ms>,<level>, as 40,0.5"))
         }),
         ..media::Io::default()
     }

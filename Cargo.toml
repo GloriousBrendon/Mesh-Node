@@ -57,6 +57,9 @@ cpal = "0.18"
 opus = "0.3"
 # Noise suppression on the microphone (SPEC-calls Q2): RNNoise in pure Rust.
 nnnoiseless = { version = "0.5", default-features = false }
+# Echo cancellation, automatic gain and the high-pass filter (SPEC-audio A2):
+# a pure Rust port of WebRTC's audio processing. Pre-1.0, so pinned.
+sonora = "=0.3.0"
 
 mesh-dm = { path = "crates/mesh-dm" }
 mesh-e2ee = { path = "crates/mesh-e2ee" }
@@ -68,4 +71,22 @@ mesh-transport = { path = "crates/mesh-transport" }
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
+opt-level = 3
+# Call audio runs in real time; unoptimised, the processing falls behind on
+# CI's 4 cores and call tests hear stale audio.
+[profile.dev.package.sonora]
+opt-level = 3
+[profile.dev.package.sonora-aec3]
+opt-level = 3
+[profile.dev.package.sonora-agc2]
+opt-level = 3
+[profile.dev.package.sonora-common-audio]
+opt-level = 3
+[profile.dev.package.sonora-fft]
+opt-level = 3
+[profile.dev.package.sonora-ns]
+opt-level = 3
+[profile.dev.package.sonora-simd]
+opt-level = 3
+[profile.dev.package.nnnoiseless]
 opt-level = 3

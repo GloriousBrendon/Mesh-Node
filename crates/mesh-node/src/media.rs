@@ -59,6 +59,12 @@ pub struct Io {
     pub heard: Option<PathBuf>,
     /// `--drop <percent>`: incoming datagrams dropped (spec test 5).
     pub drop: u8,
+    /// `--mic-file <wav>`: a 48 kHz mono 16-bit recording, looped, instead
+    /// of the microphone (PLAN-audio Task 6).
+    pub mic_file: Option<PathBuf>,
+    /// `--echo <ms>,<level>`: what's played comes back into the mic this
+    /// late at this level, as speakers beside a mic would (Task 6).
+    pub echo: Option<(u32, f32)>,
 }
 
 /// What the media tasks share with the call.
@@ -72,6 +78,94 @@ struct Shared {
     ptt: std::sync::atomic::AtomicU8,
     /// Input volume, in percent (SPEC-audio A3): 100 leaves the mic as it is.
     gain: std::sync::atomic::AtomicU32,
+    /// The switches and sensitivity (SPEC-audio A3), changed live.
+    audio: Mutex<Audio>,
+    /// Told the mic's level (dBFS) and whether it goes out (A5).
+    level: Box<dyn Fn(f32, bool) + Send + Sync>,
+    /// Each peer device's volume, in percent, where it isn't 100 (A6).
+    volumes: Mutex<HashMap<[u8; 32], u32>>,
+    /// `--echo`: the level, and what was played, waiting its delay.
+    echo: Option<(f32, Mutex<std::collections::VecDeque<i16>>)>,
+}
+
+impl Shared {
+    fn new(
+        call: [u8; 8],
+        level: impl Fn(f32, bool) + Send + Sync + 'static,
+        echo: Option<(u32, f32)>,
+    ) -> Arc<Self> {
+        let echo = echo.map(|(ms, at)| {
+            let late = SAMPLE_RATE as usize * ms as usize / 1000;
+            (at, Mutex::new(std::iter::repeat_n(0, late).collect()))
+        });
+        Arc::new(Self {
+            echo,
+            call,
+            peers: Mutex::new(HashSet::new()),
+            muted: AtomicBool::new(false),
+            deafened: AtomicBool::new(false),
+            ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
+            gain: std::sync::atomic::AtomicU32::new(100),
+            audio: Mutex::new(Audio::default()),
+            level: Box::new(level),
+            volumes: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+/// The mic, or a test's tone (which noise suppression would take out).
+fn mic(
+    io: &Io,
+    stop: &Arc<AtomicBool>,
+) -> Result<(Frames, Option<audio::CaptureHandle>, Option<Denoise>), String> {
+    if let Some(path) = &io.mic_file {
+        return Ok((recording(path, stop.clone())?, None, Some(Denoise::new())));
+    }
+    Ok(match io.tone {
+        Some(hz) => (tone(hz, stop.clone()), None, None),
+        None => {
+            let (handle, rx) = audio::start_capture(io.input.clone())?;
+            (rx, Some(handle), Some(Denoise::new()))
+        }
+    })
+}
+
+/// The speakers, or a test's file.
+fn speakers(io: &Io) -> Result<(Sink, Option<audio::PlaybackHandle>), String> {
+    Ok(match &io.heard {
+        Some(path) => (Sink::File(path.clone()), None),
+        None => {
+            let (handle, buffer) = audio::start_playback(io.output.clone())?;
+            (Sink::Device(buffer), Some(handle))
+        }
+    })
+}
+
+/// Frames the mic test plays back late (0.5 s).
+const TEST_LATE: usize = 25;
+
+/// What the mic goes through, as the person set it (SPEC-audio A3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Audio {
+    pub echo: bool,
+    pub noise: bool,
+    pub gain: bool,
+    /// A manual gate threshold in dBFS; `None` is Automatic (A4).
+    pub threshold: Option<f32>,
+    /// What we hear, in percent (A3).
+    pub output: u32,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self {
+            echo: true,
+            noise: true,
+            gain: true,
+            threshold: None,
+            output: 100,
+        }
+    }
 }
 
 pub const PTT_OFF: u8 = 0;
@@ -106,31 +200,12 @@ impl Media {
         me: [u8; 32],
         io: &Io,
         speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
+        level: impl Fn(f32, bool) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Arc::new(Shared {
-            call,
-            peers: Mutex::new(HashSet::new()),
-            muted: AtomicBool::new(false),
-            deafened: AtomicBool::new(false),
-            ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
-            gain: std::sync::atomic::AtomicU32::new(100),
-        });
+        let shared = Shared::new(call, level, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
-        // A tone is a test's: noise suppression would take it out.
-        let (frames, capture, denoise) = match io.tone {
-            Some(hz) => (tone(hz, stop.clone()), None, None),
-            None => {
-                let (handle, rx) = audio::start_capture(io.input.clone())?;
-                (rx, Some(handle), Some(Denoise::new()))
-            }
-        };
-        let (sink, playback) = match &io.heard {
-            Some(path) => (Sink::File(path.clone()), None),
-            None => {
-                let (handle, buffer) = audio::start_playback(io.output.clone())?;
-                (Sink::Device(buffer), Some(handle))
-            }
-        };
+        let (frames, capture, denoise) = mic(io, &stop)?;
+        let (sink, playback) = speakers(io)?;
         let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)
             .map_err(|e| format!("opus: {e}"))?;
         encoder
@@ -139,19 +214,59 @@ impl Media {
             .and_then(|()| encoder.set_packet_loss_perc(10))
             .map_err(|e| format!("opus: {e}"))?;
         let us = Arc::new(Mutex::new(Speakers::default()));
+        let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
         let jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>> = Arc::default();
         let tasks = vec![
             tokio::spawn(send(
                 node.clone(),
                 shared.clone(),
-                (frames, denoise),
+                frames,
+                Chain::new(denoise, played_rx),
                 encoder,
                 me,
                 us.clone(),
             )),
             tokio::spawn(receive(node, shared.clone(), jitter.clone(), io.drop)),
-            tokio::spawn(mix(shared.clone(), jitter, sink, me, us, speaking)),
+            tokio::spawn(mix(
+                shared.clone(),
+                jitter,
+                sink,
+                played_tx,
+                me,
+                us,
+                speaking,
+            )),
         ];
+        Ok(Self {
+            shared,
+            tasks,
+            stop,
+            _capture: capture,
+            _playback: playback,
+        })
+    }
+
+    /// The mic test (SPEC-audio A5): the mic through the whole chain, its
+    /// level reported, sent nowhere; with `hear`, played back half a second
+    /// late. Stops when dropped.
+    pub fn test(
+        io: &Io,
+        hear: bool,
+        level: impl Fn(f32, bool) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let shared = Shared::new([0; 8], level, io.echo);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (frames, capture, denoise) = mic(io, &stop)?;
+        let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sink, playback) = match hear {
+            true => {
+                let (sink, handle) = speakers(io)?;
+                (Some((sink, played_tx)), handle)
+            }
+            false => (None, None),
+        };
+        let chain = Chain::new(denoise, played_rx);
+        let tasks = vec![tokio::spawn(test(shared.clone(), frames, chain, sink))];
         Ok(Self {
             shared,
             tasks,
@@ -178,6 +293,17 @@ impl Media {
         self.shared.ptt.store(mode, Ordering::Relaxed);
     }
 
+    /// Each peer device's volume, in percent (SPEC-audio A6); a device
+    /// left out is at 100.
+    pub fn set_volumes(&self, volumes: HashMap<[u8; 32], u32>) {
+        *lock(&self.shared.volumes) = volumes;
+    }
+
+    /// The switches and sensitivity, from the next frame on.
+    pub fn set_audio(&self, audio: Audio) {
+        *lock(&self.shared.audio) = audio;
+    }
+
     /// Input volume, 0 to 200 percent.
     pub fn set_gain(&self, percent: u32) {
         self.shared
@@ -191,6 +317,34 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A sine wave at `hz`, a 20 ms frame every 20 ms, for tests.
+/// `--mic-file`: a WAV's samples, a frame every 20 ms, looped.
+fn recording(path: &std::path::Path, stop: Arc<AtomicBool>) -> Result<Frames, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("--mic-file: {e}"))?;
+    let at = (bytes.windows(4).position(|w| w == b"data")).ok_or("--mic-file: not a WAV")? + 8;
+    let samples: Vec<i16> = (bytes[at..].as_chunks::<2>().0.iter())
+        .map(|b| i16::from_le_bytes(*b))
+        .collect();
+    if samples.len() < FRAME_SAMPLES {
+        return Err("--mic-file: too short".into());
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        let mut at = 0;
+        while !stop.load(Ordering::Relaxed) {
+            tick.tick().await;
+            let frame: Vec<i16> = (0..FRAME_SAMPLES)
+                .map(|i| samples[(at + i) % samples.len()])
+                .collect();
+            at = (at + FRAME_SAMPLES) % samples.len();
+            if tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(rx)
+}
+
 fn tone(hz: f32, stop: Arc<AtomicBool>) -> tokio::sync::mpsc::UnboundedReceiver<Vec<i16>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -215,6 +369,13 @@ fn tone(hz: f32, stop: Arc<AtomicBool>) -> tokio::sync::mpsc::UnboundedReceiver<
 
 /// Our microphone's 20 ms frames.
 type Frames = tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>;
+/// What the mix played, with how long it'll take to reach the speakers
+/// (ms): the echo canceller's far end (SPEC-audio A1).
+type Played = tokio::sync::mpsc::UnboundedReceiver<(Vec<i16>, i32)>;
+/// Where the mix (or the mic test) says what it played.
+type PlayedTx = tokio::sync::mpsc::UnboundedSender<(Vec<i16>, i32)>;
+/// A device's own delay past our queue, about (ms).
+const DEVICE_DELAY_MS: i32 = 20;
 
 /// Noise suppression on our microphone (Q2): RNNoise, on each 20 ms frame's
 /// two 10 ms halves. Its first output is silent (its own delay).
@@ -256,6 +417,25 @@ fn scale(frame: &mut [i16], percent: u32) {
     }
 }
 
+/// The frames heard, each at its device's volume, summed, at `output`
+/// (SPEC-audio A3, A6).
+fn mix_at(
+    frames: &[([u8; 32], Vec<i16>)],
+    volumes: &HashMap<[u8; 32], u32>,
+    output: u32,
+) -> Vec<i16> {
+    let scaled: Vec<Vec<i16>> = (frames.iter())
+        .map(|(device, f)| {
+            let mut f = f.clone();
+            scale(&mut f, volumes.get(device).copied().unwrap_or(100));
+            f
+        })
+        .collect();
+    let mut out = mixed(scaled.iter().map(Vec::as_slice));
+    scale(&mut out, output);
+    out
+}
+
 fn rms(frame: &[i16]) -> f64 {
     let sum: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
     (sum / frame.len().max(1) as f64).sqrt()
@@ -279,14 +459,20 @@ impl Default for Gate {
 }
 
 impl Gate {
-    fn pass(&mut self, level: f64, now: Instant) -> bool {
+    /// Whether a frame at `level` goes out: above the room's noise
+    /// (Automatic), or above `threshold` dBFS (manual, A4).
+    fn pass(&mut self, level: f64, now: Instant, threshold: Option<f32>) -> bool {
         // The floor follows quiet at once and noise slowly.
         self.floor = if level < self.floor {
             level.max(20.0)
         } else {
             self.floor * 1.002
         };
-        if level > (self.floor * 3.0).max(GATE_MIN) {
+        let at = match threshold {
+            Some(db) => 32768.0 * 10f64.powf(f64::from(db) / 20.0),
+            None => (self.floor * 3.0).max(GATE_MIN),
+        };
+        if level > at {
             self.open_until = Some(now + HANGOVER);
         }
         self.open_until.is_some_and(|until| now < until)
@@ -311,31 +497,91 @@ impl Speakers {
 }
 
 /// Our frames: gated, encoded, and sent to every peer device.
+/// The mic's way to the encoder (SPEC-audio A1), the same in a call and
+/// in the mic test: echo and high-pass, noise, gain, volume, the gate; and
+/// the level, reported about 15 times a second.
+struct Chain {
+    gate: Gate,
+    processing: crate::processing::Processing,
+    agc: crate::processing::Gain,
+    denoise: Option<Denoise>,
+    played: Played,
+    delay: i32,
+    frames: u32,
+}
+
+impl Chain {
+    fn new(denoise: Option<Denoise>, played: Played) -> Self {
+        Self {
+            gate: Gate::default(),
+            processing: crate::processing::Processing::new(),
+            agc: crate::processing::Gain::new(),
+            denoise,
+            played,
+            delay: DEVICE_DELAY_MS,
+            frames: 0,
+        }
+    }
+
+    /// Processes `frame` in place; whether it goes out.
+    fn step(&mut self, frame: &mut Vec<i16>, shared: &Shared, now: Instant) -> bool {
+        // `--echo`: the speakers, heard by the mic.
+        if let Some((at, late)) = &shared.echo {
+            let mut late = lock(late);
+            for s in frame.iter_mut() {
+                let back = late.pop_front().unwrap_or(0);
+                *s = s.saturating_add((f32::from(back) * at) as i16);
+            }
+        }
+        // What was played since, first, so the canceller knows the far end.
+        while let Ok((far, at)) = self.played.try_recv() {
+            self.processing.render(&far);
+            self.delay = at;
+        }
+        let audio = *lock(&shared.audio);
+        if audio.echo {
+            self.processing.capture(frame, self.delay);
+        }
+        if let Some(d) = self.denoise.as_mut().filter(|_| audio.noise) {
+            *frame = d.frame(frame);
+        }
+        if audio.gain {
+            self.agc.process(frame);
+        }
+        scale(frame, shared.gain.load(Ordering::Relaxed));
+        // Push-to-talk sends while the key is held, whatever the level;
+        // otherwise the gate decides.
+        let level = rms(frame);
+        let open = match shared.ptt.load(Ordering::Relaxed) {
+            PTT_DOWN => true,
+            PTT_UP => false,
+            _ => self.gate.pass(level, now, audio.threshold),
+        };
+        self.frames = self.frames.wrapping_add(1);
+        if self.frames.is_multiple_of(3) {
+            let db = 20.0 * (level.max(1.0) / 32768.0).log10();
+            (shared.level)(db as f32, open && !shared.muted.load(Ordering::Relaxed));
+        }
+        open
+    }
+}
+
+/// Our frames: processed, gated, encoded, and sent to every peer device.
 async fn send(
     node: crate::nodes::Nodes,
     shared: Arc<Shared>,
-    (mut frames, mut denoise): (Frames, Option<Denoise>),
+    mut frames: Frames,
+    mut chain: Chain,
     mut encoder: Encoder,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
 ) {
-    let mut gate = Gate::default();
     let mut seq: u32 = 0;
     let mut out = vec![0u8; 1500];
     while let Some(mut frame) = frames.recv().await {
         seq = seq.wrapping_add(1);
-        if let Some(d) = denoise.as_mut() {
-            frame = d.frame(&frame);
-        }
-        scale(&mut frame, shared.gain.load(Ordering::Relaxed));
         let now = Instant::now();
-        // Push-to-talk sends while the key is held, whatever the level;
-        // otherwise the gate decides.
-        let open = match shared.ptt.load(Ordering::Relaxed) {
-            PTT_DOWN => true,
-            PTT_UP => false,
-            _ => gate.pass(rms(&frame), now),
-        };
+        let open = chain.step(&mut frame, &shared, now);
         if shared.muted.load(Ordering::Relaxed) || !open {
             continue;
         }
@@ -353,6 +599,29 @@ async fn send(
             if let Some(addr) = mesh_transport::MeshAddr::from_device(&device) {
                 node.send_datagram(&addr.device, datagram.clone());
             }
+        }
+    }
+}
+
+/// The mic test (SPEC-audio A5): the chain with nobody to send to; what it
+/// lets out plays back half a second late if `hear`.
+async fn test(
+    shared: Arc<Shared>,
+    mut frames: Frames,
+    mut chain: Chain,
+    sink: Option<(Sink, PlayedTx)>,
+) {
+    let mut late: std::collections::VecDeque<Vec<i16>> = std::collections::VecDeque::new();
+    while let Some(mut frame) = frames.recv().await {
+        let open = chain.step(&mut frame, &shared, Instant::now());
+        let Some((sink, played)) = &sink else {
+            continue;
+        };
+        late.push_back(if open { frame } else { vec![0; FRAME_SAMPLES] });
+        if late.len() > TEST_LATE {
+            let frame = late.pop_front().expect("over the limit");
+            let delay = sink.play(&frame);
+            let _ = played.send((frame, delay));
         }
     }
 }
@@ -408,13 +677,15 @@ enum Sink {
 }
 
 impl Sink {
-    fn play(&self, frame: &[i16]) {
+    /// Plays `frame`; how long until its end is heard, in ms.
+    fn play(&self, frame: &[i16]) -> i32 {
         match self {
             Sink::Device(buffer) => {
                 let mut b = lock(buffer);
                 b.extend(frame.iter().copied());
                 let over = b.len().saturating_sub(PLAYBACK_MAX);
                 b.drain(..over);
+                (b.len() * 1000 / SAMPLE_RATE as usize) as i32 + DEVICE_DELAY_MS
             }
             Sink::File(path) => {
                 let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -425,6 +696,7 @@ impl Sink {
                 if let Err(e) = file.and_then(|mut f| f.write_all(&bytes)) {
                     eprintln!("mesh-node: couldn't write what was heard: {e}");
                 }
+                0
             }
         }
     }
@@ -436,6 +708,7 @@ async fn mix(
     shared: Arc<Shared>,
     jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>>,
     sink: Sink,
+    played: PlayedTx,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
     speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
@@ -471,7 +744,12 @@ async fn mix(
         if frames.is_empty() || shared.deafened.load(Ordering::Relaxed) {
             continue;
         }
-        sink.play(&mixed(frames.iter().map(|(_, f)| f.as_slice())));
+        let out = mix_at(&frames, &lock(&shared.volumes), lock(&shared.audio).output);
+        let delay = sink.play(&out);
+        if let Some((_, late)) = &shared.echo {
+            lock(late).extend(out.iter().copied());
+        }
+        let _ = played.send((out, delay));
     }
 }
 
@@ -524,8 +802,15 @@ impl Jitter {
             return;
         }
         self.packets.insert(seq, opus);
-        while self.packets.len() > JITTER_HOLD {
-            self.packets.pop_first();
+        if self.packets.len() > JITTER_HOLD {
+            // Playback stalled: keep the newest `target` frames and play from
+            // them; trailing a full window would conceal until the speaker paused.
+            let newest = *self.packets.keys().next_back().unwrap_or(&seq);
+            let from = newest.saturating_sub(self.target as u32 - 1);
+            self.packets = self.packets.split_off(&from);
+            if self.next.is_some() {
+                self.next = Some(from);
+            }
         }
     }
 
@@ -602,6 +887,32 @@ mod tests {
         assert_eq!(j.next, Some(2), "starts at the first");
         assert!(j.pop().is_some() && j.pop().is_some());
         assert!(j.pop().is_none(), "dry: gathers again");
+    }
+
+    /// Playback stalls past the hold while someone keeps talking: it skips to
+    /// the newest frames instead of concealing forever behind the window.
+    #[test]
+    fn a_stall_skips_to_the_newest() {
+        let packets = encoded(1);
+        let mut j = jitter();
+        for seq in 1..=3 {
+            j.push(seq, packets[0].clone());
+        }
+        assert!(j.pop().is_some());
+        // Stalled: frames 4..=100 arrive with nothing played.
+        for seq in 4..=100 {
+            j.push(seq, packets[0].clone());
+        }
+        let next = j.next.unwrap();
+        assert!(next > 100 - JITTER_HOLD as u32, "{next} trails the window");
+        assert!(j.packets.contains_key(&next), "{next} was dropped");
+        // From here, arrivals and plays keep pace and every play is real.
+        for seq in 101..=120 {
+            j.push(seq, packets[0].clone());
+            let next = j.next.unwrap();
+            assert!(j.packets.contains_key(&next), "{next} is real audio");
+            assert!(j.pop().is_some());
+        }
     }
 
     /// A lost frame is concealed, not skipped; a late one grows the buffer.
@@ -689,10 +1000,10 @@ mod tests {
     fn the_gate() {
         let mut g = Gate::default();
         let t = Instant::now();
-        assert!(!g.pass(50.0, t));
-        assert!(g.pass(5000.0, t));
-        assert!(g.pass(50.0, t + Duration::from_millis(100)));
-        assert!(!g.pass(50.0, t + Duration::from_millis(400)));
+        assert!(!g.pass(50.0, t, None));
+        assert!(g.pass(5000.0, t, None));
+        assert!(g.pass(50.0, t + Duration::from_millis(100), None));
+        assert!(!g.pass(50.0, t + Duration::from_millis(400), None));
     }
 
     /// The 0.5.0 bug: a quiet mic in a quiet room (speech at RMS 200, about
@@ -704,11 +1015,50 @@ mod tests {
         let t = Instant::now();
         for i in 0..200 {
             assert!(
-                !g.pass(30.0, t + Duration::from_millis(20 * i)),
+                !g.pass(30.0, t + Duration::from_millis(20 * i), None),
                 "the room alone"
             );
         }
-        assert!(g.pass(200.0, t + Duration::from_secs(5)), "quiet speech");
+        assert!(
+            g.pass(200.0, t + Duration::from_secs(5), None),
+            "quiet speech"
+        );
+    }
+
+    /// A manual threshold (SPEC-audio A4): only what's above it goes out,
+    /// whatever the room.
+    #[test]
+    fn a_manual_threshold_holds() {
+        let mut g = Gate::default();
+        let t = Instant::now();
+        // -30 dBFS is RMS 1036: a voice at RMS 700 stays out, 2000 goes.
+        assert!(!g.pass(700.0, t, Some(-30.0)));
+        assert!(g.pass(2000.0, t, Some(-30.0)));
+        // Automatic would have let the 700 through over a quiet room.
+        let mut auto = Gate::default();
+        assert!(auto.pass(700.0, t, None));
+    }
+
+    /// SPEC-audio A6: one person at 50% is half, the other as they were;
+    /// the output volume scales what's heard.
+    #[test]
+    fn per_person_and_output_volume() {
+        let (ann, ben) = ([1u8; 32], [2u8; 32]);
+        let frame = |v: i16| vec![v; FRAME_SAMPLES];
+        let half = HashMap::from([(ann, 50u32)]);
+        let none = HashMap::new();
+        // Alone, each as set.
+        assert_eq!(mix_at(&[(ann, frame(1000))], &half, 100)[0], 500);
+        assert_eq!(mix_at(&[(ben, frame(1000))], &half, 100)[0], 1000);
+        // Together: Ann's half adds less than Ben's whole.
+        let both = mix_at(&[(ann, frame(1000)), (ben, frame(1000))], &half, 100)[0];
+        let even = mix_at(&[(ann, frame(1000)), (ben, frame(1000))], &none, 100)[0];
+        assert!(both < even, "{both} vs {even}");
+        assert!(
+            mix_at(&[(ann, frame(1000)), (ben, frame(1000))], &none, 0)
+                .iter()
+                .all(|&s| s == 0)
+        );
     }
 
     #[test]
