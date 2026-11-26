@@ -59,6 +59,12 @@ pub struct Io {
     pub heard: Option<PathBuf>,
     /// `--drop <percent>`: incoming datagrams dropped (spec test 5).
     pub drop: u8,
+    /// `--mic-file <wav>`: a 48 kHz mono 16-bit recording, looped, instead
+    /// of the microphone (PLAN-audio Task 6).
+    pub mic_file: Option<PathBuf>,
+    /// `--echo <ms>,<level>`: what's played comes back into the mic this
+    /// late at this level, as speakers beside a mic would (Task 6).
+    pub echo: Option<(u32, f32)>,
 }
 
 /// What the media tasks share with the call.
@@ -78,11 +84,22 @@ struct Shared {
     level: Box<dyn Fn(f32, bool) + Send + Sync>,
     /// Each peer device's volume, in percent, where it isn't 100 (A6).
     volumes: Mutex<HashMap<[u8; 32], u32>>,
+    /// `--echo`: the level, and what was played, waiting its delay.
+    echo: Option<(f32, Mutex<std::collections::VecDeque<i16>>)>,
 }
 
 impl Shared {
-    fn new(call: [u8; 8], level: impl Fn(f32, bool) + Send + Sync + 'static) -> Arc<Self> {
+    fn new(
+        call: [u8; 8],
+        level: impl Fn(f32, bool) + Send + Sync + 'static,
+        echo: Option<(u32, f32)>,
+    ) -> Arc<Self> {
+        let echo = echo.map(|(ms, at)| {
+            let late = SAMPLE_RATE as usize * ms as usize / 1000;
+            (at, Mutex::new(std::iter::repeat_n(0, late).collect()))
+        });
         Arc::new(Self {
+            echo,
             call,
             peers: Mutex::new(HashSet::new()),
             muted: AtomicBool::new(false),
@@ -101,6 +118,9 @@ fn mic(
     io: &Io,
     stop: &Arc<AtomicBool>,
 ) -> Result<(Frames, Option<audio::CaptureHandle>, Option<Denoise>), String> {
+    if let Some(path) = &io.mic_file {
+        return Ok((recording(path, stop.clone())?, None, Some(Denoise::new())));
+    }
     Ok(match io.tone {
         Some(hz) => (tone(hz, stop.clone()), None, None),
         None => {
@@ -182,7 +202,7 @@ impl Media {
         speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
         level: impl Fn(f32, bool) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Shared::new(call, level);
+        let shared = Shared::new(call, level, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, capture, denoise) = mic(io, &stop)?;
         let (sink, playback) = speakers(io)?;
@@ -234,7 +254,7 @@ impl Media {
         hear: bool,
         level: impl Fn(f32, bool) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Shared::new([0; 8], level);
+        let shared = Shared::new([0; 8], level, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, capture, denoise) = mic(io, &stop)?;
         let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -297,6 +317,34 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A sine wave at `hz`, a 20 ms frame every 20 ms, for tests.
+/// `--mic-file`: a WAV's samples, a frame every 20 ms, looped.
+fn recording(path: &std::path::Path, stop: Arc<AtomicBool>) -> Result<Frames, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("--mic-file: {e}"))?;
+    let at = (bytes.windows(4).position(|w| w == b"data")).ok_or("--mic-file: not a WAV")? + 8;
+    let samples: Vec<i16> = (bytes[at..].as_chunks::<2>().0.iter())
+        .map(|b| i16::from_le_bytes(*b))
+        .collect();
+    if samples.len() < FRAME_SAMPLES {
+        return Err("--mic-file: too short".into());
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        let mut at = 0;
+        while !stop.load(Ordering::Relaxed) {
+            tick.tick().await;
+            let frame: Vec<i16> = (0..FRAME_SAMPLES)
+                .map(|i| samples[(at + i) % samples.len()])
+                .collect();
+            at = (at + FRAME_SAMPLES) % samples.len();
+            if tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(rx)
+}
+
 fn tone(hz: f32, stop: Arc<AtomicBool>) -> tokio::sync::mpsc::UnboundedReceiver<Vec<i16>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -477,6 +525,14 @@ impl Chain {
 
     /// Processes `frame` in place; whether it goes out.
     fn step(&mut self, frame: &mut Vec<i16>, shared: &Shared, now: Instant) -> bool {
+        // `--echo`: the speakers, heard by the mic.
+        if let Some((at, late)) = &shared.echo {
+            let mut late = lock(late);
+            for s in frame.iter_mut() {
+                let back = late.pop_front().unwrap_or(0);
+                *s = s.saturating_add((f32::from(back) * at) as i16);
+            }
+        }
         // What was played since, first, so the canceller knows the far end.
         while let Ok((far, at)) = self.played.try_recv() {
             self.processing.render(&far);
@@ -690,6 +746,9 @@ async fn mix(
         }
         let out = mix_at(&frames, &lock(&shared.volumes), lock(&shared.audio).output);
         let delay = sink.play(&out);
+        if let Some((_, late)) = &shared.echo {
+            lock(late).extend(out.iter().copied());
+        }
         let _ = played.send((out, delay));
     }
 }

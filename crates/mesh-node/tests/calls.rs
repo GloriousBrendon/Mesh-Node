@@ -773,3 +773,88 @@ fn a_persons_volume_is_ours_to_set() {
     let _ = (a.h.quit(), b.h.quit());
     seed.stop();
 }
+
+/// `person`, its mic set by `mic` (`--tone`, `--mic-file`, `--echo`).
+fn person_with(dir: &Path, relay: &Relay, seed: &str, name: &str, mic: &[&str]) -> Person {
+    let heard = dir.join("heard.raw");
+    let heard_s = heard.to_str().unwrap().to_owned();
+    let mut args = vec!["--seed", seed, "--record-ttl", TTL, "--heard", &heard_s];
+    args.extend(mic);
+    let mut h = Helper::start_with(dir, relay, &args);
+    assert_eq!(h.event().0, "meshIdentity");
+    let id = h.expect("idCreate", &[name, PASSWORD], "meshIdentity")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.net_state("online");
+    Person { h, id, heard }
+}
+
+/// A live call from `a` to `b`.
+fn call(a: &mut Person, b: &mut Person) {
+    friends(a, b);
+    a.h.send("callStart", &[&b.id]);
+    call_state(&mut b.h, "ringing");
+    b.h.send("callAnswer", &[]);
+    call_state(&mut a.h, "live");
+}
+
+/// PLAN-audio Task 6: a quiet voice (the clip, -50 dBFS) reaches the other
+/// side much louder with automatic gain on than with it off.
+#[test]
+fn a_quiet_voice_is_heard_at_a_normal_level() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a", "b"].map(|n| temp_dir(&format!("calls-quiet-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let clip = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/quiet-voice.wav");
+    let mut a = person_with(&dirs[1], &relay, &ticket, "ann", &["--mic-file", clip]);
+    // B says nothing: what B hears is A alone.
+    let mut b = person_with(&dirs[2], &relay, &ticket, "ben", &["--tone", "0"]);
+    call(&mut a, &mut b);
+    // The gain settles in a few seconds.
+    std::thread::sleep(Duration::from_secs(8));
+    let on = recent_rms(&b);
+    a.h.send("callAudio", &[r#"{"gain": false}"#]);
+    std::thread::sleep(Duration::from_secs(3));
+    let off = recent_rms(&b);
+    let lift = 20.0 * (on.max(1.0) / off.max(1.0)).log10();
+    eprintln!("quiet voice heard at RMS {on:.0} with gain, {off:.0} without ({lift:.1} dB)");
+    assert!(lift >= 10.0, "automatic gain lifted it {lift:.1} dB");
+    let _ = (a.h.quit(), b.h.quit());
+    seed.stop();
+}
+
+/// PLAN-audio Task 6: A's speakers are heard by A's mic (`--echo`). B
+/// talks (the clip; a steady tone would look like an echo of itself to
+/// B's own canceller), A says nothing: all B hears is its own voice back.
+/// With A's echo cancellation on that's far quieter than with it off.
+#[test]
+fn an_echo_is_cancelled_before_it_leaves() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a", "b"].map(|n| temp_dir(&format!("calls-echo-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let clip = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/quiet-voice.wav");
+    let mut a = person_with(
+        &dirs[1],
+        &relay,
+        &ticket,
+        "ann",
+        &["--tone", "0", "--echo", "40,0.5"],
+    );
+    let mut b = person_with(&dirs[2], &relay, &ticket, "ben", &["--mic-file", clip]);
+    call(&mut a, &mut b);
+    // B's gain settles and A's canceller converges.
+    std::thread::sleep(Duration::from_secs(8));
+    let cancelled = recent_rms(&b);
+    a.h.send("callAudio", &[r#"{"echo": false}"#]);
+    std::thread::sleep(Duration::from_secs(3));
+    let echoed = recent_rms(&b);
+    let cut = 20.0 * (echoed.max(1.0) / cancelled.max(1.0)).log10();
+    eprintln!("B's voice back: RMS {cancelled:.0} cancelled, {echoed:.0} not ({cut:.1} dB)");
+    assert!(echoed > 100.0, "the test feeds no echo (RMS {echoed:.0})");
+    assert!(cut >= 10.0, "echo cancellation cut it {cut:.1} dB");
+    let _ = (a.h.quit(), b.h.quit());
+    seed.stop();
+}
