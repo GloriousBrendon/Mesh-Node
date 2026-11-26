@@ -134,6 +134,8 @@ pub struct Calls {
     pub deafened: bool,
     /// Push-to-talk's mode (`media::PTT_*`); off is the voice gate.
     ptt: u8,
+    /// Input volume in percent, once the app set one; `None` is 100.
+    gain: Option<u32>,
     /// Who's speaking in the current call, by device.
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
@@ -229,6 +231,17 @@ impl Helper {
                 self.emit_call(None);
             }
             // Push-to-talk (C10): `off`, `up` (on, the key released) or `down`.
+            // Input volume, 0 to 200 percent (SPEC-audio A3), now and for
+            // the calls after.
+            "callGain" => {
+                let percent: u32 = (arg(0)?.parse())
+                    .map_err(|_| Fail("bad-args", "a percentage, 0 to 200".into()))?;
+                self.calls.gain = Some(percent.min(200));
+                #[cfg(feature = "audio")]
+                if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
+                    m.set_gain(percent);
+                }
+            }
             "callPtt" => {
                 self.calls.ptt = match arg(0)? {
                     "off" => 0,
@@ -426,6 +439,7 @@ impl Helper {
             media.set_muted(self.calls.muted);
             media.set_deafened(self.calls.deafened);
             media.set_ptt(self.calls.ptt);
+            media.set_gain(self.calls.gain.unwrap_or(100));
             call.media = Some(media);
         }
         Ok(())
