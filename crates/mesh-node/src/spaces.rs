@@ -550,7 +550,7 @@ fn notify_post(space: &SpaceId, channel: &ChannelId, author: &Person, text: &str
 }
 
 /// A Space's or channel's 16 bytes as hex, for Mesh-Voice.
-fn hex16(bytes: &[u8; 16]) -> String {
+pub(super) fn hex16(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -757,6 +757,7 @@ impl Helper {
                 "members": members,
                 "categories": categories,
                 "membersMayAdd": st.members_may_add,
+                "directAllowed": st.direct_allowed,
                 "bans": bans,
                 "ended": st.ended,
                 "changes": changes,
@@ -793,6 +794,27 @@ impl Helper {
         Ok(())
     }
 
+    /// The nodes for traffic of `spaces`: relayed (P14) unless every one of
+    /// them allows direct (P7). Then members who are friends go direct, as
+    /// only friends are ever on the direct node, and the rest stay relayed.
+    pub(super) fn space_nodes<'a>(
+        &self,
+        spaces: impl IntoIterator<Item = &'a SpaceId>,
+    ) -> crate::nodes::Nodes {
+        let net = self.net.as_ref().expect("networking runs");
+        let mut spaces = spaces.into_iter().peekable();
+        let direct = spaces.peek().is_some()
+            && spaces.all(|s| {
+                self.space_version(s)
+                    .is_some_and(|v| v.state.direct_allowed)
+            });
+        if direct {
+            net.node.clone()
+        } else {
+            net.node.relayed()
+        }
+    }
+
     /// "Typing" in a channel, to members' connected devices only (dm D10).
     fn space_send_typing(&mut self, space: &SpaceId, channel: &ChannelId) -> Result<(), Fail> {
         let me = self.me_sender()?.person;
@@ -800,9 +822,10 @@ impl Helper {
         let Some(net) = &self.net else { return Ok(()) };
         let frame = [&space[..], &channel[..]].concat();
         let others = (v.state.members.keys()).filter(|p| **p != me);
+        let nodes = self.space_nodes([space]);
         for person in others.filter_map(|p| MeshId::from_bytes(p).ok()) {
             for addr in net.node.connected(&person) {
-                let (node, frame) = (net.node.clone(), frame.clone());
+                let (node, frame) = (nodes.clone(), frame.clone());
                 tokio::spawn(async move {
                     if let Ok((_, mut send, _)) = node.open(&addr, dm::TYPING).await {
                         let _ = mesh_transport::frame::write_frame(&mut send, &frame).await;
@@ -1100,9 +1123,12 @@ impl Helper {
             }
         };
         self.peer_used(id);
-        let Some(net) = &self.net else { return };
+        if self.net.is_none() {
+            return;
+        }
         self.space_flight.insert(device);
-        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        let node = self.space_nodes(numbers.iter().map(|(s, _)| s));
+        let (back, id) = (self.back.clone(), *id);
         tokio::spawn(async move {
             let frames: Vec<Vec<u8>> = (envelopes.iter())
                 .map(|e| [&[dm::ANSWER][..], e].concat())
@@ -1569,7 +1595,8 @@ impl Helper {
         pull.under_way = true;
         let mut parts: Vec<Option<ChannelId>> = vec![None];
         parts.extend(v.state.channels.keys().copied().map(Some));
-        let (node, back, space) = (net.node.clone(), self.back.clone(), *space);
+        let node = self.space_nodes([space]);
+        let (back, space) = (self.back.clone(), *space);
         tokio::spawn(async move {
             if let Ok((_, mut send, mut recv)) = node.open(&addr, SPACE_HISTORY).await {
                 'parts: for part in parts {
@@ -1940,6 +1967,7 @@ impl Helper {
             | "spaceCategoryMove"
             | "spaceCategoryDelete"
             | "spaceMembersMayAdd"
+            | "spaceDirect"
             | "spaceTransfer"
             | "spaceEnd" => {
                 let space = parse16(arg(0)?, "Space")?;
@@ -1984,6 +2012,11 @@ impl Helper {
                     },
                     "spaceCategoryDelete" => Change::CategoryDelete(parse16(arg(1)?, "category")?),
                     "spaceMembersMayAdd" => Change::MembersMayAdd(match arg(1)? {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(Fail("bad-args", "true or false".to_owned())),
+                    }),
+                    "spaceDirect" => Change::DirectAllowed(match arg(1)? {
                         "true" => true,
                         "false" => false,
                         _ => return Err(Fail("bad-args", "true or false".to_owned())),
@@ -2043,6 +2076,9 @@ impl Helper {
                     members,
                 )?;
             }
+            "spaceReport" => self.space_report(args)?,
+            "spaceReports" => self.emit_reports(&parse16(arg(0)?, "Space")?),
+            "spaceReportDismiss" => self.report_dismiss(args)?,
             "spaceTyping" => {
                 let space = parse16(arg(0)?, "Space")?;
                 let channel = parse16(arg(1)?, "channel")?;
@@ -2329,7 +2365,7 @@ impl Helper {
         let Some(target) = Target::of(store, id).filter(|t| t.last.is_some()) else {
             return;
         };
-        let (node, back, id) = (net.node.clone(), self.back.clone(), *id);
+        let (node, back, id) = (net.node.relayed(), self.back.clone(), *id);
         tokio::spawn(async move {
             if let Some(Reached { last, list, .. }) = routing::reach_known(&node, &target).await {
                 let _ = back.send(Back::Reached(Box::new((id, last, list))));
@@ -2362,7 +2398,7 @@ impl Helper {
             }
             return;
         }
-        let (node, anon) = (net.node.clone(), net.anon.clone());
+        let (node, anon) = (net.node.relayed(), net.anon.clone());
         // The hello takes only spare gets: sends and key lookups go first.
         let gets = if hello {
             net.gets.spare()

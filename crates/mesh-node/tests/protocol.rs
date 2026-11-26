@@ -184,9 +184,13 @@ fn two_helpers_ping_through_a_relay() {
         [
             "connections",
             "direct",
+            "directCount",
+            "hideIp",
             "keys",
+            "paths",
             "published",
             "relay",
+            "relayedCount",
             "state"
         ]
     );

@@ -508,3 +508,75 @@ async fn wait(n: &Node) -> (mesh_transport::Peer, Vec<u8>) {
     let got = tokio::time::timeout(Duration::from_secs(5), n.next_datagram()).await;
     got.expect("a datagram in 5 s").expect("the node is open")
 }
+
+/// A node on `device`'s direct key (SPEC-connection-privacy P3), letting in
+/// only `allowed`.
+async fn direct_node(device: &Device, allowed: Vec<MeshId>) -> Node {
+    let (direct, cert) = mesh_identity::DirectCert::issue(&device.key, 1);
+    let config = Config {
+        relays: Relays::Disabled,
+        services: vec!["echo".into()],
+        allow: mesh_transport::Allow::only(move |id, _| allowed.contains(id)),
+        direct: Some(cert),
+        ..Config::default()
+    };
+    Node::start(&direct, &device.cert("pc"), config)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn direct_nodes_report_device_keys_and_let_only_friends_in() {
+    let (alice, bob, eve) = (Device::new(), Device::new(), Device::new());
+    let a = direct_node(&alice, vec![bob.id()]).await;
+    let b = direct_node(&bob, vec![alice.id()]).await;
+    // Bob's direct node reaches Alice's and sees her device key, not her
+    // direct key, and the connection is found again by either key.
+    let pong = b.ping(&addr_of(&a)).await.expect("friends get in");
+    assert_eq!(pong.peer.id, alice.id());
+    assert_eq!(
+        pong.peer.device,
+        mesh_transport::secret_key(&alice.key).public()
+    );
+    assert_ne!(pong.peer.device, a.addr().device);
+    assert_eq!(b.connected(&alice.id()).len(), 1);
+    b.ping(&b.connected(&alice.id())[0])
+        .await
+        .expect("reused by device key");
+    assert_eq!(b.open_connections(), 1);
+
+    // Eve has Alice's direct key (it leaked) and dials it from a normal node
+    // and from a direct one of her own: refused both times.
+    let e = eve.node("laptop").await;
+    let err = e.dial(&addr_of(&a)).await.unwrap_err();
+    assert!(
+        matches!(err, TransportError::Handshake(HandshakeError::NotAllowed)),
+        "{err:?}"
+    );
+    let e = direct_node(&eve, vec![alice.id()]).await;
+    let err = e.dial(&addr_of(&a)).await.unwrap_err();
+    assert!(
+        matches!(err, TransportError::Handshake(HandshakeError::NotAllowed)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn start_refuses_a_direct_cert_for_another_key() {
+    let (alice, bob) = (Device::new(), Device::new());
+    let (direct, cert) = mesh_identity::DirectCert::issue(&alice.key, 1);
+    let config = |cert| Config {
+        relays: Relays::Disabled,
+        direct: Some(cert),
+        ..Config::default()
+    };
+    // The device key itself under a direct cert, and Bob's cert with Alice's.
+    assert!(matches!(
+        Node::start(&alice.key, &alice.cert("pc"), config(cert.clone())).await,
+        Err(TransportError::CertNotOurs)
+    ));
+    assert!(matches!(
+        Node::start(&direct, &bob.cert("pc"), config(cert)).await,
+        Err(TransportError::CertNotOurs)
+    ));
+}

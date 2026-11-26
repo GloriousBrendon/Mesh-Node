@@ -10,7 +10,8 @@ pub mod ticket;
 
 pub use endpoint::Node;
 pub use handshake::{ALPN, HandshakeError};
-pub use iroh::RelayUrl;
+pub use iroh::endpoint::{RecvStream, SendStream};
+pub use iroh::{PublicKey, RelayUrl};
 
 use mesh_identity::{DeviceKey, MeshId};
 use std::net::SocketAddr;
@@ -114,6 +115,11 @@ pub struct Config {
     /// the node opens no socket anyone can reach (a seed that mustn't show
     /// its address, SPEC-seed D8c as changed). Can't go with `port`.
     pub relay_only: bool,
+    /// This node runs on the device's direct key, not its device key
+    /// (SPEC-connection-privacy P3): the key passed to `Node::start` is the
+    /// direct key, and the hello adds this certificate, so peers still see
+    /// the device key in `Peer::device`.
+    pub direct: Option<mesh_identity::DirectCert>,
     #[cfg(feature = "test-utils")]
     pub test: TestOptions,
 }
@@ -201,6 +207,9 @@ pub struct Status {
     /// At least one open connection is on a direct path.
     pub direct: bool,
     pub connections: usize,
+    /// Each connected person's best path (direct if any device of theirs
+    /// is), by ID bytes, sorted (SPEC-connection-privacy P8). No addresses.
+    pub paths: Vec<([u8; 32], Path)>,
 }
 
 /// A connection's current path.

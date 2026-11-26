@@ -61,7 +61,7 @@ pub(super) const PRESENCE_SILENCE: Duration = Duration::from_secs(150);
 pub(super) const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Sends our account state to another of our devices, in the background.
-pub(super) fn push_account(node: Arc<Node>, addr: MeshAddr, account: Vec<u8>) {
+pub(super) fn push_account(node: crate::nodes::Nodes, addr: MeshAddr, account: Vec<u8>) {
     tokio::spawn(async move {
         let sent = async {
             let (_, mut send, _recv) = node.open(&addr, SYNC).await.ok()?;
@@ -267,7 +267,13 @@ impl Helper {
             let (node, presenting) = (net.node.clone(), net.presenting.clone());
             let mut shown = self.shown.subscribe();
             let name = store.username().as_bytes().to_vec();
+            // Each presence stream starts with our direct key, so a friend
+            // who restarted (and forgot it) learns it again (P3).
+            let direct = self.direct_frame();
             tokio::spawn(async move {
+                if let Some(frame) = direct {
+                    send_direct(&node, &addr, &frame).await;
+                }
                 let sent = async {
                     let (_, mut send, _recv) = node.open(&addr, PRESENCE).await.ok()?;
                     loop {
@@ -285,6 +291,42 @@ impl Helper {
                 let _: Option<()> = sent.await;
                 lock(&presenting).remove(&key);
             });
+        }
+    }
+
+    /// What friends and own devices are told on `direct`: our direct key's
+    /// cert and the direct node's relay. `None` while there's no direct node
+    /// (Hide my IP) or it has no relay yet.
+    pub(super) fn direct_frame(&self) -> Option<Vec<u8>> {
+        let cert = self.direct_cert.as_ref()?;
+        let relay = self.net.as_ref()?.node.direct()?.addr().relay?;
+        Some([cert.to_bytes(), relay.to_string().into_bytes()].concat())
+    }
+
+    /// Tells each of `id`'s connected devices our direct key, if `id` is us
+    /// or a friend (P3).
+    pub(super) fn tell_direct(&self, id: &MeshId) {
+        let (Some(store), Some(net), Some(frame)) = (&self.store, &self.net, self.direct_frame())
+        else {
+            return;
+        };
+        if *id != store.id() && store.account().kind(id) != Some(Kind::Friend) {
+            return;
+        }
+        for addr in net.node.connected(id) {
+            let (node, frame) = (net.node.clone(), frame.clone());
+            tokio::spawn(async move { send_direct(&node, &addr, &frame).await });
+        }
+    }
+
+    /// A device told us its direct key: kept if it's ours or a friend's.
+    pub(super) fn direct_heard(&self, id: &MeshId, cert: &DirectCert, relay: &str) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        let own = *id == store.id();
+        if own || store.account().kind(id) == Some(Kind::Friend) {
+            net.node.learn(id, cert, relay, own);
         }
     }
 
@@ -404,7 +446,13 @@ impl Helper {
             return false;
         };
         match store.connected(id) {
-            Ok(changed) => changed,
+            Ok(changed) => {
+                // A new friend: the direct node lets them in from now (P3).
+                if changed {
+                    self.allow_contacts();
+                }
+                changed
+            }
             Err(e) => {
                 eprintln!("mesh-node: couldn't save a new friend: {e}");
                 false
@@ -453,5 +501,16 @@ impl Helper {
                 "status": store.account().status().as_str(),
             }),
         );
+    }
+}
+
+/// Sends one `direct` frame to `addr`, in the background's own time.
+async fn send_direct(node: &crate::nodes::Nodes, addr: &MeshAddr, frame: &[u8]) {
+    if let Ok((_, mut send, _recv)) = node.open(addr, crate::nodes::DIRECT).await
+        && mesh_transport::frame::write_frame(&mut send, frame)
+            .await
+            .is_ok()
+    {
+        let _ = send.finish();
     }
 }

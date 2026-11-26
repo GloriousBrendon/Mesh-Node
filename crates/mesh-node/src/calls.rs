@@ -163,7 +163,7 @@ fn hex8(id: &[u8; 8]) -> String {
 
 /// Sends `msg` to each of `addrs`, one stream each; the answer frame of an
 /// invite says it rings.
-async fn send_to(node: &mesh_transport::Node, addr: &MeshAddr, msg: &CallMsg) -> Invited {
+async fn send_to(node: &crate::nodes::Nodes, addr: &MeshAddr, msg: &CallMsg) -> Invited {
     let Ok(frame) = postcard::to_stdvec(msg) else {
         return Invited::Nobody;
     };
@@ -411,21 +411,17 @@ impl Helper {
             let (Some(net), Some(store)) = (&self.net, &self.store) else {
                 return Err(Fail("unavailable", "not connected".into()));
             };
+            let nodes = self.call_nodes(net);
             let Some(call) = self.calls.current.as_mut() else {
                 return Ok(());
             };
             let back = self.back.clone();
             let me = store.device_key().public().to_bytes();
-            let media = crate::media::Media::start(
-                net.node.clone(),
-                call.id,
-                me,
-                &self.calls.io,
-                move |who| {
+            let media =
+                crate::media::Media::start(nodes, call.id, me, &self.calls.io, move |who| {
                     let _ = back.send(Back::Speaking(who));
-                },
-            )
-            .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
+                })
+                .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
             media.set_peers(call.devices.iter().copied());
             media.set_muted(self.calls.muted);
             media.set_deafened(self.calls.deafened);
@@ -435,6 +431,16 @@ impl Helper {
         Ok(())
     }
 
+    /// The nodes the live call runs on: a voice channel is Space traffic,
+    /// relayed (connection-privacy P14); a DM call may go direct.
+    fn call_nodes(&self, net: &super::Net) -> crate::nodes::Nodes {
+        match self.calls.current.as_ref().map(|c| &c.stage) {
+            // A voice channel follows its Space's setting (P7, P14).
+            Some(Stage::Voice { space, .. }) => self.space_nodes([space]),
+            _ => net.node.clone(),
+        }
+    }
+
     /// Sends `msg` to each device, in the background.
     fn call_send(&self, to: &[(MeshId, [u8; 32])], msg: CallMsg) {
         let Some(net) = &self.net else { return };
@@ -442,7 +448,7 @@ impl Helper {
             let Some(addr) = MeshAddr::from_device(device) else {
                 continue;
             };
-            let (node, msg) = (net.node.clone(), msg.clone());
+            let (node, msg) = (self.call_nodes(net), msg.clone());
             tokio::spawn(async move {
                 send_to(&node, &addr, &msg).await;
             });
@@ -761,7 +767,7 @@ impl Helper {
         }
         // Each on its own: one slow dial mustn't hold up the rest.
         for (id, dial) in to {
-            let (node, msg) = (net.node.clone(), msg.clone());
+            let (node, msg) = (net.node.relayed(), msg.clone());
             tokio::spawn(async move {
                 let mut addrs = node.connected(&id);
                 // One we're dialling: give the dial a moment.

@@ -56,7 +56,11 @@ fn files_in(body: &Body) -> Vec<[u8; 32]> {
 }
 
 // ponytail: a file's sealed chunks gather in memory, up to 100 MB (MAX_FILE) per fetch at once; write them to a temp file as they come if that's too much.
-async fn fetch_from(node: &Node, addr: &MeshAddr, file: &Attachment) -> Option<Vec<Vec<u8>>> {
+async fn fetch_from(
+    node: &crate::nodes::Nodes,
+    addr: &MeshAddr,
+    file: &Attachment,
+) -> Option<Vec<Vec<u8>>> {
     let (_, mut send, mut recv) = node.open(addr, BLOB).await.ok()?;
     let mut opener = Opener::new(file.key, file.hash, file.size).ok()?;
     let mut sealed = Vec::new();

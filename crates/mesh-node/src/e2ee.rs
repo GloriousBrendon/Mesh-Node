@@ -147,7 +147,7 @@ pub fn learn(e2ee: &mut E2ee, id: &MeshId, records: &[AddrRecord]) -> bool {
 
 /// Sends frames to one device over the `e2ee` service, `MAX_FRAMES` to a
 /// stream as the reader takes them. True once it took them all.
-pub async fn send(node: &Node, addr: &MeshAddr, frames: &[Vec<u8>]) -> bool {
+pub async fn send(node: &crate::nodes::Nodes, addr: &MeshAddr, frames: &[Vec<u8>]) -> bool {
     for batch in frames.chunks(MAX_FRAMES) {
         let sent = async {
             let (_, mut send, _recv) = node.open(addr, SERVICE).await.ok()?;

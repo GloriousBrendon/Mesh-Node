@@ -8,6 +8,7 @@ mod addr;
 mod code;
 mod contacts;
 mod device;
+mod direct;
 mod id;
 mod keystore;
 mod knock;
@@ -30,6 +31,7 @@ pub use code::{
 };
 pub use contacts::{Contact, LastAddr, MAX_CONTACT_NAME, MAX_CONTACTS};
 pub use device::{DeviceCert, DeviceError, DeviceList, MAX_DEVICE_NAME, MAX_DEVICES};
+pub use direct::{DIRECT_CERT_LEN, DirectCert, DirectError};
 pub use ed25519_dalek::VerifyingKey;
 pub use id::{
     DeviceKey, IdError, Link, MeshId, RootKey, mail_collect_tag, verify_device, verify_device_bytes,

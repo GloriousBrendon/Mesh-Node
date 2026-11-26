@@ -312,7 +312,7 @@ pub enum ReachError {
 /// to answer wins (D8).
 /// `reach` without the seed: an open connection, or the last address that
 /// worked.
-pub async fn reach_known(node: &Node, target: &Target) -> Option<Reached> {
+pub async fn reach_known(node: &crate::nodes::Nodes, target: &Target) -> Option<Reached> {
     let current = |list: &Option<DeviceList>, device: &[u8; 32]| {
         list.as_ref()
             .is_none_or(|l| l.devices().iter().any(|c| c.device().as_bytes() == device))
@@ -346,7 +346,7 @@ pub async fn reach_known(node: &Node, target: &Target) -> Option<Reached> {
 /// The records a lookup found are put in `found`, reached or not: one
 /// find gives their keys too (SPEC-spaces S14).
 pub async fn reach(
-    node: Arc<Node>,
+    node: crate::nodes::Nodes,
     anon: &Node,
     gets: &Gets,
     seeds: &[MeshAddr],

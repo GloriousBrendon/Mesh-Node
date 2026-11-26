@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mesh_transport::Node;
 use opus::{Application, Bitrate, Channels, Decoder, Encoder};
 
 use crate::audio::{self, FRAME_SAMPLES, SAMPLE_RATE};
@@ -96,7 +95,7 @@ impl Media {
     /// `speaking` hears who's speaking (device keys, ours included) when it
     /// changes.
     pub fn start(
-        node: Arc<Node>,
+        node: crate::nodes::Nodes,
         call: [u8; 8],
         me: [u8; 32],
         io: &Io,
@@ -285,7 +284,7 @@ impl Speakers {
 
 /// Our frames: gated, encoded, and sent to every peer device.
 async fn send(
-    node: Arc<Node>,
+    node: crate::nodes::Nodes,
     shared: Arc<Shared>,
     (mut frames, mut denoise): (Frames, Option<Denoise>),
     mut encoder: Encoder,
@@ -341,7 +340,7 @@ pub fn parse(datagram: &[u8]) -> Option<([u8; 8], u32, &[u8])> {
 
 /// Peers' datagrams into their buffers.
 async fn receive(
-    node: Arc<Node>,
+    node: crate::nodes::Nodes,
     shared: Arc<Shared>,
     jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>>,
     drop: u8,

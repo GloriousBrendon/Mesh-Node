@@ -194,6 +194,11 @@ pub enum Change {
         name: String,
         category: Option<CategoryId>,
     },
+    /// The owner lets members who are friends connect directly for this
+    /// Space's traffic (SPEC-connection-privacy P7). Last, for the same
+    /// reason as `VoiceChannelCreate`: an older engine refuses it and stays
+    /// relayed, the safe side.
+    DirectAllowed(bool),
 }
 
 /// The fields a device signs: everything but the signature.
@@ -392,6 +397,9 @@ pub struct SpaceState {
     pub members: BTreeMap<Person, Member>,
     pub bans: BTreeSet<Person>,
     pub members_may_add: bool,
+    /// Members who are friends may go direct for this Space (P7); off by
+    /// default, and only the owner changes it.
+    pub direct_allowed: bool,
     pub channels: BTreeMap<ChannelId, Channel>,
     pub categories: BTreeMap<CategoryId, Category>,
     /// The owner ended it: no change counts after.
@@ -485,6 +493,7 @@ impl Chain {
             )]),
             bans: BTreeSet::new(),
             members_may_add: true,
+            direct_allowed: false,
             channels: BTreeMap::new(),
             categories: BTreeMap::new(),
             ended: false,
@@ -643,6 +652,7 @@ fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> O
         }
         Change::Rename(name) if admin => next.name = name.clone(),
         Change::MembersMayAdd(on) if admin => next.members_may_add = *on,
+        Change::DirectAllowed(on) if owner => next.direct_allowed = *on,
         Change::ChannelCreate {
             nonce,
             name,
@@ -1077,6 +1087,29 @@ pub(crate) mod tests {
                 .find(|c| c.name == "lounge")
                 .unwrap();
             assert!(c.voice && !c.admins_post);
+        }
+
+        /// "Allow direct connections with members" (SPEC-connection-privacy
+        /// P7): off by default, the owner's alone to change.
+        #[test]
+        fn direct_connections_are_the_owners_call() {
+            assert!(!version(&base()).state.direct_allowed, "on by default");
+            assert!(!counts(B, Change::DirectAllowed(true)), "a member can't");
+            assert!(!counts(X, Change::DirectAllowed(true)), "an admin can't");
+            assert!(counts(O, Change::DirectAllowed(true)), "the owner can");
+            let on = version(&with(
+                base(),
+                &[(50, O, Some(7), Change::DirectAllowed(true), 50)],
+            ));
+            assert!(on.state.direct_allowed);
+            let off = with(
+                base(),
+                &[
+                    (50, O, Some(7), Change::DirectAllowed(true), 50),
+                    (51, O, Some(50), Change::DirectAllowed(false), 51),
+                ],
+            );
+            assert!(!version(&off).state.direct_allowed);
         }
 
         #[test]

@@ -37,10 +37,10 @@ use crate::routing::{self, ReachError, Reached, Target};
 use crate::{knocks, seed};
 use mesh_e2ee::{Conversation, E2ee, E2eeError, Kind as NoteKind, Opened};
 use mesh_identity::{
-    Account, AddrRecord, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DeviceCert, DeviceKey,
-    DeviceList, FriendCode, HeldCode, IdError, Keystore, KeystoreError, Kind, KnockFrom, LastAddr,
-    Link, MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber, Status as Chosen,
-    check_password, is_kept, keyring_status, open_knock, seal_knock, unix_now,
+    Account, AddrRecord, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DIRECT_CERT_LEN, DeviceCert,
+    DeviceKey, DeviceList, DirectCert, FriendCode, HeldCode, IdError, Keystore, KeystoreError,
+    Kind, KnockFrom, LastAddr, Link, MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber,
+    Status as Chosen, check_password, is_kept, keyring_status, open_knock, seal_knock, unix_now,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -62,6 +62,8 @@ mod link;
 mod mail;
 #[path = "mailrec.rs"]
 mod mailrec;
+#[path = "reports.rs"]
+mod reports;
 #[path = "social.rs"]
 mod social;
 #[path = "spaces.rs"]
@@ -198,6 +200,8 @@ pub struct Options {
     /// `--no-calls` (tests only): no `call` service, as an engine from
     /// before calls (SPEC-calls C11).
     pub no_calls: bool,
+    /// `--hide-ip`: start with Hide my IP on (P6); `netPrivacy` changes it.
+    pub hide_ip: bool,
     /// `--tone`, `--heard` and `--drop` (tests only, SPEC-calls).
     #[cfg(feature = "audio")]
     pub audio: crate::media::Io,
@@ -213,6 +217,7 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
     helper.cut_live = options.cut.live;
     helper.crash_at_records = options.crash_at_records;
     helper.no_calls = options.no_calls;
+    helper.hide_ip = options.hide_ip;
     #[cfg(feature = "audio")]
     {
         helper.calls.io = options.audio;
@@ -277,6 +282,8 @@ pub async fn run(dir: &Path, relays: Relays, seeds: Vec<MeshAddr>, options: Opti
                 helper.dial_contacts();
                 helper.sync_own();
                 helper.fetch_keys(None);
+                helper.rotate_if_old();
+                helper.report_retry();
                 continue;
             }
             _ = collect.tick() => {
@@ -337,6 +344,12 @@ struct Helper {
     /// Who may connect: our ID and our contacts', each with the devices its
     /// newest known list removed (D9; audit finding 2).
     allowed: Arc<RwLock<Allowed>>,
+    /// Reports waiting for a Space's owner, and those we hold as one (P11).
+    reports: reports::Reports,
+    /// Who the direct node lets in: our ID and our friends' (P3).
+    friends: Arc<RwLock<HashSet<[u8; 32]>>>,
+    /// The direct key's certificate while networking runs: what friends are told.
+    direct_cert: Option<DirectCert>,
     /// How long address records last (D4).
     record_ttl: u64,
     /// `--cut seed`: the seeds, held back until `cutOff`.
@@ -418,6 +431,8 @@ struct Helper {
     calls: calls::Calls,
     /// `--no-calls`.
     no_calls: bool,
+    /// Hide my IP (P6): no direct node, everyone relayed.
+    hide_ip: bool,
     /// A device link in progress (PLAN-link), and which session it is.
     link: Option<link::Linking>,
     link_session: u64,
@@ -426,7 +441,11 @@ struct Helper {
 }
 
 struct Net {
-    node: Arc<Node>,
+    node: crate::nodes::Nodes,
+    /// What a rotated direct node starts with (P4), besides its key.
+    direct_config: Config,
+    /// The direct node's loops, stopped when it's replaced.
+    direct_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The throwaway identity's node, for seeds only (D7b).
     anon: Arc<Node>,
     /// Its address gets' budget, shared by every lookup (S14).
@@ -459,6 +478,15 @@ type Answered = (MeshId, MeshAddr, Vec<u64>, Option<Vec<bool>>);
 
 /// What a background request found out.
 enum Back {
+    /// A device told us its direct key (connection-privacy P3): who, the
+    /// cert (its device is the one that sent it) and its relay.
+    Direct(Box<(MeshId, DirectCert, String)>),
+    /// A rotated direct key's node started (P4).
+    DirectStarted(Box<(Node, DirectCert)>),
+    /// One of this owner's devices took these reports (P11).
+    ReportTaken(Box<(MeshId, Vec<reports::Report>)>),
+    /// The direct node has a relay now, so friends can be told it.
+    DirectOnline,
     /// A history stream's request (SPEC-spaces S10).
     HistoryAsk(Box<spaces::HistoryAsked>),
     /// One frame of a history pull.
@@ -560,6 +588,9 @@ impl Helper {
             held: HashSet::new(),
             back,
             allowed: Arc::default(),
+            friends: Arc::default(),
+            reports: reports::Reports::default(),
+            direct_cert: None,
             record_ttl: routing::RECORD_TTL,
             cut: None,
             cut_live: false,
@@ -600,6 +631,7 @@ impl Helper {
             mail: mail::Mail::default(),
             calls: calls::Calls::default(),
             no_calls: false,
+            hide_ip: false,
         };
         if Keystore::exists(&helper.path) {
             match Keystore::open_kept(&helper.path) {
@@ -924,6 +956,20 @@ impl Helper {
             "linkCancel" => self.link_cancel()?,
             "linkFinish" => self.link_finish(arg(0)?, arg(1)?).await?,
             "netStatus" => self.emit_net(),
+            "netPrivacy" => {
+                let hide = match arg(0)? {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(Fail(
+                            "bad-argument",
+                            "netPrivacy takes true or false".into(),
+                        ));
+                    }
+                };
+                self.set_hide_ip(hide);
+                emit("meshDone", json!({ "fn": func }));
+            }
             "netTicket" => {
                 let ticket = self
                     .node()?
@@ -972,7 +1018,7 @@ impl Helper {
     }
 
     /// The running node; the identity must be unlocked.
-    fn node(&mut self) -> Result<Arc<Node>, Fail> {
+    fn node(&mut self) -> Result<crate::nodes::Nodes, Fail> {
         self.unlocked()?;
         self.net
             .as_ref()
@@ -1154,6 +1200,7 @@ impl Helper {
                 // never met: their keys come only from records).
                 for id in learned {
                     self.space_deliver(&id);
+                    self.report_deliver(&id);
                 }
                 return;
             }
@@ -1280,11 +1327,12 @@ impl Helper {
                 self.send_waiting(&id);
                 self.dm_deliver(&id);
                 self.space_deliver(&id);
+                self.report_deliver(&id);
                 self.history_again(&id);
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
                     // with ours if it's missing something (`Back::Synced`).
-                    return;
+                    return self.tell_direct(&id);
                 }
                 if self.connected(&id) {
                     self.changed(None);
@@ -1301,6 +1349,19 @@ impl Helper {
                     self.dm_deliver(&own);
                 }
                 return self.synced(&theirs, &from);
+            }
+            Back::Direct(told) => {
+                let (id, cert, relay) = *told;
+                return self.direct_heard(&id, &cert, &relay);
+            }
+            Back::DirectOnline => return self.tell_direct_all(),
+            Back::ReportTaken(taken) => {
+                let (owner, sent) = *taken;
+                return self.report_taken(&owner, &sent);
+            }
+            Back::DirectStarted(started) => {
+                let (node, cert) = *started;
+                return self.direct_started(node, cert);
             }
             Back::Presence(heard) => {
                 let (id, device, heard, name) = *heard;
@@ -1532,6 +1593,7 @@ impl Helper {
         let mut events = Vec::new();
         let mut synced = Vec::new();
         let mut space_in = Vec::new();
+        let mut reports_in = Vec::new();
         let (mut unknown, mut fresh) = (false, false);
         let envelopes: Vec<Vec<u8>> = frames.iter().map(|(_, e)| e.clone()).collect();
         // One save for the whole stream (PLAN-dm Task 8).
@@ -1574,6 +1636,10 @@ impl Helper {
                         if opened.kind == NoteKind::Message {
                             // A Space event (SPEC-spaces): its own layout.
                             let first = opened.body.first().copied();
+                            if first == Some(reports::REPORT_LAYOUT) {
+                                reports_in.push(opened.body);
+                                continue;
+                            }
                             if first == Some(mesh_dm::space_store::SPACE_LAYOUT)
                                 || first == Some(mesh_dm::space_store::SPACE_BATCH)
                             {
@@ -1631,6 +1697,9 @@ impl Helper {
         }
         if !synced.is_empty() {
             self.dm_take_synced(&device, synced, &mut answers);
+        }
+        for body in reports_in {
+            self.report_heard(&id, &body);
         }
         if !space_in.is_empty() {
             self.space_take(&id, &device, space_in, &mut answers);
@@ -1838,6 +1907,7 @@ impl Helper {
             .ok();
         self.open_dm();
         self.open_spaces();
+        self.reports_load();
         let Some(store) = &self.store else { return };
         let this = store.device_key().public();
         let Some(cert) = store
@@ -1850,19 +1920,31 @@ impl Helper {
             return;
         };
         let allowed = self.allowed.clone();
+        let admits = move |id: &MeshId, device: &mesh_transport::PublicKey| {
+            // A device not in the newest list we hold may be newly linked;
+            // only one that list removed is refused.
+            let allowed = allowed
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            allowed
+                .get(&id.to_bytes())
+                .is_some_and(|revoked| !revoked.contains(device.as_bytes()))
+        };
+        let (admitted, friends) = (admits.clone(), self.friends.clone());
+        // The direct node lets in only our own devices and friends (P3).
+        let direct_allow = Allow::only(move |id, device| {
+            admitted(id, device)
+                && (friends.read())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&id.to_bytes())
+        });
         let config = Config {
             relays: self.relays.clone(),
-            allow: Allow::only(move |id, device| {
-                // A device not in the newest list we hold may be newly linked;
-                // only one that list removed is refused.
-                let allowed = allowed
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                allowed
-                    .get(&id.to_bytes())
-                    .is_some_and(|revoked| !revoked.contains(device.as_bytes()))
-            }),
+            allow: Allow::only(admits),
+            // The device key everyone may know never goes direct (P2, P3).
+            relay_only: true,
             services: vec![
+                crate::nodes::DIRECT.to_owned(),
                 SYNC.to_owned(),
                 PRESENCE.to_owned(),
                 e2ee::SERVICE.to_owned(),
@@ -1877,15 +1959,33 @@ impl Helper {
         };
         self.allow_contacts();
         let Some(store) = &self.store else { return };
-        let started = match Node::start(store.device_key(), cert, config).await {
-            Ok(node) => anon_node(self.relays.clone())
-                .await
-                .map(|anon| (node, anon)),
-            Err(e) => Err(e.to_string()),
+        let (direct_key, direct_cert) = DirectCert::issue(store.device_key(), self.direct_issued());
+        let direct_config = Config {
+            relay_only: false,
+            allow: direct_allow,
+            direct: Some(direct_cert.clone()),
+            ..config.clone()
         };
-        match started {
-            Ok((node, anon)) => {
-                let node = Arc::new(node);
+        let hide_ip = self.hide_ip;
+        let started = async {
+            let relay = Node::start(store.device_key(), cert, config).await;
+            // Hide my IP (P6): no direct node at all, so nothing can reach one.
+            let direct = match hide_ip {
+                true => None,
+                false => Some(Node::start(&direct_key, cert, direct_config.clone()).await),
+            };
+            let anon = anon_node(self.relays.clone()).await?;
+            Ok::<_, String>((
+                relay.map_err(|e| e.to_string())?,
+                direct.transpose().map_err(|e| e.to_string())?,
+                anon,
+            ))
+        };
+        match started.await {
+            Ok((relay, direct, anon)) => {
+                let (relay, direct) = (Arc::new(relay), direct.map(Arc::new));
+                let node = crate::nodes::Nodes::new(relay.clone(), direct.clone());
+                self.direct_cert = direct.is_some().then_some(direct_cert);
                 let published = Arc::new(AtomicBool::new(false));
                 let keys = Arc::new(AtomicBool::new(false));
                 let watch = tokio::spawn(watch_net(
@@ -1894,12 +1994,31 @@ impl Helper {
                     keys.clone(),
                     self.back.clone(),
                 ));
-                let peers = tokio::spawn(watch_peers(node.clone(), self.back.clone()));
+                let peers = tokio::spawn(watch_peers(relay.clone(), self.back.clone()));
                 let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
-                let blobs = self.blobs_dir();
-                let streams =
-                    tokio::spawn(serve_streams(node.clone(), own, blobs, self.back.clone()));
+                let streams = tokio::spawn(serve_streams(
+                    relay,
+                    own,
+                    self.blobs_dir(),
+                    self.back.clone(),
+                ));
+                // Friends who connect before the direct node has a relay
+                // aren't told it then; they are once it has one.
+                let direct_tasks = match direct {
+                    Some(direct) => {
+                        let (back, waiting) = (self.back.clone(), direct.clone());
+                        tokio::spawn(async move {
+                            if waiting.online(Duration::from_secs(30)).await {
+                                let _ = back.send(Back::DirectOnline);
+                            }
+                        });
+                        self.direct_tasks(direct)
+                    }
+                    None => Vec::new(),
+                };
                 self.net = Some(Net {
+                    direct_config,
+                    direct_tasks,
                     node,
                     anon: Arc::new(anon),
                     gets: routing::Gets::default(),
@@ -1920,6 +2039,159 @@ impl Helper {
         }
     }
 
+    /// The loops a direct node needs: who connects, and their streams.
+    fn direct_tasks(&self, direct: Arc<Node>) -> Vec<tokio::task::JoinHandle<()>> {
+        let own = self.store.as_ref().map(Keystore::id).expect("unlocked");
+        vec![
+            tokio::spawn(watch_peers(direct.clone(), self.back.clone())),
+            tokio::spawn(serve_streams(
+                direct,
+                own,
+                self.blobs_dir(),
+                self.back.clone(),
+            )),
+        ]
+    }
+
+    /// A new direct key (P4): when someone stops being a friend, and every
+    /// 7 days. The new node starts in the background (`Back::DirectStarted`).
+    fn rotate_direct(&self) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        if self.hide_ip {
+            return;
+        }
+        let now = unix_now();
+        let path = self.path.with_file_name("direct-issued");
+        if let Err(e) = std::fs::write(&path, now.to_string()) {
+            eprintln!("mesh-node: couldn't keep the direct key's time: {e}");
+        }
+        let this = store.device_key().public();
+        let Some(cert) = (store.devices().devices().iter())
+            .find(|d| *d.device() == this)
+            .cloned()
+        else {
+            return;
+        };
+        let (key, direct) = DirectCert::issue(store.device_key(), now);
+        let config = Config {
+            direct: Some(direct.clone()),
+            ..net.direct_config.clone()
+        };
+        let back = self.back.clone();
+        tokio::spawn(async move {
+            match Node::start(&key, &cert, config).await {
+                // Friends are told its relay, so it needs one first.
+                Ok(node) if node.online(Duration::from_secs(10)).await => {
+                    let _ = back.send(Back::DirectStarted(Box::new((node, direct))));
+                }
+                Ok(node) => {
+                    eprintln!("mesh-node: the new direct key's node found no relay");
+                    node.close().await;
+                }
+                Err(e) => eprintln!("mesh-node: the new direct key's node didn't start: {e}"),
+            }
+        });
+    }
+
+    /// The rotated direct node is up: it replaces the old one, friends and
+    /// our devices are told, and the old one closes once they've heard.
+    fn direct_started(&mut self, node: Node, cert: DirectCert) {
+        if self.net.is_none() || self.hide_ip {
+            // Locked, or Hide my IP turned on, meanwhile.
+            tokio::spawn(async move { node.close().await });
+            return;
+        }
+        let node = Arc::new(node);
+        let tasks = self.direct_tasks(node.clone());
+        let net = self.net.as_mut().expect("checked");
+        let old = net.node.swap_direct(Some(node));
+        let old_tasks = std::mem::replace(&mut net.direct_tasks, tasks);
+        self.direct_cert = Some(cert);
+        self.tell_direct_all();
+        // Friends were just told the new key; the old one reaches nothing now.
+        tokio::spawn(async move {
+            for task in old_tasks {
+                task.abort();
+            }
+            if let Some(old) = old {
+                old.close().await;
+            }
+        });
+    }
+
+    /// Hide my IP on or off (P6). On: the direct node closes, so the key
+    /// friends hold reaches nothing, and everyone is relayed. Off: a new
+    /// direct key (rotation's path), which friends are told.
+    fn set_hide_ip(&mut self, hide: bool) {
+        if hide == self.hide_ip {
+            return;
+        }
+        self.hide_ip = hide;
+        let Some(net) = &mut self.net else { return };
+        if hide {
+            let old = net.node.swap_direct(None);
+            let tasks = std::mem::take(&mut net.direct_tasks);
+            self.direct_cert = None;
+            tokio::spawn(async move {
+                for task in tasks {
+                    task.abort();
+                }
+                if let Some(old) = old {
+                    old.close().await;
+                }
+            });
+        } else {
+            self.rotate_direct();
+        }
+        self.emit_net();
+    }
+
+    /// Tells our connected devices and friends our direct key (P3).
+    fn tell_direct_all(&self) {
+        let told: Vec<MeshId> = self
+            .store
+            .iter()
+            .flat_map(|store| {
+                std::iter::once(store.id()).chain(
+                    (store.account().entries().iter())
+                        .filter(|e| e.kind == Kind::Friend)
+                        .map(|e| e.id()),
+                )
+            })
+            .collect();
+        for id in &told {
+            self.tell_direct(id);
+        }
+    }
+
+    /// Rotates the direct key once it's 7 days old (P4).
+    fn rotate_if_old(&self) {
+        let issued = self.direct_cert.as_ref().map(DirectCert::issued_at);
+        if issued.is_some_and(|at| unix_now().saturating_sub(at) >= DIRECT_LIFE) {
+            self.rotate_direct();
+        }
+    }
+
+    /// When the direct key in use was issued (P4): kept beside the identity,
+    /// so the key stays the same across restarts. A missing or unreadable
+    /// file, or a key 7 days old, starts a new key, which is the safe side.
+    fn direct_issued(&self) -> u64 {
+        let path = self.path.with_file_name("direct-issued");
+        let kept = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|at| unix_now().saturating_sub(*at) < DIRECT_LIFE);
+        kept.unwrap_or_else(|| {
+            let now = unix_now();
+            if let Err(e) = std::fs::write(&path, now.to_string()) {
+                eprintln!("mesh-node: couldn't keep the direct key's time: {e}");
+            }
+            now
+        })
+    }
+
     /// Closes every connection (they're told it's locked) and the node.
     async fn stop_net(&mut self) {
         // Locking or quitting hangs up.
@@ -1928,12 +2200,15 @@ impl Helper {
             net.watch.abort();
             net.peers.abort();
             net.streams.abort();
+            for task in &net.direct_tasks {
+                task.abort();
+            }
             net.anon.close().await;
             net.node.close().await;
             self.held.clear();
             self.publish_retry = PUBLISH_RETRY;
             self.presence.clear();
-            emit_net(None, false, false);
+            emit_net(None, false, false, self.hide_ip);
         }
         self.e2ee = None;
         if self.dm.take().is_some() {
@@ -1974,6 +2249,31 @@ impl Helper {
             .allowed
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ids.collect();
+        let friends = self.store.iter().flat_map(|store| {
+            std::iter::once(store.id().to_bytes()).chain(
+                (store.account().entries().iter())
+                    .filter(|e| e.kind == mesh_identity::Kind::Friend)
+                    .map(|e| e.id().to_bytes()),
+            )
+        });
+        let friends: HashSet<[u8; 32]> = friends
+            .take(if self.cut_live { 1 } else { usize::MAX })
+            .collect();
+        let before = std::mem::replace(
+            &mut *self
+                .friends
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            friends.clone(),
+        );
+        // Someone stopped being a friend: they knew the direct key (P4, P5).
+        if before.iter().any(|id| !friends.contains(id)) {
+            if let Some(net) = &self.net {
+                net.node
+                    .forget_all_but(|id| friends.contains(&id.to_bytes()));
+            }
+            self.rotate_direct();
+        }
         if let Some(net) = &self.net {
             net.node.prune();
         }
@@ -2018,8 +2318,9 @@ impl Helper {
                 Some(&net.node.status()),
                 net.published.load(Ordering::Relaxed),
                 net.keys.load(Ordering::Relaxed),
+                self.hide_ip,
             ),
-            None => emit_net(None, false, false),
+            None => emit_net(None, false, false, self.hide_ip),
         }
     }
 
@@ -2198,6 +2499,9 @@ fn emit_fail(func: &str, kind: &str, message: &str) {
     );
 }
 
+/// How long a direct key lasts before it's replaced (P4).
+const DIRECT_LIFE: u64 = 7 * 86_400;
+
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -2288,6 +2592,28 @@ async fn serve_streams(
             });
             continue;
         }
+        if stream.service == crate::nodes::DIRECT {
+            tokio::spawn(async move {
+                let read = mesh_transport::frame::read_frame(&mut stream.recv);
+                let Ok(Ok(Some(frame))) = tokio::time::timeout(SYNC_TIMEOUT, read).await else {
+                    return;
+                };
+                let Some((cert, relay)) = frame.split_at_checked(DIRECT_CERT_LEN) else {
+                    return;
+                };
+                let (Ok(cert), Ok(relay)) =
+                    (DirectCert::from_bytes(cert), std::str::from_utf8(relay))
+                else {
+                    return;
+                };
+                // Only a device's own key, said by that device.
+                if cert.device().as_bytes() == stream.peer.device.as_bytes() {
+                    let told = (stream.peer.id, cert, relay.to_owned());
+                    let _ = back.send(Back::Direct(Box::new(told)));
+                }
+            });
+            continue;
+        }
         if stream.service != SYNC || stream.peer.id != own {
             let _ = stream.send.reset(0u32.into());
             continue;
@@ -2320,7 +2646,7 @@ async fn watch_peers(node: Arc<Node>, back: tokio::sync::mpsc::UnboundedSender<B
 /// Sends `meshNet` whenever the node's state changes.
 // ponytail: polls once a second; switch to iroh's watchers if idle CPU says so.
 async fn watch_net(
-    node: Arc<Node>,
+    node: crate::nodes::Nodes,
     published: Arc<AtomicBool>,
     keys: Arc<AtomicBool>,
     back: tokio::sync::mpsc::UnboundedSender<Back>,
@@ -2347,7 +2673,7 @@ async fn watch_net(
             }
         }
         if last.as_ref() != Some(&now) {
-            emit_net(Some(&now.0), now.1, now.2);
+            emit_net(Some(&now.0), now.1, now.2, node.direct().is_none());
             last = Some(now);
         }
         tokio::time::sleep(NET_POLL).await;
@@ -2356,20 +2682,46 @@ async fn watch_net(
 
 /// `meshNet`: never any IP address (SPEC-transport "Endpoint"). `keys`:
 /// our published records carry our e2ee keys (SPEC-e2ee).
-fn emit_net(status: Option<&Status>, published: bool, keys: bool) {
+/// `meshNet`. `paths` is each connected person's path, `direct` or `relay`
+/// (connection-privacy P8), and `hideIp` whether Hide my IP is on; never
+/// an address.
+fn emit_net(status: Option<&Status>, published: bool, keys: bool, hide_ip: bool) {
     let payload = match status {
         None => json!({
             "state": "off", "relay": null, "direct": false, "connections": 0, "published": false,
-            "keys": false,
+            "keys": false, "directCount": 0, "relayedCount": 0, "paths": {}, "hideIp": hide_ip,
         }),
-        Some(s) => json!({
-            "state": if s.online { "online" } else { "connecting" },
-            "relay": s.relay.as_ref().map(ToString::to_string),
-            "direct": s.direct,
-            "connections": s.connections,
-            "published": published,
-            "keys": keys,
-        }),
+        Some(s) => {
+            let path = |p: &NetPath| {
+                if *p == NetPath::Direct {
+                    "direct"
+                } else {
+                    "relay"
+                }
+            };
+            let paths: serde_json::Map<String, Value> = (s.paths.iter())
+                .filter_map(|(id, p)| {
+                    Some((MeshId::from_bytes(id).ok()?.to_string(), json!(path(p))))
+                })
+                .collect();
+            let direct = s
+                .paths
+                .iter()
+                .filter(|(_, p)| *p == NetPath::Direct)
+                .count();
+            json!({
+                "state": if s.online { "online" } else { "connecting" },
+                "relay": s.relay.as_ref().map(ToString::to_string),
+                "direct": s.direct,
+                "connections": s.connections,
+                "published": published,
+                "keys": keys,
+                "directCount": direct,
+                "relayedCount": s.paths.len() - direct,
+                "paths": paths,
+                "hideIp": hide_ip,
+            })
+        }
     };
     emit("meshNet", payload);
 }
