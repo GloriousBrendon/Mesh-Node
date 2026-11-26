@@ -35,6 +35,10 @@ const JITTER_MAX: usize = 10;
 const JITTER_HOLD: usize = 50;
 /// Loud enough to count as speaking (an RMS in `i16` units).
 const SPEAKING_RMS: f64 = 500.0;
+/// The quietest the voice gate opens for, whatever the room (about −55
+/// dBFS). It was `SPEAKING_RMS` in 0.5.0, which cut off a quiet mic's
+/// speech entirely; the room's noise floor (×3) does the real work.
+const GATE_MIN: f64 = 60.0;
 /// How long someone stays "speaking" after their last loud frame, and how
 /// long the gate stays open after ours.
 const HANGOVER: Duration = Duration::from_millis(300);
@@ -66,6 +70,8 @@ struct Shared {
     deafened: AtomicBool,
     /// Push-to-talk (C10): `PTT_OFF` (the voice gate), `PTT_UP` or `PTT_DOWN`.
     ptt: std::sync::atomic::AtomicU8,
+    /// Input volume, in percent (SPEC-audio A3): 100 leaves the mic as it is.
+    gain: std::sync::atomic::AtomicU32,
 }
 
 pub const PTT_OFF: u8 = 0;
@@ -107,6 +113,7 @@ impl Media {
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
+            gain: std::sync::atomic::AtomicU32::new(100),
         });
         let stop = Arc::new(AtomicBool::new(false));
         // A tone is a test's: noise suppression would take it out.
@@ -170,6 +177,13 @@ impl Media {
     pub fn set_ptt(&self, mode: u8) {
         self.shared.ptt.store(mode, Ordering::Relaxed);
     }
+
+    /// Input volume, 0 to 200 percent.
+    pub fn set_gain(&self, percent: u32) {
+        self.shared
+            .gain
+            .store(percent.min(MAX_GAIN), Ordering::Relaxed);
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -228,6 +242,20 @@ impl Denoise {
     }
 }
 
+/// The highest input volume, in percent.
+pub const MAX_GAIN: u32 = 200;
+
+/// `frame` at `percent` volume, clipped to `i16`.
+fn scale(frame: &mut [i16], percent: u32) {
+    if percent == 100 {
+        return;
+    }
+    for s in frame.iter_mut() {
+        let v = i32::from(*s) * percent as i32 / 100;
+        *s = v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    }
+}
+
 fn rms(frame: &[i16]) -> f64 {
     let sum: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
     (sum / frame.len().max(1) as f64).sqrt()
@@ -258,7 +286,7 @@ impl Gate {
         } else {
             self.floor * 1.002
         };
-        if level > (self.floor * 3.0).max(SPEAKING_RMS) {
+        if level > (self.floor * 3.0).max(GATE_MIN) {
             self.open_until = Some(now + HANGOVER);
         }
         self.open_until.is_some_and(|until| now < until)
@@ -299,6 +327,7 @@ async fn send(
         if let Some(d) = denoise.as_mut() {
             frame = d.frame(&frame);
         }
+        scale(&mut frame, shared.gain.load(Ordering::Relaxed));
         let now = Instant::now();
         // Push-to-talk sends while the key is held, whatever the level;
         // otherwise the gate decides.
@@ -664,5 +693,32 @@ mod tests {
         assert!(g.pass(5000.0, t));
         assert!(g.pass(50.0, t + Duration::from_millis(100)));
         assert!(!g.pass(50.0, t + Duration::from_millis(400)));
+    }
+
+    /// The 0.5.0 bug: a quiet mic in a quiet room (speech at RMS 200, about
+    /// −44 dBFS, over a floor of 30) never opened the gate. It does now,
+    /// and the room alone still doesn't.
+    #[test]
+    fn a_quiet_mic_opens_the_gate() {
+        let mut g = Gate::default();
+        let t = Instant::now();
+        for i in 0..200 {
+            assert!(
+                !g.pass(30.0, t + Duration::from_millis(20 * i)),
+                "the room alone"
+            );
+        }
+        assert!(g.pass(200.0, t + Duration::from_secs(5)), "quiet speech");
+    }
+
+    #[test]
+    fn input_volume() {
+        let mut frame = vec![1000, -1000, 30_000];
+        scale(&mut frame, 100);
+        assert_eq!(frame, [1000, -1000, 30_000]);
+        scale(&mut frame, 200);
+        assert_eq!(frame, [2000, -2000, i16::MAX], "louder, clipped");
+        scale(&mut frame, 0);
+        assert_eq!(frame, [0, 0, 0]);
     }
 }
