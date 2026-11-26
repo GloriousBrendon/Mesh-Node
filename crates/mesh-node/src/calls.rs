@@ -136,6 +136,9 @@ pub struct Calls {
     ptt: u8,
     /// Input volume in percent, once the app set one; `None` is 100.
     gain: Option<u32>,
+    /// The switches and sensitivity (SPEC-audio A3).
+    #[cfg(feature = "audio")]
+    audio: crate::media::Audio,
     /// Who's speaking in the current call, by device.
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
@@ -233,6 +236,31 @@ impl Helper {
             // Push-to-talk (C10): `off`, `up` (on, the key released) or `down`.
             // Input volume, 0 to 200 percent (SPEC-audio A3), now and for
             // the calls after.
+            // The switches and sensitivity, as JSON: any of `echo`, `noise`,
+            // `gain` (true/false) and `threshold` (a dBFS number, or null for
+            // Automatic); what's left out stays as it was.
+            "callAudio" => {
+                let v: serde_json::Value = serde_json::from_str(arg(0)?)
+                    .map_err(|_| Fail("bad-args", "callAudio takes a JSON object".into()))?;
+                #[cfg(feature = "audio")]
+                {
+                    let a = &mut self.calls.audio;
+                    let flag = |k: &str, was: bool| v[k].as_bool().unwrap_or(was);
+                    (a.echo, a.noise, a.gain) = (
+                        flag("echo", a.echo),
+                        flag("noise", a.noise),
+                        flag("gain", a.gain),
+                    );
+                    if let Some(t) = v.get("threshold") {
+                        a.threshold = t.as_f64().map(|db| db.clamp(-90.0, 0.0) as f32);
+                    }
+                    let audio = *a;
+                    if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
+                        m.set_audio(audio);
+                    }
+                }
+                let _ = v;
+            }
             "callGain" => {
                 let percent: u32 = (arg(0)?.parse())
                     .map_err(|_| Fail("bad-args", "a percentage, 0 to 200".into()))?;
@@ -440,6 +468,7 @@ impl Helper {
             media.set_deafened(self.calls.deafened);
             media.set_ptt(self.calls.ptt);
             media.set_gain(self.calls.gain.unwrap_or(100));
+            media.set_audio(self.calls.audio);
             call.media = Some(media);
         }
         Ok(())

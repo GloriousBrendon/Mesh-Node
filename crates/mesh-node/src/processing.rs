@@ -4,7 +4,7 @@
 //! 20 ms at 48 kHz; sonora works on 10 ms, so each frame is two halves.
 
 use crate::audio::{FRAME_SAMPLES, SAMPLE_RATE};
-use sonora::config::{EchoCanceller, HighPassFilter};
+use sonora::config::{AdaptiveDigital, EchoCanceller, GainController2, HighPassFilter};
 use sonora::{AudioProcessing, Config, StreamConfig};
 
 /// sonora's frame: 10 ms.
@@ -45,6 +45,49 @@ impl Processing {
     pub fn capture(&mut self, frame: &mut [i16], delay_ms: i32) {
         for half in frame.as_chunks_mut::<HALF>().0 {
             let _ = self.apm.set_stream_delay_ms(delay_ms.clamp(0, 500));
+            if self
+                .apm
+                .process_capture_i16(half, &mut self.scratch)
+                .is_ok()
+            {
+                half.copy_from_slice(&self.scratch);
+            }
+        }
+    }
+}
+
+/// Automatic gain (AGC2's adaptive digital gain and limiter, SPEC-audio
+/// A1): its own sonora instance, so noise suppression sits between it and
+/// the echo canceller, as WebRTC orders them.
+pub struct Gain {
+    apm: AudioProcessing,
+    scratch: [i16; HALF],
+}
+
+impl Gain {
+    pub fn new() -> Self {
+        let config = Config {
+            gain_controller2: Some(GainController2 {
+                input_volume_controller: false,
+                adaptive_digital: Some(AdaptiveDigital::default()),
+                fixed_digital: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let stream = StreamConfig::new(SAMPLE_RATE, 1);
+        Self {
+            apm: AudioProcessing::builder()
+                .config(config)
+                .capture_config(stream)
+                .render_config(stream)
+                .build(),
+            scratch: [0; HALF],
+        }
+    }
+
+    /// A mic frame, brought towards a normal speaking level, in place.
+    pub fn process(&mut self, frame: &mut [i16]) {
+        for half in frame.as_chunks_mut::<HALF>().0 {
             if self
                 .apm
                 .process_capture_i16(half, &mut self.scratch)
@@ -120,6 +163,29 @@ pub(crate) mod tests {
         // A delay estimate 40 ms out still cancels most of it.
         let off = echo_cut(40, 80);
         assert!(off >= 15.0, "cut by {off:.1} dB with the delay 40 ms off");
+    }
+
+    fn dbfs(x: &[i16]) -> f64 {
+        10.0 * (energy(x) / (32768.0f64 * 32768.0)).log10()
+    }
+
+    /// PLAN-audio Task 3: a quiet voice (the clip, -50 dBFS) comes out
+    /// within 10 dB of -20 dBFS once the gain has settled (after 5 s).
+    #[test]
+    fn a_quiet_voice_is_brought_up() {
+        let voice = quiet_voice();
+        let mut g = Gain::new();
+        let mut out = voice.clone();
+        for frame in out.as_chunks_mut::<FRAME_SAMPLES>().0 {
+            g.process(frame);
+        }
+        let settled = SAMPLE_RATE as usize * 5;
+        let (before, after) = (dbfs(&voice[settled..]), dbfs(&out[settled..]));
+        eprintln!("gain: {before:.1} dBFS in, {after:.1} dBFS out");
+        assert!(
+            (after + 20.0).abs() <= 10.0,
+            "{before:.1} dBFS in, {after:.1} out"
+        );
     }
 
     #[test]

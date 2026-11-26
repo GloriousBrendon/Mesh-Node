@@ -72,6 +72,29 @@ struct Shared {
     ptt: std::sync::atomic::AtomicU8,
     /// Input volume, in percent (SPEC-audio A3): 100 leaves the mic as it is.
     gain: std::sync::atomic::AtomicU32,
+    /// The switches and sensitivity (SPEC-audio A3), changed live.
+    audio: Mutex<Audio>,
+}
+
+/// What the mic goes through, as the person set it (SPEC-audio A3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Audio {
+    pub echo: bool,
+    pub noise: bool,
+    pub gain: bool,
+    /// A manual gate threshold in dBFS; `None` is Automatic (A4).
+    pub threshold: Option<f32>,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self {
+            echo: true,
+            noise: true,
+            gain: true,
+            threshold: None,
+        }
+    }
 }
 
 pub const PTT_OFF: u8 = 0;
@@ -114,6 +137,7 @@ impl Media {
             deafened: AtomicBool::new(false),
             ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
             gain: std::sync::atomic::AtomicU32::new(100),
+            audio: Mutex::new(Audio::default()),
         });
         let stop = Arc::new(AtomicBool::new(false));
         // A tone is a test's: noise suppression would take it out.
@@ -186,6 +210,11 @@ impl Media {
 
     pub fn set_ptt(&self, mode: u8) {
         self.shared.ptt.store(mode, Ordering::Relaxed);
+    }
+
+    /// The switches and sensitivity, from the next frame on.
+    pub fn set_audio(&self, audio: Audio) {
+        *lock(&self.shared.audio) = audio;
     }
 
     /// Input volume, 0 to 200 percent.
@@ -294,14 +323,20 @@ impl Default for Gate {
 }
 
 impl Gate {
-    fn pass(&mut self, level: f64, now: Instant) -> bool {
+    /// Whether a frame at `level` goes out: above the room's noise
+    /// (Automatic), or above `threshold` dBFS (manual, A4).
+    fn pass(&mut self, level: f64, now: Instant, threshold: Option<f32>) -> bool {
         // The floor follows quiet at once and noise slowly.
         self.floor = if level < self.floor {
             level.max(20.0)
         } else {
             self.floor * 1.002
         };
-        if level > (self.floor * 3.0).max(GATE_MIN) {
+        let at = match threshold {
+            Some(db) => 32768.0 * 10f64.powf(f64::from(db) / 20.0),
+            None => (self.floor * 3.0).max(GATE_MIN),
+        };
+        if level > at {
             self.open_until = Some(now + HANGOVER);
         }
         self.open_until.is_some_and(|until| now < until)
@@ -337,6 +372,7 @@ async fn send(
 ) {
     let mut gate = Gate::default();
     let mut processing = crate::processing::Processing::new();
+    let mut agc = crate::processing::Gain::new();
     let mut delay = DEVICE_DELAY_MS;
     let mut seq: u32 = 0;
     let mut out = vec![0u8; 1500];
@@ -347,9 +383,16 @@ async fn send(
             processing.render(&far);
             delay = at;
         }
-        processing.capture(&mut frame, delay);
-        if let Some(d) = denoise.as_mut() {
+        // SPEC-audio A1's order: echo and high-pass, noise, gain, volume.
+        let audio = *lock(&shared.audio);
+        if audio.echo {
+            processing.capture(&mut frame, delay);
+        }
+        if let Some(d) = denoise.as_mut().filter(|_| audio.noise) {
             frame = d.frame(&frame);
+        }
+        if audio.gain {
+            agc.process(&mut frame);
         }
         scale(&mut frame, shared.gain.load(Ordering::Relaxed));
         let now = Instant::now();
@@ -358,7 +401,7 @@ async fn send(
         let open = match shared.ptt.load(Ordering::Relaxed) {
             PTT_DOWN => true,
             PTT_UP => false,
-            _ => gate.pass(rms(&frame), now),
+            _ => gate.pass(rms(&frame), now, audio.threshold),
         };
         if shared.muted.load(Ordering::Relaxed) || !open {
             continue;
@@ -719,10 +762,10 @@ mod tests {
     fn the_gate() {
         let mut g = Gate::default();
         let t = Instant::now();
-        assert!(!g.pass(50.0, t));
-        assert!(g.pass(5000.0, t));
-        assert!(g.pass(50.0, t + Duration::from_millis(100)));
-        assert!(!g.pass(50.0, t + Duration::from_millis(400)));
+        assert!(!g.pass(50.0, t, None));
+        assert!(g.pass(5000.0, t, None));
+        assert!(g.pass(50.0, t + Duration::from_millis(100), None));
+        assert!(!g.pass(50.0, t + Duration::from_millis(400), None));
     }
 
     /// The 0.5.0 bug: a quiet mic in a quiet room (speech at RMS 200, about
@@ -734,11 +777,28 @@ mod tests {
         let t = Instant::now();
         for i in 0..200 {
             assert!(
-                !g.pass(30.0, t + Duration::from_millis(20 * i)),
+                !g.pass(30.0, t + Duration::from_millis(20 * i), None),
                 "the room alone"
             );
         }
-        assert!(g.pass(200.0, t + Duration::from_secs(5)), "quiet speech");
+        assert!(
+            g.pass(200.0, t + Duration::from_secs(5), None),
+            "quiet speech"
+        );
+    }
+
+    /// A manual threshold (SPEC-audio A4): only what's above it goes out,
+    /// whatever the room.
+    #[test]
+    fn a_manual_threshold_holds() {
+        let mut g = Gate::default();
+        let t = Instant::now();
+        // -30 dBFS is RMS 1036: a voice at RMS 700 stays out, 2000 goes.
+        assert!(!g.pass(700.0, t, Some(-30.0)));
+        assert!(g.pass(2000.0, t, Some(-30.0)));
+        // Automatic would have let the 700 through over a quiet room.
+        let mut auto = Gate::default();
+        assert!(auto.pass(700.0, t, None));
     }
 
     #[test]
