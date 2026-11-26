@@ -77,10 +77,10 @@ pub fn load(path: &str) -> Result<Module, String> {
             .map_err(|e| format!("load {}: {e}", lib_path.display()))?;
             let handle = l.into_raw();
             let l = libloading::os::unix::Library::from_raw(handle);
-            if let Ok(entry) = l.get::<unsafe extern "C" fn(*mut c_void) -> bool>(b"ModuleEntry") {
-                if !entry(handle) {
-                    return Err("ModuleEntry failed".into());
-                }
+            if let Ok(entry) = l.get::<unsafe extern "C" fn(*mut c_void) -> bool>(b"ModuleEntry")
+                && !entry(handle)
+            {
+                return Err("ModuleEntry failed".into());
             }
             l.into()
         };
@@ -463,7 +463,7 @@ impl Instance {
         let mut out_data: Vec<Vec<Vec<f32>>> =
             outs.iter().map(|&n| vec![vec![0f32; BLOCK]; n]).collect();
         let (mut out, mut times) = (Vec::with_capacity(input.len()), Vec::new());
-        for block in input.chunks_exact(BLOCK) {
+        for block in input.as_chunks::<BLOCK>().0 {
             if let Some(main) = in_data.first_mut() {
                 for ch in main.iter_mut() {
                     ch.copy_from_slice(block);

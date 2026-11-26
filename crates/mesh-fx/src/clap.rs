@@ -155,7 +155,7 @@ impl Instance {
         let events_in = EventBuffer::new();
         let mut events_out = EventBuffer::new();
         let (mut out, mut times) = (Vec::with_capacity(input.len()), Vec::new());
-        for (k, block) in input.chunks_exact(BLOCK).enumerate() {
+        for (k, block) in input.as_chunks::<BLOCK>().0.iter().enumerate() {
             for ch in &mut in_bufs {
                 ch.copy_from_slice(block);
             }
@@ -214,14 +214,13 @@ impl Instance {
             is_floating: false,
         };
         let h = self.instance.plugin_handle();
-        let how;
         #[cfg(target_os = "linux")]
         let mut parent = None;
-        if gui.is_api_supported(&h, floating) {
+        let how = if gui.is_api_supported(&h, floating) {
             gui.create(&h, floating)
                 .map_err(|e| format!("create floating: {e:?}"))?;
             gui.suggest_title(&h, c"Aflos plugin");
-            how = "floating";
+            "floating"
         } else if gui.is_api_supported(&h, embedded) {
             gui.create(&h, embedded)
                 .map_err(|e| format!("create embedded: {e:?}"))?;
@@ -239,10 +238,10 @@ impl Instance {
             }
             #[cfg(not(target_os = "linux"))]
             return Err("embedding only on Linux in the spike".into());
-            how = "embedded";
+            "embedded"
         } else {
             return Err("no supported editor API".into());
-        }
+        };
         gui.show(&h).map_err(|e| format!("show: {e:?}"))?;
         let size = gui.get_size(&h);
         let timer_ext = h.get_extension::<PluginTimer>();
