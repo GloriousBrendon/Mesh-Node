@@ -4,8 +4,11 @@
 //! mesh-fx list <file>                 the plugins in a .clap or .vst3
 //! mesh-fx gain <file> <id>            1 s of 440 Hz at -20 dBFS through it: dB change, block times
 //! mesh-fx edit <file> <id> [secs]     opens its editor for secs (default 10)
+//! mesh-fx serve                       mesh-node's end: messages on stdin/stdout (proto.rs)
 
 mod clap;
+mod proto;
+mod serve;
 mod vst3host;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -34,10 +37,8 @@ fn rms(s: &[f32]) -> f32 {
 
 fn run(args: &[String]) -> Result<(), String> {
     let arg = |i: usize| args.get(i).map(String::as_str).ok_or("missing argument");
-    match args.first().map(String::as_str) {
-        Some("pipe-echo") => return pipe_echo(),
-        Some("pipe-bench") => return pipe_bench(),
-        _ => {}
+    if args.first().map(String::as_str) == Some("serve") {
+        return serve_stdio();
     }
     let file = arg(1)?;
     let vst3 = file.trim_end_matches('/').ends_with(".vst3");
@@ -104,50 +105,16 @@ fn level() -> f32 {
         .unwrap_or(0.1)
 }
 
-/// One 20 ms frame of i16 over the pipe (the planned audio message's size).
-const FRAME_BYTES: usize = BLOCK * 2;
-
-/// Spike: sends back every frame it reads.
-fn pipe_echo() -> Result<(), String> {
-    use std::io::{Read, Write};
-    let (mut i, mut o) = (std::io::stdin().lock(), std::io::stdout().lock());
-    let mut buf = [0u8; FRAME_BYTES];
-    while i.read_exact(&mut buf).is_ok() {
-        o.write_all(&buf)
-            .and_then(|()| o.flush())
-            .map_err(|e| e.to_string())?;
+/// `serve` on stdin and the protocol's stdout; malformed input exits 2.
+fn serve_stdio() -> Result<(), String> {
+    #[cfg(unix)]
+    let out = serve::protocol_out().map_err(|e| e.to_string())?;
+    // ponytail: on Windows a plugin printing to stdout would corrupt the protocol; redirect it there too (Task 11).
+    #[cfg(not(unix))]
+    let out = std::io::stdout().lock();
+    if let Err(e) = serve::serve(std::io::stdin().lock(), std::io::BufWriter::new(out)) {
+        eprintln!("mesh-fx: {e}");
+        std::process::exit(2);
     }
-    Ok(())
-}
-
-/// Spike: 1,000 frame round trips through a child `pipe-echo`.
-fn pipe_bench() -> Result<(), String> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut child = Command::new(me)
-        .arg("pipe-echo")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let (mut to, mut from) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-    let frame = [7u8; FRAME_BYTES];
-    let mut back = [0u8; FRAME_BYTES];
-    let mut times = Vec::with_capacity(1000);
-    for _ in 0..1000 {
-        let t = std::time::Instant::now();
-        to.write_all(&frame).map_err(|e| e.to_string())?;
-        from.read_exact(&mut back).map_err(|e| e.to_string())?;
-        times.push(t.elapsed());
-        assert_eq!(back, frame);
-    }
-    drop(to);
-    let _ = child.wait();
-    times.sort();
-    println!(
-        "round trip: median {:?}, p99 {:?}, max {:?}",
-        times[500], times[990], times[999]
-    );
     Ok(())
 }

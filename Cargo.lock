@@ -2672,6 +2672,7 @@ dependencies = [
  "clack-host",
  "libc",
  "libloading",
+ "serde_json",
  "vst3",
  "x11rb",
 ]
