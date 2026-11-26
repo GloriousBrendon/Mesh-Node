@@ -687,3 +687,52 @@ fn measure_a_full_voice_channel() {
         let _ = p.h.quit();
     }
 }
+
+/// PLAN-audio Task 4: the mic test, with no call. Levels come about 15 a
+/// second and say a loud tone goes out; with `hear` it plays back (late);
+/// `off` stops both. (Played back, a steady tone looks like an echo of
+/// itself to the canceller, so the levels are counted without `hear`.)
+#[test]
+fn the_mic_test_reports_levels_and_plays_back() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a"].map(|n| temp_dir(&format!("calls-mictest-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut a = person(&dirs[1], &relay, &ticket, "ann", "440");
+    a.h.send("audioTest", &["on"]);
+    let started = Instant::now();
+    let (mut levels, mut open) = (0, 0);
+    while started.elapsed() < Duration::from_secs(3) {
+        if let Some((binding, v)) = a.h.line_within(Duration::from_millis(200))
+            && binding == "meshAudioLevel"
+        {
+            levels += 1;
+            open += usize::from(v["open"] == true);
+            assert!(v["level"].as_f64().unwrap() < 0.0, "{v}");
+        }
+    }
+    assert!((35..=60).contains(&levels), "{levels} levels in 3 s");
+    assert!(open * 10 >= levels * 9, "{open} of {levels} said open");
+    assert_eq!(
+        std::fs::metadata(&a.heard).map_or(0, |m| m.len()),
+        0,
+        "played without hear"
+    );
+    // With hear: played back, half a second late.
+    a.h.send("audioTest", &["on", "hear"]);
+    std::thread::sleep(Duration::from_secs(2));
+    let played = std::fs::metadata(&a.heard).map_or(0, |m| m.len());
+    assert!(played > 96_000, "played back {played} bytes");
+    // off: no more levels.
+    a.h.send("audioTest", &["off"]);
+    std::thread::sleep(Duration::from_millis(300));
+    while a.h.line_within(Duration::from_millis(50)).is_some() {}
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(1) {
+        if let Some((binding, _)) = a.h.line_within(Duration::from_millis(200)) {
+            assert_ne!(binding, "meshAudioLevel", "levels after off");
+        }
+    }
+    let _ = a.h.quit();
+    seed.stop();
+}

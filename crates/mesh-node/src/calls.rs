@@ -139,6 +139,9 @@ pub struct Calls {
     /// The switches and sensitivity (SPEC-audio A3).
     #[cfg(feature = "audio")]
     audio: crate::media::Audio,
+    /// The mic test while it runs (SPEC-audio A5).
+    #[cfg(feature = "audio")]
+    test: Option<crate::media::Media>,
     /// Who's speaking in the current call, by device.
     speaking: Vec<[u8; 32]>,
     last_keep: Option<Instant>,
@@ -260,6 +263,29 @@ impl Helper {
                     }
                 }
                 let _ = v;
+            }
+            // The mic test (A5): `on` or `off`, and with `on`, `hear` to
+            // play it back. A call stops it.
+            "audioTest" => {
+                #[cfg(feature = "audio")]
+                {
+                    self.calls.test = None;
+                    if arg(0)? == "on" {
+                        let hear = args.get(1).is_some_and(|a| a == "hear");
+                        let test = crate::media::Media::test(&self.calls.io, hear, emit_level)
+                            .map_err(|e| {
+                                Fail("unavailable", format!("couldn't open the mic: {e}"))
+                            })?;
+                        test.set_gain(self.calls.gain.unwrap_or(100));
+                        test.set_audio(self.calls.audio);
+                        self.calls.test = Some(test);
+                    }
+                }
+                #[cfg(not(feature = "audio"))]
+                return Err(Fail(
+                    "unavailable",
+                    "this Mesh was built without calls".into(),
+                ));
             }
             "callGain" => {
                 let percent: u32 = (arg(0)?.parse())
@@ -449,6 +475,8 @@ impl Helper {
     fn call_media(&mut self) -> Result<(), Fail> {
         #[cfg(feature = "audio")]
         {
+            // One user of the mic at a time: a call ends the mic test.
+            self.calls.test = None;
             let (Some(net), Some(store)) = (&self.net, &self.store) else {
                 return Err(Fail("unavailable", "not connected".into()));
             };
@@ -458,11 +486,17 @@ impl Helper {
             };
             let back = self.back.clone();
             let me = store.device_key().public().to_bytes();
-            let media =
-                crate::media::Media::start(nodes, call.id, me, &self.calls.io, move |who| {
+            let media = crate::media::Media::start(
+                nodes,
+                call.id,
+                me,
+                &self.calls.io,
+                move |who| {
                     let _ = back.send(Back::Speaking(who));
-                })
-                .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
+                },
+                emit_level,
+            )
+            .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
             media.set_peers(call.devices.iter().copied());
             media.set_muted(self.calls.muted);
             media.set_deafened(self.calls.deafened);
@@ -1038,6 +1072,14 @@ pub async fn serve(
         let _ = mesh_transport::frame::write_frame(&mut stream.send, &[1]).await;
         let _ = stream.send.finish();
     }
+}
+
+/// `meshAudioLevel`: the mic's level after the chain (dBFS) and whether
+/// it goes out, about 15 times a second in a call or the mic test.
+#[cfg(feature = "audio")]
+fn emit_level(level: f32, open: bool) {
+    let level = (f64::from(level) * 10.0).round() / 10.0;
+    emit("meshAudioLevel", json!({ "level": level, "open": open }));
 }
 
 #[cfg(test)]

@@ -74,7 +74,52 @@ struct Shared {
     gain: std::sync::atomic::AtomicU32,
     /// The switches and sensitivity (SPEC-audio A3), changed live.
     audio: Mutex<Audio>,
+    /// Told the mic's level (dBFS) and whether it goes out (A5).
+    level: Box<dyn Fn(f32, bool) + Send + Sync>,
 }
+
+impl Shared {
+    fn new(call: [u8; 8], level: impl Fn(f32, bool) + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            call,
+            peers: Mutex::new(HashSet::new()),
+            muted: AtomicBool::new(false),
+            deafened: AtomicBool::new(false),
+            ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
+            gain: std::sync::atomic::AtomicU32::new(100),
+            audio: Mutex::new(Audio::default()),
+            level: Box::new(level),
+        })
+    }
+}
+
+/// The mic, or a test's tone (which noise suppression would take out).
+fn mic(
+    io: &Io,
+    stop: &Arc<AtomicBool>,
+) -> Result<(Frames, Option<audio::CaptureHandle>, Option<Denoise>), String> {
+    Ok(match io.tone {
+        Some(hz) => (tone(hz, stop.clone()), None, None),
+        None => {
+            let (handle, rx) = audio::start_capture(io.input.clone())?;
+            (rx, Some(handle), Some(Denoise::new()))
+        }
+    })
+}
+
+/// The speakers, or a test's file.
+fn speakers(io: &Io) -> Result<(Sink, Option<audio::PlaybackHandle>), String> {
+    Ok(match &io.heard {
+        Some(path) => (Sink::File(path.clone()), None),
+        None => {
+            let (handle, buffer) = audio::start_playback(io.output.clone())?;
+            (Sink::Device(buffer), Some(handle))
+        }
+    })
+}
+
+/// Frames the mic test plays back late (0.5 s).
+const TEST_LATE: usize = 25;
 
 /// What the mic goes through, as the person set it (SPEC-audio A3).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -129,32 +174,12 @@ impl Media {
         me: [u8; 32],
         io: &Io,
         speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
+        level: impl Fn(f32, bool) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Arc::new(Shared {
-            call,
-            peers: Mutex::new(HashSet::new()),
-            muted: AtomicBool::new(false),
-            deafened: AtomicBool::new(false),
-            ptt: std::sync::atomic::AtomicU8::new(PTT_OFF),
-            gain: std::sync::atomic::AtomicU32::new(100),
-            audio: Mutex::new(Audio::default()),
-        });
+        let shared = Shared::new(call, level);
         let stop = Arc::new(AtomicBool::new(false));
-        // A tone is a test's: noise suppression would take it out.
-        let (frames, capture, denoise) = match io.tone {
-            Some(hz) => (tone(hz, stop.clone()), None, None),
-            None => {
-                let (handle, rx) = audio::start_capture(io.input.clone())?;
-                (rx, Some(handle), Some(Denoise::new()))
-            }
-        };
-        let (sink, playback) = match &io.heard {
-            Some(path) => (Sink::File(path.clone()), None),
-            None => {
-                let (handle, buffer) = audio::start_playback(io.output.clone())?;
-                (Sink::Device(buffer), Some(handle))
-            }
-        };
+        let (frames, capture, denoise) = mic(io, &stop)?;
+        let (sink, playback) = speakers(io)?;
         let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)
             .map_err(|e| format!("opus: {e}"))?;
         encoder
@@ -169,8 +194,8 @@ impl Media {
             tokio::spawn(send(
                 node.clone(),
                 shared.clone(),
-                (frames, denoise),
-                played_rx,
+                frames,
+                Chain::new(denoise, played_rx),
                 encoder,
                 me,
                 us.clone(),
@@ -186,6 +211,36 @@ impl Media {
                 speaking,
             )),
         ];
+        Ok(Self {
+            shared,
+            tasks,
+            stop,
+            _capture: capture,
+            _playback: playback,
+        })
+    }
+
+    /// The mic test (SPEC-audio A5): the mic through the whole chain, its
+    /// level reported, sent nowhere; with `hear`, played back half a second
+    /// late. Stops when dropped.
+    pub fn test(
+        io: &Io,
+        hear: bool,
+        level: impl Fn(f32, bool) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let shared = Shared::new([0; 8], level);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (frames, capture, denoise) = mic(io, &stop)?;
+        let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sink, playback) = match hear {
+            true => {
+                let (sink, handle) = speakers(io)?;
+                (Some((sink, played_tx)), handle)
+            }
+            false => (None, None),
+        };
+        let chain = Chain::new(denoise, played_rx);
+        let tasks = vec![tokio::spawn(test(shared.clone(), frames, chain, sink))];
         Ok(Self {
             shared,
             tasks,
@@ -361,48 +416,83 @@ impl Speakers {
 }
 
 /// Our frames: gated, encoded, and sent to every peer device.
+/// The mic's way to the encoder (SPEC-audio A1), the same in a call and
+/// in the mic test: echo and high-pass, noise, gain, volume, the gate; and
+/// the level, reported about 15 times a second.
+struct Chain {
+    gate: Gate,
+    processing: crate::processing::Processing,
+    agc: crate::processing::Gain,
+    denoise: Option<Denoise>,
+    played: Played,
+    delay: i32,
+    frames: u32,
+}
+
+impl Chain {
+    fn new(denoise: Option<Denoise>, played: Played) -> Self {
+        Self {
+            gate: Gate::default(),
+            processing: crate::processing::Processing::new(),
+            agc: crate::processing::Gain::new(),
+            denoise,
+            played,
+            delay: DEVICE_DELAY_MS,
+            frames: 0,
+        }
+    }
+
+    /// Processes `frame` in place; whether it goes out.
+    fn step(&mut self, frame: &mut Vec<i16>, shared: &Shared, now: Instant) -> bool {
+        // What was played since, first, so the canceller knows the far end.
+        while let Ok((far, at)) = self.played.try_recv() {
+            self.processing.render(&far);
+            self.delay = at;
+        }
+        let audio = *lock(&shared.audio);
+        if audio.echo {
+            self.processing.capture(frame, self.delay);
+        }
+        if let Some(d) = self.denoise.as_mut().filter(|_| audio.noise) {
+            *frame = d.frame(frame);
+        }
+        if audio.gain {
+            self.agc.process(frame);
+        }
+        scale(frame, shared.gain.load(Ordering::Relaxed));
+        // Push-to-talk sends while the key is held, whatever the level;
+        // otherwise the gate decides.
+        let level = rms(frame);
+        let open = match shared.ptt.load(Ordering::Relaxed) {
+            PTT_DOWN => true,
+            PTT_UP => false,
+            _ => self.gate.pass(level, now, audio.threshold),
+        };
+        self.frames = self.frames.wrapping_add(1);
+        if self.frames.is_multiple_of(3) {
+            let db = 20.0 * (level.max(1.0) / 32768.0).log10();
+            (shared.level)(db as f32, open && !shared.muted.load(Ordering::Relaxed));
+        }
+        open
+    }
+}
+
+/// Our frames: processed, gated, encoded, and sent to every peer device.
 async fn send(
     node: crate::nodes::Nodes,
     shared: Arc<Shared>,
-    (mut frames, mut denoise): (Frames, Option<Denoise>),
-    mut played: Played,
+    mut frames: Frames,
+    mut chain: Chain,
     mut encoder: Encoder,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
 ) {
-    let mut gate = Gate::default();
-    let mut processing = crate::processing::Processing::new();
-    let mut agc = crate::processing::Gain::new();
-    let mut delay = DEVICE_DELAY_MS;
     let mut seq: u32 = 0;
     let mut out = vec![0u8; 1500];
     while let Some(mut frame) = frames.recv().await {
         seq = seq.wrapping_add(1);
-        // What was played since, first, so the canceller knows the far end.
-        while let Ok((far, at)) = played.try_recv() {
-            processing.render(&far);
-            delay = at;
-        }
-        // SPEC-audio A1's order: echo and high-pass, noise, gain, volume.
-        let audio = *lock(&shared.audio);
-        if audio.echo {
-            processing.capture(&mut frame, delay);
-        }
-        if let Some(d) = denoise.as_mut().filter(|_| audio.noise) {
-            frame = d.frame(&frame);
-        }
-        if audio.gain {
-            agc.process(&mut frame);
-        }
-        scale(&mut frame, shared.gain.load(Ordering::Relaxed));
         let now = Instant::now();
-        // Push-to-talk sends while the key is held, whatever the level;
-        // otherwise the gate decides.
-        let open = match shared.ptt.load(Ordering::Relaxed) {
-            PTT_DOWN => true,
-            PTT_UP => false,
-            _ => gate.pass(rms(&frame), now, audio.threshold),
-        };
+        let open = chain.step(&mut frame, &shared, now);
         if shared.muted.load(Ordering::Relaxed) || !open {
             continue;
         }
@@ -420,6 +510,29 @@ async fn send(
             if let Some(addr) = mesh_transport::MeshAddr::from_device(&device) {
                 node.send_datagram(&addr.device, datagram.clone());
             }
+        }
+    }
+}
+
+/// The mic test (SPEC-audio A5): the chain with nobody to send to; what it
+/// lets out plays back half a second late if `hear`.
+async fn test(
+    shared: Arc<Shared>,
+    mut frames: Frames,
+    mut chain: Chain,
+    sink: Option<(Sink, tokio::sync::mpsc::UnboundedSender<(Vec<i16>, i32)>)>,
+) {
+    let mut late: std::collections::VecDeque<Vec<i16>> = std::collections::VecDeque::new();
+    while let Some(mut frame) = frames.recv().await {
+        let open = chain.step(&mut frame, &shared, Instant::now());
+        let Some((sink, played)) = &sink else {
+            continue;
+        };
+        late.push_back(if open { frame } else { vec![0; FRAME_SAMPLES] });
+        if late.len() > TEST_LATE {
+            let frame = late.pop_front().expect("over the limit");
+            let delay = sink.play(&frame);
+            let _ = played.send((frame, delay));
         }
     }
 }

@@ -949,7 +949,9 @@ impl Helper {
             "deviceRemove" => self.remove_device(arg(0)?)?,
             "linkStart" => self.link_start()?,
             f if f.starts_with("dm") => self.dm_command(f, args)?,
-            f if f.starts_with("call") || f.starts_with("voice") => self.call_command(f, args)?,
+            f if f.starts_with("call") || f.starts_with("voice") || f == "audioTest" => {
+                self.call_command(f, args)?
+            }
             f if f.starts_with("space") => self.space_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
             "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
