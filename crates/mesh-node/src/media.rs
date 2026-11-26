@@ -139,18 +139,28 @@ impl Media {
             .and_then(|()| encoder.set_packet_loss_perc(10))
             .map_err(|e| format!("opus: {e}"))?;
         let us = Arc::new(Mutex::new(Speakers::default()));
+        let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
         let jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>> = Arc::default();
         let tasks = vec![
             tokio::spawn(send(
                 node.clone(),
                 shared.clone(),
                 (frames, denoise),
+                played_rx,
                 encoder,
                 me,
                 us.clone(),
             )),
             tokio::spawn(receive(node, shared.clone(), jitter.clone(), io.drop)),
-            tokio::spawn(mix(shared.clone(), jitter, sink, me, us, speaking)),
+            tokio::spawn(mix(
+                shared.clone(),
+                jitter,
+                sink,
+                played_tx,
+                me,
+                us,
+                speaking,
+            )),
         ];
         Ok(Self {
             shared,
@@ -215,6 +225,11 @@ fn tone(hz: f32, stop: Arc<AtomicBool>) -> tokio::sync::mpsc::UnboundedReceiver<
 
 /// Our microphone's 20 ms frames.
 type Frames = tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>;
+/// What the mix played, with how long it'll take to reach the speakers
+/// (ms): the echo canceller's far end (SPEC-audio A1).
+type Played = tokio::sync::mpsc::UnboundedReceiver<(Vec<i16>, i32)>;
+/// A device's own delay past our queue, about (ms).
+const DEVICE_DELAY_MS: i32 = 20;
 
 /// Noise suppression on our microphone (Q2): RNNoise, on each 20 ms frame's
 /// two 10 ms halves. Its first output is silent (its own delay).
@@ -315,15 +330,24 @@ async fn send(
     node: crate::nodes::Nodes,
     shared: Arc<Shared>,
     (mut frames, mut denoise): (Frames, Option<Denoise>),
+    mut played: Played,
     mut encoder: Encoder,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
 ) {
     let mut gate = Gate::default();
+    let mut processing = crate::processing::Processing::new();
+    let mut delay = DEVICE_DELAY_MS;
     let mut seq: u32 = 0;
     let mut out = vec![0u8; 1500];
     while let Some(mut frame) = frames.recv().await {
         seq = seq.wrapping_add(1);
+        // What was played since, first, so the canceller knows the far end.
+        while let Ok((far, at)) = played.try_recv() {
+            processing.render(&far);
+            delay = at;
+        }
+        processing.capture(&mut frame, delay);
         if let Some(d) = denoise.as_mut() {
             frame = d.frame(&frame);
         }
@@ -408,13 +432,15 @@ enum Sink {
 }
 
 impl Sink {
-    fn play(&self, frame: &[i16]) {
+    /// Plays `frame`; how long until its end is heard, in ms.
+    fn play(&self, frame: &[i16]) -> i32 {
         match self {
             Sink::Device(buffer) => {
                 let mut b = lock(buffer);
                 b.extend(frame.iter().copied());
                 let over = b.len().saturating_sub(PLAYBACK_MAX);
                 b.drain(..over);
+                (b.len() * 1000 / SAMPLE_RATE as usize) as i32 + DEVICE_DELAY_MS
             }
             Sink::File(path) => {
                 let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -425,6 +451,7 @@ impl Sink {
                 if let Err(e) = file.and_then(|mut f| f.write_all(&bytes)) {
                     eprintln!("mesh-node: couldn't write what was heard: {e}");
                 }
+                0
             }
         }
     }
@@ -436,6 +463,7 @@ async fn mix(
     shared: Arc<Shared>,
     jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>>,
     sink: Sink,
+    played: tokio::sync::mpsc::UnboundedSender<(Vec<i16>, i32)>,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
     speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
@@ -471,7 +499,9 @@ async fn mix(
         if frames.is_empty() || shared.deafened.load(Ordering::Relaxed) {
             continue;
         }
-        sink.play(&mixed(frames.iter().map(|(_, f)| f.as_slice())));
+        let out = mixed(frames.iter().map(|(_, f)| f.as_slice()));
+        let delay = sink.play(&out);
+        let _ = played.send((out, delay));
     }
 }
 

@@ -44,6 +44,8 @@ mod mailstore;
 #[cfg(feature = "audio")]
 mod media;
 mod nodes;
+#[cfg(feature = "audio")]
+mod processing;
 mod routing;
 mod saved;
 mod seed;
