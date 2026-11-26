@@ -76,6 +76,8 @@ struct Shared {
     audio: Mutex<Audio>,
     /// Told the mic's level (dBFS) and whether it goes out (A5).
     level: Box<dyn Fn(f32, bool) + Send + Sync>,
+    /// Each peer device's volume, in percent, where it isn't 100 (A6).
+    volumes: Mutex<HashMap<[u8; 32], u32>>,
 }
 
 impl Shared {
@@ -89,6 +91,7 @@ impl Shared {
             gain: std::sync::atomic::AtomicU32::new(100),
             audio: Mutex::new(Audio::default()),
             level: Box::new(level),
+            volumes: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -129,6 +132,8 @@ pub struct Audio {
     pub gain: bool,
     /// A manual gate threshold in dBFS; `None` is Automatic (A4).
     pub threshold: Option<f32>,
+    /// What we hear, in percent (A3).
+    pub output: u32,
 }
 
 impl Default for Audio {
@@ -138,6 +143,7 @@ impl Default for Audio {
             noise: true,
             gain: true,
             threshold: None,
+            output: 100,
         }
     }
 }
@@ -267,6 +273,12 @@ impl Media {
         self.shared.ptt.store(mode, Ordering::Relaxed);
     }
 
+    /// Each peer device's volume, in percent (SPEC-audio A6); a device
+    /// left out is at 100.
+    pub fn set_volumes(&self, volumes: HashMap<[u8; 32], u32>) {
+        *lock(&self.shared.volumes) = volumes;
+    }
+
     /// The switches and sensitivity, from the next frame on.
     pub fn set_audio(&self, audio: Audio) {
         *lock(&self.shared.audio) = audio;
@@ -355,6 +367,25 @@ fn scale(frame: &mut [i16], percent: u32) {
         let v = i32::from(*s) * percent as i32 / 100;
         *s = v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
     }
+}
+
+/// The frames heard, each at its device's volume, summed, at `output`
+/// (SPEC-audio A3, A6).
+fn mix_at(
+    frames: &[([u8; 32], Vec<i16>)],
+    volumes: &HashMap<[u8; 32], u32>,
+    output: u32,
+) -> Vec<i16> {
+    let scaled: Vec<Vec<i16>> = (frames.iter())
+        .map(|(device, f)| {
+            let mut f = f.clone();
+            scale(&mut f, volumes.get(device).copied().unwrap_or(100));
+            f
+        })
+        .collect();
+    let mut out = mixed(scaled.iter().map(Vec::as_slice));
+    scale(&mut out, output);
+    out
 }
 
 fn rms(frame: &[i16]) -> f64 {
@@ -657,7 +688,7 @@ async fn mix(
         if frames.is_empty() || shared.deafened.load(Ordering::Relaxed) {
             continue;
         }
-        let out = mixed(frames.iter().map(|(_, f)| f.as_slice()));
+        let out = mix_at(&frames, &lock(&shared.volumes), lock(&shared.audio).output);
         let delay = sink.play(&out);
         let _ = played.send((out, delay));
     }
@@ -914,6 +945,28 @@ mod tests {
         // Automatic would have let the 700 through over a quiet room.
         let mut auto = Gate::default();
         assert!(auto.pass(700.0, t, None));
+    }
+
+    /// SPEC-audio A6: one person at 50% is half, the other as they were;
+    /// the output volume scales what's heard.
+    #[test]
+    fn per_person_and_output_volume() {
+        let (ann, ben) = ([1u8; 32], [2u8; 32]);
+        let frame = |v: i16| vec![v; FRAME_SAMPLES];
+        let half = HashMap::from([(ann, 50u32)]);
+        let none = HashMap::new();
+        // Alone, each as set.
+        assert_eq!(mix_at(&[(ann, frame(1000))], &half, 100)[0], 500);
+        assert_eq!(mix_at(&[(ben, frame(1000))], &half, 100)[0], 1000);
+        // Together: Ann's half adds less than Ben's whole.
+        let both = mix_at(&[(ann, frame(1000)), (ben, frame(1000))], &half, 100)[0];
+        let even = mix_at(&[(ann, frame(1000)), (ben, frame(1000))], &none, 100)[0];
+        assert!(both < even, "{both} vs {even}");
+        assert!(
+            mix_at(&[(ann, frame(1000)), (ben, frame(1000))], &none, 0)
+                .iter()
+                .all(|&s| s == 0)
+        );
     }
 
     #[test]

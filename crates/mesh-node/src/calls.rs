@@ -139,6 +139,8 @@ pub struct Calls {
     /// The switches and sensitivity (SPEC-audio A3).
     #[cfg(feature = "audio")]
     audio: crate::media::Audio,
+    /// Each person's volume, in percent, by ID (SPEC-audio A6).
+    volumes: HashMap<[u8; 32], u32>,
     /// The mic test while it runs (SPEC-audio A5).
     #[cfg(feature = "audio")]
     test: Option<crate::media::Media>,
@@ -257,6 +259,9 @@ impl Helper {
                     if let Some(t) = v.get("threshold") {
                         a.threshold = t.as_f64().map(|db| db.clamp(-90.0, 0.0) as f32);
                     }
+                    if let Some(o) = v["output"].as_u64() {
+                        a.output = (o as u32).min(200);
+                    }
                     let audio = *a;
                     if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
                         m.set_audio(audio);
@@ -286,6 +291,15 @@ impl Helper {
                     "unavailable",
                     "this Mesh was built without calls".into(),
                 ));
+            }
+            // One person's volume for us, 0 to 200 percent (A6), kept for
+            // this run; Aflos sends what it keeps at each call's start.
+            "callVolume" => {
+                let id = parse_id(arg(0)?)?;
+                let percent: u32 = (arg(1)?.parse())
+                    .map_err(|_| Fail("bad-args", "a percentage, 0 to 200".into()))?;
+                self.calls.volumes.insert(id.to_bytes(), percent.min(200));
+                self.push_volumes();
             }
             "callGain" => {
                 let percent: u32 = (arg(0)?.parse())
@@ -498,6 +512,10 @@ impl Helper {
             )
             .map_err(|e| Fail("unavailable", format!("couldn't start the audio: {e}")))?;
             media.set_peers(call.devices.iter().copied());
+            media.set_volumes(self.device_volumes());
+            let Some(call) = self.calls.current.as_mut() else {
+                return Ok(());
+            };
             media.set_muted(self.calls.muted);
             media.set_deafened(self.calls.deafened);
             media.set_ptt(self.calls.ptt);
@@ -932,6 +950,32 @@ impl Helper {
                 m.set_peers(devices.iter().copied());
             }
             call.devices = devices;
+        }
+        self.push_volumes();
+    }
+
+    /// Each of the current call's devices at its person's volume, where
+    /// that isn't 100.
+    fn device_volumes(&self) -> HashMap<[u8; 32], u32> {
+        let Some(call) = &self.calls.current else {
+            return HashMap::new();
+        };
+        let owner = |device: &[u8; 32]| match call.stage {
+            Stage::Voice { space, channel } => (self.calls.voice.get(&(space, channel)))
+                .and_then(|m| m.get(device))
+                .map(|(id, ..)| *id),
+            _ => Some(call.with),
+        };
+        (call.devices.iter())
+            .filter_map(|d| Some((*d, *self.calls.volumes.get(&owner(d)?.to_bytes())?)))
+            .collect()
+    }
+
+    /// Tells the current call's media the volumes (A6).
+    fn push_volumes(&self) {
+        #[cfg(feature = "audio")]
+        if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
+            m.set_volumes(self.device_volumes());
         }
     }
 

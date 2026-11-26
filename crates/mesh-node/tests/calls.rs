@@ -736,3 +736,40 @@ fn the_mic_test_reports_levels_and_plays_back() {
     let _ = a.h.quit();
     seed.stop();
 }
+
+/// The loudness of the last half second `p` heard (RMS).
+fn recent_rms(p: &Person) -> f64 {
+    let bytes = std::fs::read(&p.heard).unwrap_or_default();
+    let samples: Vec<f64> = (bytes.as_chunks::<2>().0.iter())
+        .map(|b| f64::from(i16::from_le_bytes(*b)))
+        .collect();
+    let tail = &samples[samples.len().saturating_sub(24_000)..];
+    (tail.iter().map(|s| s * s).sum::<f64>() / tail.len().max(1) as f64).sqrt()
+}
+
+/// PLAN-audio Task 5: B turns A down to 0% and hears silence from A; back
+/// to 100%, A again.
+#[test]
+fn a_persons_volume_is_ours_to_set() {
+    let relay = Relay::start();
+    let dirs = ["seed", "a", "b"].map(|n| temp_dir(&format!("calls-volume-{n}")));
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let mut a = person(&dirs[1], &relay, &ticket, "ann", "440");
+    let mut b = person(&dirs[2], &relay, &ticket, "ben", "660");
+    friends(&mut a, &mut b);
+    a.h.send("callStart", &[&b.id]);
+    call_state(&mut b.h, "ringing");
+    b.h.send("callAnswer", &[]);
+    call_state(&mut a.h, "live");
+    hears(&b, 440.0, 660.0);
+    let loud = recent_rms(&b);
+    b.h.send("callVolume", &[&a.id, "0"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    let quiet = recent_rms(&b);
+    assert!(quiet < loud / 20.0, "at 0%: {quiet:.0}, before {loud:.0}");
+    b.h.send("callVolume", &[&a.id, "100"]);
+    hears(&b, 440.0, 660.0);
+    let _ = (a.h.quit(), b.h.quit());
+    seed.stop();
+}
