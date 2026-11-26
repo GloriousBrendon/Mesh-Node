@@ -434,12 +434,10 @@ impl Helper {
     /// The nodes the live call runs on: a voice channel is Space traffic,
     /// relayed (connection-privacy P14); a DM call may go direct.
     fn call_nodes(&self, net: &super::Net) -> crate::nodes::Nodes {
-        let voice =
-            (self.calls.current.as_ref()).is_some_and(|c| matches!(c.stage, Stage::Voice { .. }));
-        if voice {
-            net.node.relayed()
-        } else {
-            net.node.clone()
+        match self.calls.current.as_ref().map(|c| &c.stage) {
+            // A voice channel follows its Space's setting (P7, P14).
+            Some(Stage::Voice { space, .. }) => self.space_nodes([space]),
+            _ => net.node.clone(),
         }
     }
 

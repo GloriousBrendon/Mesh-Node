@@ -152,6 +152,24 @@ fn friends_go_direct_and_space_strangers_stay_relayed() {
         "C reached B direct"
     );
 
+    // P7: the owner turns it on, and every member holds it.
+    ask(&mut o, "spaceDirect", &[&s, "true"], "meshSpaces");
+    for h in [&mut b, &mut c] {
+        until(h, "meshSpaces", |v| {
+            club(v).is_some_and(|s| s["directAllowed"] == true)
+        });
+    }
+    // Still only friends go direct: B and C stay relayed.
+    assert_eq!(
+        ping_until(&mut b, &id_c, "direct"),
+        "relay",
+        "B reached C direct with P7 on"
+    );
+    ask(&mut o, "spaceDirect", &[&s, "false"], "meshSpaces");
+    until(&mut b, "meshSpaces", |v| {
+        club(v).is_some_and(|s| s["directAllowed"] == false)
+    });
+
     for h in [o, b, c] {
         h.quit();
     }
