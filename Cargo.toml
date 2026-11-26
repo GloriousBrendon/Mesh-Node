@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mesh-dm", "crates/mesh-e2ee", "crates/mesh-identity", "crates/mesh-node", "crates/mesh-transport"]
+members = ["crates/mesh-dm", "crates/mesh-fx", "crates/mesh-e2ee", "crates/mesh-identity", "crates/mesh-node", "crates/mesh-transport"]
 
 [workspace.package]
 version = "0.1.0"
