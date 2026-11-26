@@ -254,3 +254,54 @@ fn keyring() -> Value {
         Err(reason) => Value::String(reason),
     }
 }
+
+/// `idRemove`: a wrong password keeps everything; the right one deletes this
+/// device's copy (the plugin list in `fx/` stays) and ends the helper, and
+/// the next one finds no identity.
+#[test]
+fn removing_the_identity_from_this_device() {
+    // The identity's answer (or error), past network and code events.
+    fn answer(h: &mut Node, func: &str, args: &[&str]) -> (String, Value) {
+        h.send(func, args);
+        loop {
+            let (binding, payload) = h.event();
+            if binding == "meshIdentity" || binding == "meshError" {
+                return (binding, payload);
+            }
+        }
+    }
+    let relay = Relay::start();
+    let dir = temp_dir("protocol-remove");
+    let mut a = Node::start(&dir, &relay);
+    assert_eq!(a.event().0, "meshIdentity");
+    assert_eq!(
+        answer(&mut a, "idCreate", &[USER, PASSWORD]).1["state"],
+        "unlocked"
+    );
+    std::fs::create_dir_all(dir.join("fx")).unwrap();
+    std::fs::write(dir.join("fx/scan.json"), "{}").unwrap();
+
+    let (binding, wrong) = answer(&mut a, "idRemove", &[NEW_PASSWORD]);
+    assert_eq!(
+        (binding.as_str(), wrong["kind"].as_str()),
+        ("meshError", Some("cannot-unlock"))
+    );
+    assert!(
+        dir.join("identity.mks").exists(),
+        "kept after a wrong password"
+    );
+
+    assert_eq!(answer(&mut a, "idRemove", &[PASSWORD]).1["state"], "none");
+    let stderr = a.quit();
+    assert!(!stderr.contains(PASSWORD), "a password reached stderr");
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["fx"]);
+    assert!(dir.join("fx/scan.json").exists());
+
+    let mut again = Node::start(&dir, &relay);
+    assert_eq!(again.event().1["state"], "none");
+    let _ = again.quit();
+}

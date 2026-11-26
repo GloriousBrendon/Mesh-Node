@@ -685,6 +685,7 @@ impl Helper {
                 self.stop_net().await;
                 self.emit_identity();
             }
+            "idRemove" => self.remove_identity(arg(0)?).await?,
             "idChangePassword" => {
                 self.unlocked()?
                     .change_password(arg(0)?, arg(1)?, arg(2)?)?;
@@ -2327,7 +2328,6 @@ impl Helper {
         }
     }
 
-    /// `meshIdentity`: nothing about the identity unless it's unlocked.
     /// `fxScan {"dirs": [...], "fresh": bool}`: finds plugins in the
     /// standard folders and `dirs` on a thread of its own, then
     /// `meshFxPlugins`. `fresh` forgets the cache (Rescan).
@@ -2371,6 +2371,29 @@ impl Helper {
         Ok(())
     }
 
+    /// `idRemove <password>`: deletes this device's copy of the identity
+    /// and everything it keeps (`fx/`, the computer's plugin list, stays).
+    /// For good unless another device or a backup has it, so the password
+    /// must be right. Ends the process afterwards, so nothing still held in
+    /// memory writes a file back; Aflos starts a fresh one, which finds none.
+    async fn remove_identity(&mut self, password: &str) -> Result<(), Fail> {
+        let username = self.unlocked()?.username().to_owned();
+        Keystore::unlock(&self.path, &username, password)?;
+        if is_kept(&self.path) {
+            self.unlocked()?.keep_unlocked(false)?;
+        }
+        self.mail_flush().await;
+        self.store = None;
+        self.link = None;
+        self.stop_net().await;
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        remove_except(dir, &["fx"])
+            .map_err(|e| Fail("io", format!("couldn't remove everything: {e}")))?;
+        self.emit_identity();
+        std::process::exit(0);
+    }
+
+    /// `meshIdentity`: nothing about the identity unless it's unlocked.
     fn emit_identity(&self) {
         let keyring = self.keyring.as_ref().err();
         let Some(store) = &self.store else {
@@ -2538,6 +2561,22 @@ fn parse_code(text: &str) -> Result<FriendCode, Fail> {
 }
 
 /// A `meshError` for a command answered in the background.
+/// Deletes everything in `dir` but the entries named in `keep`.
+fn remove_except(dir: &Path, keep: &[&str]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if keep.iter().any(|k| entry.file_name() == *k) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn emit_fail(func: &str, kind: &str, message: &str) {
     emit(
         "meshError",

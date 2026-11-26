@@ -78,6 +78,26 @@ fn friends(a: &mut Person, b: &mut Person) {
     };
     until(&mut a.h, "meshSocial", |s| has(s, &ib));
     until(&mut b.h, "meshSocial", |s| has(s, &ia));
+    // Connected, so a call rings at once: calling the moment they're
+    // friends could race the first connection on a loaded machine.
+    let started = std::time::Instant::now();
+    loop {
+        a.h.send("netPingId", &[&ib]);
+        let got = loop {
+            let (got, payload) = a.h.event();
+            if got == "meshPing" || (got == "meshError" && payload["fn"] == "netPingId") {
+                break got;
+            }
+        };
+        if got == "meshPing" {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "they never connected"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn call_state(h: &mut Helper, state: &str) -> Value {
