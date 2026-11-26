@@ -316,6 +316,9 @@ impl Frame {
 
 // --- An instance ---
 
+/// A block per channel, per bus.
+type Buses = Vec<Vec<Vec<f32>>>;
+
 pub struct Instance {
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
@@ -327,6 +330,8 @@ pub struct Instance {
     _handler: ComWrapper<Handler>,
     /// Channels per bus, inputs then outputs.
     buses: (Vec<usize>, Vec<usize>),
+    /// Input and output buffers while processing.
+    running: Option<(Buses, Buses)>,
     _module: Module,
 }
 
@@ -415,12 +420,14 @@ pub fn open(path: &str, id: &str) -> Result<Instance, String> {
         host,
         _handler: handler,
         buses,
+        running: None,
         _module: module,
     })
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        self.stop();
         unsafe {
             if let Some((a, b)) = &self.points {
                 a.disconnect(b.as_ptr());
@@ -442,8 +449,11 @@ impl Instance {
         unsafe { self.processor.getLatencySamples() }
     }
 
-    /// Runs `input` (mono) through it in 960-frame blocks; mono out, block times.
-    pub fn process(&mut self, input: &[f32]) -> Result<(Vec<f32>, Vec<Duration>), String> {
+    /// Sets it up for 960-frame blocks at 48 kHz and starts processing.
+    pub fn start(&mut self) -> Result<(), String> {
+        if self.running.is_some() {
+            return Ok(());
+        }
         let mut setup = ProcessSetup {
             processMode: kRealtime as i32,
             symbolicSampleSize: kSample32 as i32,
@@ -457,64 +467,85 @@ impl Instance {
             self.component.setActive(1);
             self.processor.setProcessing(1);
         }
-        let (ins, outs) = self.buses.clone();
-        let mut in_data: Vec<Vec<Vec<f32>>> =
-            ins.iter().map(|&n| vec![vec![0f32; BLOCK]; n]).collect();
-        let mut out_data: Vec<Vec<Vec<f32>>> =
-            outs.iter().map(|&n| vec![vec![0f32; BLOCK]; n]).collect();
+        let bufs = |chans: &[usize]| chans.iter().map(|&n| vec![vec![0f32; BLOCK]; n]).collect();
+        self.running = Some((bufs(&self.buses.0), bufs(&self.buses.1)));
+        Ok(())
+    }
+
+    /// One block through it, in place: mono in on the main bus's channels,
+    /// its main output averaged back to mono (F7).
+    pub fn block(&mut self, buf: &mut [f32; BLOCK]) -> Result<(), String> {
+        let (in_data, out_data) = self.running.as_mut().ok_or("not started")?;
+        if let Some(main) = in_data.first_mut() {
+            for ch in main.iter_mut() {
+                ch.copy_from_slice(buf);
+            }
+        }
+        let mut in_ptrs: Vec<Vec<*mut f32>> = in_data
+            .iter_mut()
+            .map(|b| b.iter_mut().map(|c| c.as_mut_ptr()).collect())
+            .collect();
+        let mut out_ptrs: Vec<Vec<*mut f32>> = out_data
+            .iter_mut()
+            .map(|b| b.iter_mut().map(|c| c.as_mut_ptr()).collect())
+            .collect();
+        let bus = |p: &mut Vec<*mut f32>| AudioBusBuffers {
+            numChannels: p.len() as i32,
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 {
+                channelBuffers32: p.as_mut_ptr(),
+            },
+        };
+        let mut in_bufs: Vec<AudioBusBuffers> = in_ptrs.iter_mut().map(bus).collect();
+        let mut out_bufs: Vec<AudioBusBuffers> = out_ptrs.iter_mut().map(bus).collect();
+        let mut data = ProcessData {
+            processMode: kRealtime as i32,
+            symbolicSampleSize: kSample32 as i32,
+            numSamples: BLOCK as i32,
+            numInputs: in_bufs.len() as i32,
+            numOutputs: out_bufs.len() as i32,
+            inputs: in_bufs.as_mut_ptr(),
+            outputs: out_bufs.as_mut_ptr(),
+            inputParameterChanges: ptr::null_mut(),
+            outputParameterChanges: ptr::null_mut(),
+            inputEvents: ptr::null_mut(),
+            outputEvents: ptr::null_mut(),
+            processContext: ptr::null_mut(),
+        };
+        let r = unsafe { self.processor.process(&mut data) };
+        if r != kResultOk {
+            return Err(format!("process returned {r}"));
+        }
+        let main = out_data.first().ok_or("no output bus")?;
+        let n = main.len().max(1) as f32;
+        for (i, s) in buf.iter_mut().enumerate() {
+            *s = main.iter().map(|c| c[i]).sum::<f32>() / n;
+        }
+        Ok(())
+    }
+
+    /// Stops processing and deactivates it.
+    pub fn stop(&mut self) {
+        if self.running.take().is_some() {
+            unsafe {
+                self.processor.setProcessing(0);
+                self.component.setActive(0);
+            }
+        }
+    }
+
+    /// Runs `input` (mono) through it in 960-frame blocks; mono out, block times.
+    pub fn process(&mut self, input: &[f32]) -> Result<(Vec<f32>, Vec<Duration>), String> {
+        self.start()?;
         let (mut out, mut times) = (Vec::with_capacity(input.len()), Vec::new());
         for block in input.as_chunks::<BLOCK>().0 {
-            if let Some(main) = in_data.first_mut() {
-                for ch in main.iter_mut() {
-                    ch.copy_from_slice(block);
-                }
-            }
-            let mut in_ptrs: Vec<Vec<*mut f32>> = in_data
-                .iter_mut()
-                .map(|b| b.iter_mut().map(|c| c.as_mut_ptr()).collect())
-                .collect();
-            let mut out_ptrs: Vec<Vec<*mut f32>> = out_data
-                .iter_mut()
-                .map(|b| b.iter_mut().map(|c| c.as_mut_ptr()).collect())
-                .collect();
-            let bus = |p: &mut Vec<*mut f32>| AudioBusBuffers {
-                numChannels: p.len() as i32,
-                silenceFlags: 0,
-                __field0: AudioBusBuffers__type0 {
-                    channelBuffers32: p.as_mut_ptr(),
-                },
-            };
-            let mut in_bufs: Vec<AudioBusBuffers> = in_ptrs.iter_mut().map(bus).collect();
-            let mut out_bufs: Vec<AudioBusBuffers> = out_ptrs.iter_mut().map(bus).collect();
-            let mut data = ProcessData {
-                processMode: kRealtime as i32,
-                symbolicSampleSize: kSample32 as i32,
-                numSamples: BLOCK as i32,
-                numInputs: in_bufs.len() as i32,
-                numOutputs: out_bufs.len() as i32,
-                inputs: in_bufs.as_mut_ptr(),
-                outputs: out_bufs.as_mut_ptr(),
-                inputParameterChanges: ptr::null_mut(),
-                outputParameterChanges: ptr::null_mut(),
-                inputEvents: ptr::null_mut(),
-                outputEvents: ptr::null_mut(),
-                processContext: ptr::null_mut(),
-            };
+            let mut buf = *block;
             let started = Instant::now();
-            let r = unsafe { self.processor.process(&mut data) };
+            self.block(&mut buf)?;
             times.push(started.elapsed());
-            if r != kResultOk {
-                return Err(format!("process returned {r}"));
-            }
-            let main = out_data.first().ok_or("no output bus")?;
-            for i in 0..BLOCK {
-                out.push(main.iter().map(|c| c[i]).sum::<f32>() / main.len().max(1) as f32);
-            }
+            out.extend(buf);
         }
-        unsafe {
-            self.processor.setProcessing(0);
-            self.component.setActive(0);
-        }
+        self.stop();
         Ok((out, times))
     }
 

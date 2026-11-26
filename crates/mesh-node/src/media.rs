@@ -82,6 +82,11 @@ struct Shared {
     audio: Mutex<Audio>,
     /// Told the mic's level (dBFS) and whether it goes out (A5).
     level: Box<dyn Fn(f32, bool) + Send + Sync>,
+    /// A person's own plugins (SPEC-voice-quality): the chain's version
+    /// (a new one restarts them) and its plugins, `[{path, id, on}]`.
+    fx: Mutex<(u64, Arc<serde_json::Value>)>,
+    /// Told each change in how the plugins are doing (`meshFx`).
+    fx_report: Box<dyn Fn(serde_json::Value) + Send + Sync>,
     /// Each peer device's volume, in percent, where it isn't 100 (A6).
     volumes: Mutex<HashMap<[u8; 32], u32>>,
     /// `--echo`: the level, and what was played, waiting its delay.
@@ -92,6 +97,7 @@ impl Shared {
     fn new(
         call: [u8; 8],
         level: impl Fn(f32, bool) + Send + Sync + 'static,
+        fx_report: impl Fn(serde_json::Value) + Send + Sync + 'static,
         echo: Option<(u32, f32)>,
     ) -> Arc<Self> {
         let echo = echo.map(|(ms, at)| {
@@ -108,6 +114,8 @@ impl Shared {
             gain: std::sync::atomic::AtomicU32::new(100),
             audio: Mutex::new(Audio::default()),
             level: Box::new(level),
+            fx: Mutex::new((0, Arc::new(serde_json::Value::Null))),
+            fx_report: Box::new(fx_report),
             volumes: Mutex::new(HashMap::new()),
         })
     }
@@ -201,8 +209,9 @@ impl Media {
         io: &Io,
         speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
         level: impl Fn(f32, bool) + Send + Sync + 'static,
+        fx_report: impl Fn(serde_json::Value) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Shared::new(call, level, io.echo);
+        let shared = Shared::new(call, level, fx_report, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, capture, denoise) = mic(io, &stop)?;
         let (sink, playback) = speakers(io)?;
@@ -253,8 +262,9 @@ impl Media {
         io: &Io,
         hear: bool,
         level: impl Fn(f32, bool) + Send + Sync + 'static,
+        fx_report: impl Fn(serde_json::Value) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Shared::new([0; 8], level, io.echo);
+        let shared = Shared::new([0; 8], level, fx_report, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, capture, denoise) = mic(io, &stop)?;
         let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -302,6 +312,11 @@ impl Media {
     /// The switches and sensitivity, from the next frame on.
     pub fn set_audio(&self, audio: Audio) {
         *lock(&self.shared.audio) = audio;
+    }
+
+    /// The plugin chain at `version`; a version it hasn't run restarts them.
+    pub fn set_fx(&self, version: u64, plugins: Arc<serde_json::Value>) {
+        *lock(&self.shared.fx) = (version, plugins);
     }
 
     /// Input volume, 0 to 200 percent.
@@ -505,6 +520,7 @@ struct Chain {
     processing: crate::processing::Processing,
     agc: crate::processing::Gain,
     denoise: Option<Denoise>,
+    fx: crate::fx::Runner,
     played: Played,
     delay: i32,
     frames: u32,
@@ -517,6 +533,7 @@ impl Chain {
             processing: crate::processing::Processing::new(),
             agc: crate::processing::Gain::new(),
             denoise,
+            fx: crate::fx::Runner::new(Arc::new(crate::fx::start_mesh_fx)),
             played,
             delay: DEVICE_DELAY_MS,
             frames: 0,
@@ -545,6 +562,9 @@ impl Chain {
         if let Some(d) = self.denoise.as_mut().filter(|_| audio.noise) {
             *frame = d.frame(frame);
         }
+        // A person's own plugins: after echo and noise, before gain (F3).
+        let (version, plugins) = lock(&shared.fx).clone();
+        self.fx.step(frame, version, &plugins, &*shared.fx_report);
         if audio.gain {
             self.agc.process(frame);
         }

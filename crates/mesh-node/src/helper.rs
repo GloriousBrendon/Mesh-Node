@@ -951,7 +951,10 @@ impl Helper {
             "linkStart" => self.link_start()?,
             "fxScan" => self.fx_scan(args.first().map_or("{}", String::as_str))?,
             f if f.starts_with("dm") => self.dm_command(f, args)?,
-            f if f.starts_with("call") || f.starts_with("voice") || f == "audioTest" => {
+            f if f.starts_with("call")
+                || f.starts_with("voice")
+                || matches!(f, "audioTest" | "fxChain" | "fxRestart") =>
+            {
                 self.call_command(f, args)?
             }
             f if f.starts_with("space") => self.space_command(f, args)?,

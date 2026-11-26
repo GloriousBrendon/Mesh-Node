@@ -98,6 +98,20 @@ pub struct Instance {
     instance: PluginInstance<Host>,
     /// Channels on the main input and output port.
     channels: (usize, usize),
+    running: Option<Running>,
+}
+
+/// An activated, processing plugin and the buffers it works on.
+struct Running {
+    processor: clack_host::process::StartedPluginAudioProcessor<Host>,
+    ins: Vec<Vec<f32>>,
+    outs: Vec<Vec<f32>>,
+    in_ports: AudioPorts,
+    out_ports: AudioPorts,
+    events_in: EventBuffer,
+    events_out: EventBuffer,
+    /// Frames processed so far (CLAP's steady time).
+    steady: u64,
 }
 
 pub fn open(path: &str, id: &str) -> Result<Instance, String> {
@@ -123,7 +137,14 @@ pub fn open(path: &str, id: &str) -> Result<Instance, String> {
         _entry: entry,
         instance,
         channels,
+        running: None,
     })
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl Instance {
@@ -132,9 +153,11 @@ impl Instance {
         h.get_extension::<PluginLatency>().map_or(0, |l| l.get(&h))
     }
 
-    /// Runs `input` (mono) through the plugin in 960-frame blocks; mono out,
-    /// and the time each block took.
-    pub fn process(&mut self, input: &[f32]) -> Result<(Vec<f32>, Vec<Duration>), String> {
+    /// Activates it for 960-frame blocks at 48 kHz and starts processing.
+    pub fn start(&mut self) -> Result<(), String> {
+        if self.running.is_some() {
+            return Ok(());
+        }
         let config = PluginAudioConfiguration {
             sample_rate: f64::from(RATE),
             min_frames_count: BLOCK as u32,
@@ -144,55 +167,84 @@ impl Instance {
             .instance
             .activate(|_, _| (), config)
             .map_err(|e| format!("activate: {e}"))?;
-        let mut processor = stopped
+        let processor = stopped
             .start_processing()
             .map_err(|e| format!("start: {e}"))?;
         let (ins, outs) = self.channels;
-        let mut in_bufs = vec![vec![0f32; BLOCK]; ins];
-        let mut out_bufs = vec![vec![0f32; BLOCK]; outs];
-        let mut in_ports = AudioPorts::with_capacity(ins, 1);
-        let mut out_ports = AudioPorts::with_capacity(outs, 1);
-        let events_in = EventBuffer::new();
-        let mut events_out = EventBuffer::new();
-        let (mut out, mut times) = (Vec::with_capacity(input.len()), Vec::new());
-        for (k, block) in input.as_chunks::<BLOCK>().0.iter().enumerate() {
-            for ch in &mut in_bufs {
-                ch.copy_from_slice(block);
-            }
-            let started = Instant::now();
-            let audio_in = in_ports.with_input_buffers([AudioPortBuffer {
-                latency: 0,
-                channels: AudioPortBufferType::f32_input_only(
-                    in_bufs
-                        .iter_mut()
-                        .map(|b| InputChannel::variable(b.as_mut_slice())),
-                ),
-            }]);
-            let mut audio_out = out_ports.with_output_buffers([AudioPortBuffer {
-                latency: 0,
-                channels: AudioPortBufferType::f32_output_only(
-                    out_bufs.iter_mut().map(|b| b.as_mut_slice()),
-                ),
-            }]);
-            processor
-                .process(
-                    &audio_in,
-                    &mut audio_out,
-                    &InputEvents::from_buffer(&events_in),
-                    &mut OutputEvents::from_buffer(&mut events_out),
-                    Some((k * BLOCK) as u64),
-                    None,
-                )
-                .map_err(|e| format!("process: {e}"))?;
-            times.push(started.elapsed());
-            events_out.clear();
-            // Stereo out averaged to mono (F7).
-            for i in 0..BLOCK {
-                out.push(out_bufs.iter().map(|c| c[i]).sum::<f32>() / outs.max(1) as f32);
-            }
+        self.running = Some(Running {
+            processor,
+            ins: vec![vec![0f32; BLOCK]; ins],
+            outs: vec![vec![0f32; BLOCK]; outs],
+            in_ports: AudioPorts::with_capacity(ins, 1),
+            out_ports: AudioPorts::with_capacity(outs, 1),
+            events_in: EventBuffer::new(),
+            events_out: EventBuffer::new(),
+            steady: 0,
+        });
+        Ok(())
+    }
+
+    /// One block through it, in place: mono in on every input channel, the
+    /// outputs averaged back to mono (F7).
+    pub fn block(&mut self, buf: &mut [f32; BLOCK]) -> Result<(), String> {
+        let r = self.running.as_mut().ok_or("not started")?;
+        for ch in &mut r.ins {
+            ch.copy_from_slice(buf);
         }
-        let stopped = processor.stop_processing();
-        self.instance.deactivate(stopped);
+        let audio_in = r.in_ports.with_input_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only(
+                r.ins
+                    .iter_mut()
+                    .map(|b| InputChannel::variable(b.as_mut_slice())),
+            ),
+        }]);
+        let mut audio_out = r.out_ports.with_output_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_output_only(
+                r.outs.iter_mut().map(|b| b.as_mut_slice()),
+            ),
+        }]);
+        r.processor
+            .process(
+                &audio_in,
+                &mut audio_out,
+                &InputEvents::from_buffer(&r.events_in),
+                &mut OutputEvents::from_buffer(&mut r.events_out),
+                Some(r.steady),
+                None,
+            )
+            .map_err(|e| format!("process: {e}"))?;
+        r.steady += BLOCK as u64;
+        r.events_out.clear();
+        let n = r.outs.len().max(1) as f32;
+        for (i, s) in buf.iter_mut().enumerate() {
+            *s = r.outs.iter().map(|c| c[i]).sum::<f32>() / n;
+        }
+        Ok(())
+    }
+
+    /// Stops processing and deactivates it.
+    pub fn stop(&mut self) {
+        if let Some(r) = self.running.take() {
+            let stopped = r.processor.stop_processing();
+            self.instance.deactivate(stopped);
+        }
+    }
+
+    /// Runs `input` (mono) through the plugin in 960-frame blocks; mono out,
+    /// and the time each block took.
+    pub fn process(&mut self, input: &[f32]) -> Result<(Vec<f32>, Vec<Duration>), String> {
+        self.start()?;
+        let (mut out, mut times) = (Vec::with_capacity(input.len()), Vec::new());
+        for block in input.as_chunks::<BLOCK>().0 {
+            let mut buf = *block;
+            let started = Instant::now();
+            self.block(&mut buf)?;
+            times.push(started.elapsed());
+            out.extend(buf);
+        }
+        self.stop();
         Ok((out, times))
     }
 

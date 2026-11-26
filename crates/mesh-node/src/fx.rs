@@ -4,13 +4,16 @@
 //! blocks on it: a frame that isn't back in time, or can't even be queued,
 //! is `Late`, and the caller sends it dry.
 
-// ponytail: nothing calls this until the chain is wired (Task 4).
-#![cfg_attr(not(test), allow(dead_code))]
+// Without calls (the seed's build) there is no voice chain to run plugins in.
+#![cfg_attr(not(feature = "audio"), allow(dead_code))]
 
 use std::io;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
 
 #[path = "../../mesh-fx/src/proto.rs"]
 mod proto;
@@ -156,6 +159,122 @@ impl Fx {
     }
 }
 
+/// How long a frame may take in mesh-fx before it goes out dry (F4).
+const DEADLINE: Duration = Duration::from_millis(20);
+/// Late frames in a row before the plugins are bypassed (F4).
+const LATE_MAX: u32 = 3;
+/// How long loading a chain may take.
+const LOAD_LIMIT: Duration = Duration::from_secs(30);
+
+/// Starts mesh-fx with a chain: the running process and its answer.
+pub type Starter = Arc<dyn Fn(&Value) -> Result<(Fx, Value), String> + Send + Sync>;
+
+/// The real one: `mesh-fx serve`, then the chain.
+pub fn start_mesh_fx(plugins: &Value) -> Result<(Fx, Value), String> {
+    let mut cmd = Command::new(mesh_fx_path());
+    cmd.arg("serve");
+    let mut fx = Fx::start(cmd).map_err(|e| format!("couldn't start mesh-fx: {e}"))?;
+    let answer = fx
+        .control(json!({ "cmd": "chain", "plugins": plugins }), LOAD_LIMIT)
+        .map_err(|e| format!("the plugins didn't load ({e:?})"))?;
+    match answer["error"].as_str() {
+        Some(e) => Err(e.to_owned()),
+        None => Ok((fx, answer)),
+    }
+}
+
+/// A call's (or the mic test's) plugins (F3, F4): started off the audio
+/// thread when the chain changes, each frame through them within the
+/// deadline or dry, bypassed after `LATE_MAX` late frames or a crash until
+/// the chain is set or restarted again. Tells `report` each change.
+pub struct Runner {
+    start: Starter,
+    applied: u64,
+    fx: Option<Fx>,
+    starting: Option<Receiver<Result<(Fx, Value), String>>>,
+    late: u32,
+}
+
+impl Runner {
+    pub fn new(start: Starter) -> Self {
+        Runner {
+            start,
+            applied: 0,
+            fx: None,
+            starting: None,
+            late: 0,
+        }
+    }
+
+    /// `frame` through the chain at `version` (`plugins`, `[{path, id, on}]`).
+    pub fn step(
+        &mut self,
+        frame: &mut [i16],
+        version: u64,
+        plugins: &Arc<Value>,
+        report: &dyn Fn(Value),
+    ) {
+        if version != self.applied {
+            (self.applied, self.fx, self.starting, self.late) = (version, None, None, 0);
+            if plugins
+                .as_array()
+                .is_some_and(|a| a.iter().any(|p| p["on"] != false))
+            {
+                let (tx, rx) = mpsc::channel();
+                let (start, plugins) = (self.start.clone(), plugins.clone());
+                std::thread::spawn(move || drop(tx.send(start(&plugins))));
+                self.starting = Some(rx);
+                report(json!({ "state": "starting" }));
+            } else {
+                report(json!({ "state": "off" }));
+            }
+        }
+        if let Some(rx) = &self.starting {
+            match rx.try_recv() {
+                Ok(Ok((fx, answer))) => {
+                    (self.fx, self.starting) = (Some(fx), None);
+                    report(json!({ "state": "on", "latency": answer["latency"] }));
+                    // From the next frame on.
+                    return;
+                }
+                Ok(Err(error)) => {
+                    self.starting = None;
+                    report(json!({ "state": "failed", "error": error }));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.starting = None;
+                    report(json!({ "state": "failed", "error": "mesh-fx didn't start" }));
+                }
+            }
+        }
+        let Some(fx) = self.fx.as_mut() else { return };
+        // The wait mustn't hold up the other tasks on this runtime thread.
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| fx.process(frame, DEADLINE))
+            }
+            _ => fx.process(frame, DEADLINE),
+        };
+        let why = match result {
+            Ok(()) => {
+                self.late = 0;
+                return;
+            }
+            Err(FxError::Late) => {
+                self.late += 1;
+                if self.late < LATE_MAX {
+                    return;
+                }
+                "too slow: 3 frames late in a row"
+            }
+            Err(FxError::Dead) => "the plugins stopped (crashed)",
+        };
+        self.fx = None;
+        report(json!({ "state": "bypassed", "error": why }));
+    }
+}
+
 impl Drop for Fx {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -223,6 +342,126 @@ mod tests {
             "{:?}",
             killed.elapsed()
         );
+    }
+
+    fn runner(cmd: &'static [&'static str]) -> Runner {
+        Runner::new(Arc::new(move |_: &Value| {
+            let mut c = Command::new(cmd[0]);
+            c.args(&cmd[1..]);
+            Fx::start(c)
+                .map(|fx| (fx, json!({ "latency": 7 })))
+                .map_err(|e| e.to_string())
+        }))
+    }
+
+    /// Steps `r` with `frame` until a report comes (or 2 s): the reports.
+    fn step_until_report(r: &mut Runner, version: u64, plugins: &Arc<Value>) -> Vec<Value> {
+        let got = std::cell::RefCell::new(Vec::new());
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            let mut frame = vec![9i16; FRAME];
+            r.step(&mut frame, version, plugins, &|v| got.borrow_mut().push(v));
+            assert_eq!(
+                frame,
+                vec![9i16; FRAME],
+                "cat or nothing: unchanged either way"
+            );
+            if got.borrow().iter().any(|v| v["state"] != "starting") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        got.into_inner()
+    }
+
+    fn on() -> Arc<Value> {
+        Arc::new(json!([{ "path": "x.clap", "id": "x", "on": true }]))
+    }
+
+    #[test]
+    fn a_runner_starts_off_the_audio_thread_and_reports_on() {
+        let mut r = runner(&["cat"]);
+        let got = step_until_report(&mut r, 1, &on());
+        assert_eq!(got[0]["state"], "starting");
+        assert_eq!(got.last().unwrap()["state"], "on");
+        assert_eq!(got.last().unwrap()["latency"], 7);
+        // Running: frames come back, nothing more reported.
+        let got = std::cell::RefCell::new(Vec::new());
+        for _ in 0..20 {
+            let mut frame = vec![3i16; FRAME];
+            r.step(&mut frame, 1, &on(), &|v| got.borrow_mut().push(v));
+        }
+        assert!(got.borrow().is_empty(), "{:?}", got.borrow());
+        assert!(r.fx.is_some());
+    }
+
+    #[test]
+    fn three_late_frames_bypass_and_a_restart_restores() {
+        let mut r = runner(&["sleep", "10"]);
+        assert_eq!(
+            step_until_report(&mut r, 1, &on()).last().unwrap()["state"],
+            "on"
+        );
+        let got = std::cell::RefCell::new(Vec::new());
+        for k in 0..3 {
+            let mut frame = vec![4i16; FRAME];
+            let started = Instant::now();
+            r.step(&mut frame, 1, &on(), &|v| got.borrow_mut().push(v));
+            assert!(started.elapsed() < Duration::from_millis(200));
+            assert_eq!(frame, vec![4i16; FRAME], "late: sent dry");
+            assert_eq!(
+                got.borrow().len(),
+                usize::from(k == 2),
+                "bypassed on the third"
+            );
+        }
+        assert_eq!(got.borrow()[0]["state"], "bypassed");
+        assert!(r.fx.is_none());
+        // Bypassed: frames go straight through without waiting.
+        let started = Instant::now();
+        r.step(&mut vec![4i16; FRAME], 1, &on(), &|_| {});
+        assert!(started.elapsed() < Duration::from_millis(5));
+        // Restart (the same chain, a new version) starts it again.
+        r.start = runner(&["cat"]).start.clone();
+        assert_eq!(
+            step_until_report(&mut r, 2, &on()).last().unwrap()["state"],
+            "on"
+        );
+    }
+
+    #[test]
+    fn a_crash_bypasses_at_once() {
+        // `head` reads one byte of the first frame and exits.
+        let mut r = runner(&["head", "-c", "1"]);
+        assert_eq!(
+            step_until_report(&mut r, 1, &on()).last().unwrap()["state"],
+            "on"
+        );
+        let got = std::cell::RefCell::new(Vec::new());
+        let until = Instant::now() + Duration::from_secs(2);
+        while got.borrow().is_empty() && Instant::now() < until {
+            r.step(&mut vec![1i16; FRAME], 1, &on(), &|v| {
+                got.borrow_mut().push(v)
+            });
+        }
+        assert_eq!(got.borrow()[0]["state"], "bypassed", "{:?}", got.borrow());
+        assert!(
+            got.borrow()[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("crashed")
+        );
+    }
+
+    #[test]
+    fn no_plugins_on_starts_nothing_and_a_failed_load_is_reported() {
+        let mut r = Runner::new(Arc::new(|_: &Value| panic!("nothing to start")));
+        let off = Arc::new(json!([{ "path": "x.clap", "id": "x", "on": false }]));
+        assert_eq!(step_until_report(&mut r, 1, &off)[0]["state"], "off");
+        let mut r = Runner::new(Arc::new(|_: &Value| Err("x: no such plugin".to_owned())));
+        let got = step_until_report(&mut r, 1, &on());
+        assert_eq!(got.last().unwrap()["state"], "failed");
+        assert_eq!(got.last().unwrap()["error"], "x: no such plugin");
     }
 
     /// A stuck mesh-fx (here: one that never reads) makes frames late,

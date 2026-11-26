@@ -7,6 +7,7 @@
 //! mesh-fx edit <file> <id> [secs]     opens its editor for secs (default 10)
 //! mesh-fx serve                       mesh-node's end: messages on stdin/stdout (proto.rs)
 
+mod chain;
 mod clap;
 mod proto;
 mod serve;

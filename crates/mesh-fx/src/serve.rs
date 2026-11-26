@@ -2,23 +2,41 @@
 
 use std::io::{self, Read, Write};
 
+use serde_json::{Value, json};
+
+use crate::chain::Chain;
 use crate::proto::{self, Msg};
 
-/// Serves `r` into `w`; `Ok` at a clean end, `Err` on malformed input.
+/// Serves `r` into `w`; `Ok` at a clean end, `Err` on malformed input or a
+/// plugin that fails while processing (mesh-node then sends the voice dry).
 pub fn serve(mut r: impl Read, mut w: impl Write) -> io::Result<()> {
+    let mut chain: Option<Chain> = None;
     while let Some(msg) = proto::read(&mut r)? {
         let reply = match msg {
-            // ponytail: passes audio through until the chain is wired (Task 4).
-            Msg::Audio(seq, pcm) => Msg::Audio(seq, pcm),
+            Msg::Audio(seq, mut pcm) => {
+                if let Some(c) = chain.as_mut() {
+                    c.run(&mut pcm).map_err(io::Error::other)?;
+                }
+                Msg::Audio(seq, pcm)
+            }
             Msg::Control(json) => {
-                let v: serde_json::Value = serde_json::from_slice(&json)
+                let v: Value = serde_json::from_slice(&json)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let id = v.get("id").cloned().unwrap_or_default();
-                Msg::Control(
-                    serde_json::json!({"id": id, "error": "unknown command"})
-                        .to_string()
-                        .into_bytes(),
-                )
+                let mut answer = match v["cmd"].as_str() {
+                    Some("chain") => {
+                        chain = None;
+                        match Chain::load(&v["plugins"]) {
+                            Ok((c, info)) => {
+                                chain = Some(c);
+                                info
+                            }
+                            Err(e) => json!({ "error": e }),
+                        }
+                    }
+                    _ => json!({ "error": "unknown command" }),
+                };
+                answer["id"] = v.get("id").cloned().unwrap_or_default();
+                Msg::Control(answer.to_string().into_bytes())
             }
         };
         proto::write(&mut w, &reply)?;
