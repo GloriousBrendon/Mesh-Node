@@ -312,6 +312,8 @@ type Frames = tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>;
 /// What the mix played, with how long it'll take to reach the speakers
 /// (ms): the echo canceller's far end (SPEC-audio A1).
 type Played = tokio::sync::mpsc::UnboundedReceiver<(Vec<i16>, i32)>;
+/// Where the mix (or the mic test) says what it played.
+type PlayedTx = tokio::sync::mpsc::UnboundedSender<(Vec<i16>, i32)>;
 /// A device's own delay past our queue, about (ms).
 const DEVICE_DELAY_MS: i32 = 20;
 
@@ -520,7 +522,7 @@ async fn test(
     shared: Arc<Shared>,
     mut frames: Frames,
     mut chain: Chain,
-    sink: Option<(Sink, tokio::sync::mpsc::UnboundedSender<(Vec<i16>, i32)>)>,
+    sink: Option<(Sink, PlayedTx)>,
 ) {
     let mut late: std::collections::VecDeque<Vec<i16>> = std::collections::VecDeque::new();
     while let Some(mut frame) = frames.recv().await {
@@ -619,7 +621,7 @@ async fn mix(
     shared: Arc<Shared>,
     jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>>,
     sink: Sink,
-    played: tokio::sync::mpsc::UnboundedSender<(Vec<i16>, i32)>,
+    played: PlayedTx,
     me: [u8; 32],
     us: Arc<Mutex<Speakers>>,
     speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
