@@ -209,3 +209,99 @@ fn a_friend_gets_your_profile_and_loses_it_when_unfriended() {
     carol.quit();
     seed.stop();
 }
+
+/// Sends a Top 8 command and waits for its `meshTop8` (or its error).
+fn top8(h: &mut Helper, func: &str, args: &[&str]) -> (String, Value) {
+    h.send(func, args);
+    let started = std::time::Instant::now();
+    loop {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{func}: no answer"
+        );
+        let (got, payload) = h.event();
+        if (got == "meshTop8" && payload["event"]["fn"] == func) || got == "meshError" {
+            return (got, payload);
+        }
+    }
+}
+
+/// SPEC-profile PR11: Alice may show Bob in her Top 8 only once he says
+/// yes; Carol, Alice's friend but not Bob's, sees the name he gave and his
+/// avatar, never his ID; once he withdraws, he's gone from her profile.
+#[test]
+fn a_top8_ask_accept_and_withdraw() {
+    let dirs = [
+        "seed",
+        "alice",
+        "bob",
+        "carol",
+        "alice-profile",
+        "bob-profile",
+    ]
+    .map(|n| temp_dir(&format!("top8-{n}")));
+    let relay = Relay::start();
+    let mut seed = Seed::start(&dirs[0], &relay);
+    let ticket = seed.ticket();
+    let (mut alice, id_a) = helper(&dirs[1], &relay, &ticket, "alice");
+    let (mut bob, id_b) = helper(&dirs[2], &relay, &ticket, "bob");
+    let (mut carol, id_c) = helper(&dirs[3], &relay, &ticket, "carol");
+    for (b, id_b) in [(&mut bob, &id_b), (&mut carol, &id_c)] {
+        alice.expect("friendAdd", &[id_b, ""], "meshSocial");
+        b.expect("friendAdd", &[&id_a, ""], "meshSocial");
+        alice.social_until(|s| has(s, "friends", id_b));
+        b.social_until(|s| has(s, "friends", &id_a));
+    }
+    // Bob has a profile with an avatar, and Alice holds it.
+    write_profile(&dirs[5], "Bob's.", b"bob's avatar");
+    ask(&mut bob, "profileSet", &[dirs[5].to_str().unwrap()]);
+    until(&mut alice, "meshProfile", |p| {
+        p["id"] == *id_b && p["complete"] == true
+    });
+    write_profile(&dirs[4], "Alice's.", b"alice's avatar");
+    ask(&mut alice, "profileSet", &[dirs[4].to_str().unwrap()]);
+
+    // Not before he says yes.
+    let (got, err) = top8(&mut alice, "top8Set", &[&id_b]);
+    assert_eq!(
+        (got.as_str(), err["kind"].as_str()),
+        ("meshError", Some("not-allowed"))
+    );
+
+    top8(&mut alice, "top8Ask", &[&id_b]);
+    until(&mut bob, "meshTop8", |t| {
+        t["event"]["event"] == "ask" && t["asks"][0] == *id_a
+    });
+    top8(&mut bob, "top8Answer", &[&id_a, "true", "Bobby"]);
+    until(&mut alice, "meshTop8", |t| {
+        t["event"]["event"] == "yes" && t["mayShow"][0]["name"] == "Bobby"
+    });
+    let (_, set) = top8(&mut alice, "top8Set", &[&id_b]);
+    assert_eq!(set["shown"][0], *id_b);
+
+    // Carol sees "Bobby" and his avatar in Alice's profile, not his ID.
+    until(&mut carol, "meshProfile", |p| {
+        p["id"] == *id_a && p["version"] == 2 && p["complete"] == true
+    });
+    let (_, profile) = ask(&mut carol, "profileGet", &[&id_a]);
+    assert_eq!(profile["top8"][0]["name"], "Bobby", "{profile}");
+    let avatar = profile["top8"][0]["avatar"].as_str().unwrap();
+    assert_eq!(std::fs::read(avatar).unwrap(), b"bob's avatar");
+    assert!(!profile.to_string().contains(&id_b), "no ID in {profile}");
+
+    // He withdraws: Alice's profile drops him, and Carol's copy follows.
+    top8(&mut bob, "top8Withdraw", &[&id_a]);
+    until(&mut alice, "meshTop8", |t| {
+        t["event"]["event"] == "withdrawn" && t["shown"].as_array().unwrap().is_empty()
+    });
+    until(&mut carol, "meshProfile", |p| {
+        p["id"] == *id_a && p["version"] == 3
+    });
+    let (_, profile) = ask(&mut carol, "profileGet", &[&id_a]);
+    assert_eq!(profile["top8"], serde_json::json!([]), "{profile}");
+
+    alice.quit();
+    bob.quit();
+    carol.quit();
+    seed.stop();
+}

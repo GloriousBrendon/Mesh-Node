@@ -70,6 +70,8 @@ mod reports;
 mod social;
 #[path = "spaces.rs"]
 mod spaces;
+#[path = "top8.rs"]
+mod top8;
 use social::{
     COLLECT_EVERY, Collected, PRESENCE, PRESENCE_SILENCE, Presence, SYNC, SYNC_TIMEOUT,
     push_account,
@@ -544,6 +546,10 @@ enum Back {
     Profile(Box<(MeshId, [u8; 32], Vec<u8>)>),
     /// A profile file came, or didn't.
     ProfileFetched(Box<profile::ProfileFetched>),
+    /// A friend's Top 8 message (SPEC-profile PR11).
+    Top8(Box<(MeshId, top8::Msg)>),
+    /// A friend's device took our Top 8 message.
+    Top8Sent(Box<(MeshId, top8::Msg)>),
     /// A device didn't take these envelopes: they wait for it.
     Unsent(Box<([u8; 32], Vec<Vec<u8>>)>),
     /// A contact answered through this address.
@@ -964,6 +970,7 @@ impl Helper {
             }
             f if f.starts_with("space") => self.space_command(f, args)?,
             f if f.starts_with("profile") => self.profile_command(f, args)?,
+            f if f.starts_with("top8") => self.top8_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
             "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
             "linkCancel" => self.link_cancel()?,
@@ -1241,6 +1248,11 @@ impl Helper {
                 return self.profile_heard(id, device, &bytes);
             }
             Back::ProfileFetched(got) => return self.profile_fetched(*got),
+            Back::Top8(got) => {
+                let (id, msg) = *got;
+                return self.top8_heard(id, msg);
+            }
+            Back::Top8Sent(got) => return self.top8_sent(*got),
             Back::Typing(got) => {
                 let (id, device, frame) = *got;
                 return self.typing_heard(id, device, frame);
@@ -1327,6 +1339,7 @@ impl Helper {
                 let promoted = self.connected(&id);
                 self.present_to(&id);
                 self.offer_profile(&id);
+                self.top8_deliver(&id);
                 self.keys_for(&id);
                 self.mail_records_missing(&id);
                 self.send_waiting(&id);
@@ -1369,6 +1382,7 @@ impl Helper {
                 self.keys_for(&id);
                 self.mail_records_missing(&id);
                 self.offer_profile(&id);
+                self.top8_deliver(&id);
                 return self.present_to(&id);
             }
             Back::Synced(synced) => {
@@ -1981,6 +1995,7 @@ impl Helper {
                 dm::TYPING.to_owned(),
                 files::BLOB.to_owned(),
                 profile::SERVICE.to_owned(),
+                top8::SERVICE.to_owned(),
                 spaces::SPACE_HISTORY.to_owned(),
             ]
             .into_iter()
@@ -2621,6 +2636,10 @@ async fn serve_streams(
         }
         if stream.service == profile::SERVICE {
             tokio::spawn(profile::serve(stream, back));
+            continue;
+        }
+        if stream.service == top8::SERVICE {
+            tokio::spawn(top8::serve(stream, back));
             continue;
         }
         if stream.service == calls::CALL {

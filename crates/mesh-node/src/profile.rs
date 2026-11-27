@@ -178,7 +178,7 @@ impl Helper {
         }
     }
 
-    fn save_own_profile(&self, manifest: &Manifest) -> Result<(), Fail> {
+    pub(super) fn save_own_profile(&self, manifest: &Manifest) -> Result<(), Fail> {
         let store = self
             .store
             .as_ref()
@@ -195,7 +195,7 @@ impl Helper {
     }
 
     /// The friends' manifests we hold, by their ID's bytes.
-    fn friend_profiles(&self) -> HashMap<[u8; 32], Manifest> {
+    pub(super) fn friend_profiles(&self) -> HashMap<[u8; 32], Manifest> {
         let Some(store) = self.store.as_ref() else {
             return HashMap::new();
         };
@@ -286,6 +286,7 @@ impl Helper {
             version: 0,
             toml: toml.clone(),
             assets: declared,
+            top8: Vec::new(),
             cert: Vec::new(),
             signature: Vec::new(),
         };
@@ -308,8 +309,9 @@ impl Helper {
         }
         let old = self.own_profile();
         let version = old.as_ref().map_or(1, |m| m.version + 1);
-        let manifest =
-            Manifest::signed(version, toml, assets, store.device_key(), &cert).map_err(fail)?;
+        let top8 = self.top8_for_profile();
+        let manifest = Manifest::signed(version, toml, assets, top8, store.device_key(), &cert)
+            .map_err(fail)?;
         self.save_own_profile(&manifest)?;
         if let Some(old) = old {
             self.drop_profile_files(&old, &manifest);
@@ -323,15 +325,28 @@ impl Helper {
     }
 
     /// Drops `old`'s kept files that `new` no longer shows.
-    fn drop_profile_files(&self, old: &Manifest, new: &Manifest) {
+    /// Call once `new` is saved: a file another profile we hold still
+    /// shows stays (a friend's avatar in our Top 8, say).
+    pub(super) fn drop_profile_files(&self, old: &Manifest, new: &Manifest) {
         let Ok(blobs) = self.blobs() else { return };
-        for asset in &old.assets {
-            if !new.assets.iter().any(|a| a.hash == asset.hash)
+        let used = self.profile_files_held();
+        for asset in old.files() {
+            if !new.files().any(|a| a.hash == asset.hash)
+                && !used.contains(&asset.hash)
                 && let Err(e) = blobs.remove(&asset.hash)
             {
                 eprintln!("mesh-node: couldn't drop an old profile file: {e}");
             }
         }
+    }
+
+    /// The hashes of every file the profiles we hold show, ours and friends'.
+    fn profile_files_held(&self) -> HashSet<[u8; 32]> {
+        let friends = self.friend_profiles();
+        let own = self.own_profile();
+        (own.iter().chain(friends.values()))
+            .flat_map(|m| m.files().map(|a| a.hash))
+            .collect()
     }
 
     /// `profileGet(id)`: the profile we hold for `id` (a friend, or us),
@@ -378,6 +393,19 @@ impl Helper {
                 "path": path.map(|p| p.to_string_lossy().into_owned()),
             }));
         }
+        let mut top8 = Vec::new();
+        for (i, friend) in manifest.top8.iter().enumerate() {
+            let path = (friend.avatar.as_ref())
+                .filter(|a| blobs.has(&a.hash))
+                .and_then(|a| {
+                    let name = format!("top8-{}.{}", i + 1, extension(&a.mime));
+                    self.open_profile_file(&dir, &name, a).ok()
+                });
+            top8.push(json!({
+                "name": friend.name,
+                "avatar": path.map(|p| p.to_string_lossy().into_owned()),
+            }));
+        }
         emit(
             "meshProfile",
             json!({
@@ -386,6 +414,7 @@ impl Helper {
                 "version": manifest.version,
                 "toml": manifest.toml,
                 "assets": shown,
+                "top8": top8,
             }),
         );
         Ok(())
@@ -412,7 +441,7 @@ impl Helper {
     }
 
     /// Offers our profile to every connected friend and own device.
-    fn offer_profile_all(&self) {
+    pub(super) fn offer_profile_all(&self) {
         let Some(store) = &self.store else { return };
         let mut ids = vec![store.id()];
         ids.extend(
@@ -537,7 +566,7 @@ impl Helper {
             return;
         };
         let addrs = net.node.connected(&id);
-        for asset in manifest.assets.iter().filter(|a| !blobs.has(&a.hash)) {
+        for asset in manifest.files().filter(|a| !blobs.has(&a.hash)) {
             let (node, back, addrs, asset) = (
                 net.node.clone(),
                 self.back.clone(),
@@ -577,12 +606,16 @@ impl Helper {
             self.friend_profiles().remove(&id.to_bytes())
         };
         if let Some(m) = manifest
-            && m.assets.iter().all(|a| blobs.has(&a.hash))
+            && m.files().all(|a| blobs.has(&a.hash))
         {
             emit(
                 "meshProfile",
                 json!({ "id": id.to_string(), "version": m.version, "complete": true }),
             );
+            // A friend we show changed their avatar: show the new one.
+            if Some(id) != me {
+                self.top8_refresh(&id);
+            }
         }
     }
 
@@ -595,7 +628,7 @@ impl Helper {
         store.account().kind(id) == Some(Kind::Friend)
             && self
                 .own_profile()
-                .is_some_and(|m| m.assets.iter().any(|a| a.hash == *hash))
+                .is_some_and(|m| m.files().any(|a| a.hash == *hash))
     }
 
     /// Forgets the profiles of anyone who's no longer a friend, with their
@@ -610,20 +643,25 @@ impl Helper {
             })
             .copied()
             .collect();
+        // Anyone in our Top 8 lists who's no longer a friend goes too.
+        self.top8_prune();
         if gone.is_empty() {
             return;
         }
-        let blobs = self.blobs().ok();
-        for id in &gone {
-            if let (Some(m), Some(blobs)) = (all.remove(id), &blobs) {
-                for asset in &m.assets {
+        let removed: Vec<Manifest> = gone.iter().filter_map(|id| all.remove(id)).collect();
+        self.save_friend_profiles(&all);
+        let used = self.profile_files_held();
+        if let Ok(blobs) = self.blobs() {
+            for asset in removed.iter().flat_map(Manifest::files) {
+                if !used.contains(&asset.hash) {
                     let _ = blobs.remove(&asset.hash);
                 }
             }
+        }
+        for id in &gone {
             let prefix = format!("profile-{}-", e2ee::hex(&id[..8]));
             self.clear_opened(|name| name.starts_with(&prefix));
         }
-        self.save_friend_profiles(&all);
     }
 }
 
