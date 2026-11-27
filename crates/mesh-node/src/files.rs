@@ -24,7 +24,7 @@ const CHUNK_WAIT: Duration = Duration::from_secs(20);
 pub(super) type Fetched = (Where, String, usize, Attachment, Option<Vec<Vec<u8>>>);
 
 /// A file's type from its name: the common ones, else bytes.
-fn mime_of(name: &str) -> &'static str {
+pub(super) fn mime_of(name: &str) -> &'static str {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     match ext.as_deref() {
         Some("jpg" | "jpeg") => "image/jpeg",
@@ -56,7 +56,7 @@ fn files_in(body: &Body) -> Vec<[u8; 32]> {
 }
 
 // ponytail: a file's sealed chunks gather in memory, up to 100 MB (MAX_FILE) per fetch at once; write them to a temp file as they come if that's too much.
-async fn fetch_from(
+pub(super) async fn fetch_from(
     node: &crate::nodes::Nodes,
     addr: &MeshAddr,
     file: &Attachment,
@@ -143,7 +143,7 @@ impl Helper {
 
     /// The kept files; their notes are sealed with the data key, so only
     /// while unlocked.
-    fn blobs(&self) -> Result<Blobs, Fail> {
+    pub(super) fn blobs(&self) -> Result<Blobs, Fail> {
         let store = (self.store.as_ref()).ok_or_else(|| Fail("locked", "locked".to_owned()))?;
         Ok(Blobs::new(&self.blobs_dir(), store.data_key()))
     }
@@ -201,7 +201,7 @@ impl Helper {
         self.clear_opened(|name| name.starts_with(&prefix));
     }
 
-    fn opened_dir(&self) -> PathBuf {
+    pub(super) fn opened_dir(&self) -> PathBuf {
         self.path.parent().unwrap_or(Path::new(".")).join("files")
     }
 

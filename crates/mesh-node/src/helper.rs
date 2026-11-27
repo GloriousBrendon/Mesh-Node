@@ -62,12 +62,16 @@ mod link;
 mod mail;
 #[path = "mailrec.rs"]
 mod mailrec;
+#[path = "profile.rs"]
+mod profile;
 #[path = "reports.rs"]
 mod reports;
 #[path = "social.rs"]
 mod social;
 #[path = "spaces.rs"]
 mod spaces;
+#[path = "top8.rs"]
+mod top8;
 use social::{
     COLLECT_EVERY, Collected, PRESENCE, PRESENCE_SILENCE, Presence, SYNC, SYNC_TIMEOUT,
     push_account,
@@ -535,6 +539,17 @@ enum Back {
     BlobAsk(Box<(MeshId, [u8; 32], tokio::sync::oneshot::Sender<bool>)>),
     /// A file came, or didn't: where it's wanted for (D12).
     Fetched(Box<files::Fetched>),
+    /// A device offers its person's profile at this version: whose, the
+    /// version, where to say whether we want it (SPEC-profile PR3).
+    ProfileOffer(Box<(MeshId, u64, tokio::sync::oneshot::Sender<bool>)>),
+    /// A device sent its person's profile manifest: whose, the device, the bytes.
+    Profile(Box<(MeshId, [u8; 32], Vec<u8>)>),
+    /// A profile file came, or didn't.
+    ProfileFetched(Box<profile::ProfileFetched>),
+    /// A friend's Top 8 message (SPEC-profile PR11).
+    Top8(Box<(MeshId, top8::Msg)>),
+    /// A friend's device took our Top 8 message.
+    Top8Sent(Box<(MeshId, top8::Msg)>),
     /// A device didn't take these envelopes: they wait for it.
     Unsent(Box<([u8; 32], Vec<Vec<u8>>)>),
     /// A contact answered through this address.
@@ -957,7 +972,9 @@ impl Helper {
             {
                 self.call_command(f, args)?
             }
-            f if f.starts_with("space") => self.space_command(f, args)?,
+            f if f.starts_with("space") || f.starts_with("card") => self.space_command(f, args)?,
+            f if f.starts_with("profile") => self.profile_command(f, args)?,
+            f if f.starts_with("top8") => self.top8_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
             "linkConfirm" => self.link_confirm(arg(0)? == "true")?,
             "linkCancel" => self.link_cancel()?,
@@ -1057,6 +1074,8 @@ impl Helper {
     /// (`only` the one that changed, when it's one).
     fn contacts_changed(&mut self, only: Option<&MeshId>) {
         self.allow_contacts();
+        // A former friend's profile goes (SPEC-profile PR15).
+        self.profile_prune();
         self.publish_only(only);
         // Mail for them must have somewhere to go before the next renewal,
         // and where to mail them must be known before it's needed.
@@ -1068,6 +1087,7 @@ impl Helper {
     /// They're no longer let in; their records lapse (routing D4).
     fn cut_off(&self, id: &MeshId) {
         self.allow_contacts();
+        self.profile_prune();
         if let Some(net) = &self.net {
             net.node.disconnect(id);
         }
@@ -1217,10 +1237,26 @@ impl Helper {
             }
             Back::BlobAsk(got) => {
                 let (id, hash, answer) = *got;
-                let _ = answer.send(self.may_fetch(&id, &hash));
+                let may = self.may_fetch(&id, &hash) || self.may_fetch_profile(&id, &hash);
+                let _ = answer.send(may);
                 return;
             }
             Back::Fetched(got) => return self.fetched(*got),
+            Back::ProfileOffer(got) => {
+                let (id, version, answer) = *got;
+                let _ = answer.send(self.profile_offered(&id, version));
+                return;
+            }
+            Back::Profile(got) => {
+                let (id, device, bytes) = *got;
+                return self.profile_heard(id, device, &bytes);
+            }
+            Back::ProfileFetched(got) => return self.profile_fetched(*got),
+            Back::Top8(got) => {
+                let (id, msg) = *got;
+                return self.top8_heard(id, msg);
+            }
+            Back::Top8Sent(got) => return self.top8_sent(*got),
             Back::Typing(got) => {
                 let (id, device, frame) = *got;
                 return self.typing_heard(id, device, frame);
@@ -1306,6 +1342,8 @@ impl Helper {
                 }
                 let promoted = self.connected(&id);
                 self.present_to(&id);
+                self.offer_profile(&id);
+                self.top8_deliver(&id);
                 self.keys_for(&id);
                 self.mail_records_missing(&id);
                 self.send_waiting(&id);
@@ -1339,6 +1377,7 @@ impl Helper {
                 if self.store.as_ref().is_some_and(|s| s.id() == id) {
                     // Another of our devices: it sends its state; we answer
                     // with ours if it's missing something (`Back::Synced`).
+                    self.offer_profile(&id);
                     return self.tell_direct(&id);
                 }
                 if self.connected(&id) {
@@ -1346,6 +1385,8 @@ impl Helper {
                 }
                 self.keys_for(&id);
                 self.mail_records_missing(&id);
+                self.offer_profile(&id);
+                self.top8_deliver(&id);
                 return self.present_to(&id);
             }
             Back::Synced(synced) => {
@@ -1957,6 +1998,8 @@ impl Helper {
                 e2ee::SERVICE.to_owned(),
                 dm::TYPING.to_owned(),
                 files::BLOB.to_owned(),
+                profile::SERVICE.to_owned(),
+                top8::SERVICE.to_owned(),
                 spaces::SPACE_HISTORY.to_owned(),
             ]
             .into_iter()
@@ -2636,6 +2679,14 @@ async fn serve_streams(
         if stream.service == files::BLOB {
             let (dir, open) = (blobs.clone(), blob_streams.clone());
             tokio::spawn(files::serve_blob(stream, dir, back, open));
+            continue;
+        }
+        if stream.service == profile::SERVICE {
+            tokio::spawn(profile::serve(stream, back));
+            continue;
+        }
+        if stream.service == top8::SERVICE {
+            tokio::spawn(top8::serve(stream, back));
             continue;
         }
         if stream.service == calls::CALL {

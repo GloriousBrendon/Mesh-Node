@@ -36,6 +36,10 @@ mod addrs;
 #[cfg(feature = "audio")]
 mod audio;
 mod codes;
+// Used by profile delivery (PLAN-profile Task 3).
+#[cfg(feature = "profile-media")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod decode;
 mod e2ee;
 mod fx;
 mod fxscan;

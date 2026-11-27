@@ -30,6 +30,12 @@ pub const MAX_SPACE_NAME: usize = 100;
 pub const MAX_DISPLAY_NAME: usize = 64;
 /// People one line may mention (S12): everyone else in a full Space.
 pub const MAX_MENTIONS: usize = MAX_SPACE_MEMBERS;
+/// A Space card's one line, in characters (SPEC-profile PR12).
+pub const MAX_CARD_LINE: usize = 190;
+/// A Space card's avatar, in bytes (PR12).
+pub const MAX_CARD_AVATAR: u64 = 1000 * 1000;
+/// The kinds of picture a card's still avatar may be (PR12): no animation.
+pub const CARD_PICTURE_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
 /// A whole event, in bytes: under e2ee's 64 KiB envelope with room for the
 /// certificate and signature.
 pub const MAX_SPACE_EVENT_LEN: usize = 60 * 1024;
@@ -199,6 +205,47 @@ pub enum Change {
     /// reason as `VoiceChannelCreate`: an older engine refuses it and stays
     /// relayed, the safe side.
     DirectAllowed(bool),
+    /// A member's own card for this Space (SPEC-profile PR12): the name
+    /// they go by, a still avatar (a sealed file, fetched as Space files
+    /// are) and one line. Replaces their last one. Last, as above.
+    Card {
+        display: String,
+        avatar: Option<Attachment>,
+        line: String,
+    },
+    /// An owner or admin hides one member's card avatar and/or line (PR13);
+    /// `false` shows it again. Only over those they could kick.
+    CardHide {
+        who: Person,
+        avatar: bool,
+        line: bool,
+    },
+}
+
+/// A card's fields against PR12's limits.
+pub fn check_card(
+    display: &str,
+    avatar: Option<&Attachment>,
+    line: &str,
+) -> Result<(), EventError> {
+    if display.len() > MAX_DISPLAY_NAME {
+        return Err(EventError::TooLong("name"));
+    }
+    if line.chars().count() > MAX_CARD_LINE {
+        return Err(EventError::TooLong("card line"));
+    }
+    if let Some(a) = avatar {
+        if a.size > MAX_CARD_AVATAR {
+            return Err(EventError::TooLong("avatar"));
+        }
+        if !CARD_PICTURE_TYPES.contains(&a.mime.as_str()) {
+            return Err(EventError::Malformed);
+        }
+        if a.name.len() > MAX_NAME || a.preview.as_ref().is_some_and(|p| p.len() > MAX_PREVIEW) {
+            return Err(EventError::TooLong("avatar"));
+        }
+    }
+    Ok(())
 }
 
 /// The fields a device signs: everything but the signature.
@@ -339,6 +386,11 @@ impl SpaceEvent {
                     long(display, MAX_DISPLAY_NAME, "name")?;
                 }
                 Change::Add { display, .. } => long(display, MAX_DISPLAY_NAME, "name")?,
+                Change::Card {
+                    display,
+                    avatar,
+                    line,
+                } => check_card(display, avatar.as_ref(), line)?,
                 Change::Rename(name) => long(name, MAX_SPACE_NAME, "space name")?,
                 Change::ChannelCreate { name, .. }
                 | Change::VoiceChannelCreate { name, .. }
@@ -370,6 +422,12 @@ pub struct Member {
     pub display: String,
     /// The change they joined at: the creation, or their add.
     pub joined: EventId,
+    /// Their card's avatar and line (PR12), empty until they set one.
+    pub avatar: Option<Attachment>,
+    pub line: String,
+    /// An owner or admin hid them (PR13): clients don't show them.
+    pub avatar_hidden: bool,
+    pub line_hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +547,10 @@ impl Chain {
                     role: Role::Owner,
                     display: display.clone(),
                     joined: *root,
+                    avatar: None,
+                    line: String::new(),
+                    avatar_hidden: false,
+                    line_hidden: false,
                 },
             )]),
             bans: BTreeSet::new(),
@@ -623,6 +685,10 @@ fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> O
                 role: Role::Member,
                 display: display.clone(),
                 joined: id,
+                avatar: None,
+                line: String::new(),
+                avatar_hidden: false,
+                line_hidden: false,
             };
             next.members.insert(*who, member);
         }
@@ -735,6 +801,20 @@ fn apply(space: &SpaceId, v: &SpaceState, id: EventId, node: &Node<Change>) -> O
             }
         }
         Change::End if owner => next.ended = true,
+        Change::Card {
+            display,
+            avatar,
+            line,
+        } => {
+            let m = next.members.get_mut(&node.by).expect("a member");
+            m.display.clone_from(display);
+            m.avatar.clone_from(avatar);
+            m.line.clone_from(line);
+        }
+        Change::CardHide { who, avatar, line } if v.members.contains_key(who) && over(who) => {
+            let m = next.members.get_mut(who).expect("a member");
+            (m.avatar_hidden, m.line_hidden) = (*avatar, *line);
+        }
         _ => return None,
     }
     Some(next)
@@ -915,6 +995,62 @@ pub(crate) mod tests {
         bytes[1..33].copy_from_slice(&alice.id());
         forged.cert = bytes;
         assert_eq!(forged.author(), None, "a certificate not signed by the ID");
+    }
+
+    fn card(display: &str, line: &str, size: u64, mime: &str) -> SpaceBody {
+        let avatar = Attachment {
+            key: [1; 32],
+            hash: [2; 32],
+            size,
+            name: "me.png".into(),
+            mime: mime.into(),
+            preview: None,
+        };
+        SpaceBody::Change(SpaceChange {
+            after: Some([1; 16]),
+            change: Change::Card {
+                display: display.into(),
+                avatar: Some(avatar),
+                line: line.into(),
+            },
+        })
+    }
+
+    /// PR12's caps: a 1 MB still picture and a 190-character line, both ways.
+    #[test]
+    fn card_caps_are_refused_both_ways() {
+        let alice = Someone::new();
+        let refused = |body: SpaceBody, why: EventError| {
+            let e = alice.event([5; 16], 1, 1, body);
+            assert_eq!(e.to_bytes(), Err(why));
+            let bytes = postcard::to_stdvec(&e).unwrap();
+            assert_eq!(SpaceEvent::from_bytes(&bytes), Err(why));
+        };
+        let at_caps = card(
+            &"n".repeat(MAX_DISPLAY_NAME),
+            &"é".repeat(MAX_CARD_LINE),
+            MAX_CARD_AVATAR,
+            "image/webp",
+        );
+        let e = alice.event([5; 16], 1, 1, at_caps);
+        assert_eq!(SpaceEvent::from_bytes(&e.to_bytes().unwrap()).unwrap(), e);
+        let line = "é".repeat(MAX_CARD_LINE + 1);
+        refused(
+            card("n", &line, 10, "image/png"),
+            EventError::TooLong("card line"),
+        );
+        refused(
+            card("n", "", MAX_CARD_AVATAR + 1, "image/png"),
+            EventError::TooLong("avatar"),
+        );
+        let name = "n".repeat(MAX_DISPLAY_NAME + 1);
+        refused(
+            card(&name, "", 10, "image/png"),
+            EventError::TooLong("name"),
+        );
+        for moving in ["image/gif", "image/apng", "text/html"] {
+            refused(card("n", "", 10, moving), EventError::Malformed);
+        }
     }
 
     #[test]
@@ -1110,6 +1246,85 @@ pub(crate) mod tests {
                 ],
             );
             assert!(!version(&off).state.direct_allowed);
+        }
+
+        fn a_card(line: &str) -> Change {
+            Change::Card {
+                display: "bea".into(),
+                avatar: None,
+                line: line.into(),
+            }
+        }
+
+        fn hide(who: Person, avatar: bool, line: bool) -> Change {
+            Change::CardHide { who, avatar, line }
+        }
+
+        /// PR12: a member's card is their own, replaced by their next one;
+        /// someone who isn't a member can't set one.
+        #[test]
+        fn a_card_is_a_members_own() {
+            assert!(counts(B, a_card("hi")), "a member sets theirs");
+            assert!(!counts(D, a_card("hi")), "a non-member can't");
+            let v = in_any_order(&with(
+                base(),
+                &[
+                    (50, B, Some(7), a_card("first"), 50),
+                    (51, B, Some(50), a_card("second"), 51),
+                ],
+            ));
+            let b = &v.state.members[&B];
+            assert_eq!((b.display.as_str(), b.line.as_str()), ("bea", "second"));
+            assert_eq!(v.state.members[&C].line, "", "nobody else's changes");
+            // Gone with them: a kicked member's card, and a fresh one on return.
+            let v = version(&with(
+                base(),
+                &[
+                    (50, B, Some(7), a_card("first"), 50),
+                    (51, O, Some(50), Change::Kick(B), 51),
+                    (52, O, Some(51), add(B), 52),
+                ],
+            ));
+            assert_eq!(v.state.members[&B].line, "");
+        }
+
+        /// PR13: an owner or admin hides a member's avatar or line, and only
+        /// over someone they could kick; a member can't hide anyone's.
+        #[test]
+        fn only_an_owner_or_admin_hides_a_card() {
+            assert!(!counts(B, hide(C, true, true)), "a member can't");
+            assert!(counts(X, hide(B, false, true)), "an admin can");
+            assert!(counts(O, hide(X, true, false)), "the owner over an admin");
+            assert!(
+                !counts(X, hide(Y, true, true)),
+                "not an admin over an admin"
+            );
+            assert!(!counts(X, hide(O, true, true)), "nobody over the owner");
+            assert!(!counts(O, hide(D, true, true)), "not a member");
+            let v = version(&with(
+                base(),
+                &[
+                    (50, B, Some(7), a_card("rude"), 50),
+                    (51, X, Some(50), hide(B, false, true), 51),
+                ],
+            ));
+            let b = &v.state.members[&B];
+            assert!(b.line_hidden && !b.avatar_hidden);
+            // It outlasts a new card, and shows again when unhidden.
+            let v = version(&with(
+                base(),
+                &[
+                    (50, B, Some(7), a_card("rude"), 50),
+                    (51, X, Some(50), hide(B, false, true), 51),
+                    (52, B, Some(51), a_card("ruder"), 52),
+                ],
+            ));
+            assert!(v.state.members[&B].line_hidden);
+            let shown = version(&base()).state;
+            assert!(
+                !would_count(&space(), &shown, &X, &hide(B, false, false)),
+                "already shown: nothing to sign"
+            );
         }
 
         #[test]

@@ -22,12 +22,17 @@ cpal = { workspace = true, optional = true }
 opus = { workspace = true, optional = true }
 nnnoiseless = { workspace = true, optional = true }
 sonora = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+symphonia = { workspace = true, optional = true }
 
 [features]
-default = ["audio"]
+default = ["audio", "profile-media"]
 # Calls' audio (SPEC-calls C4). The seed's image builds without it: no ALSA
 # or CMake there, and a seed makes no calls.
 audio = ["dep:cpal", "dep:opus", "dep:nnnoiseless", "dep:sonora"]
+# Decoding friends' profile pictures and songs (SPEC-profile PR8). The seed
+# shows no profiles, so its image builds without it.
+profile-media = ["dep:image", "dep:symphonia", "dep:opus"]
 
 [dev-dependencies]
 # A plain-http relay on loopback for the two-helper test, so the helper never
