@@ -50,6 +50,8 @@ impl Put {
         self as u8
     }
 
+    // The seed still serves 0.5.x clients' requests (social R3-4); only they read this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_byte(byte: u8) -> Option<Self> {
         [Put::Ok, Put::Gone, Put::SlowDown, Put::Full, Put::Bad]
             .into_iter()

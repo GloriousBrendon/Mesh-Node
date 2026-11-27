@@ -12,7 +12,6 @@ mod common;
 use common::{Helper, Relay, Seed, temp_dir};
 
 const PASSWORD: &str = "correct horse battery staple";
-const NOTE: &str = "it's me, from the hike";
 /// Short records, so refreshes come every 2 s.
 const TTL: &str = "8";
 
@@ -54,9 +53,9 @@ impl Helper {
         }
     }
 
-    /// Sends a request with `code`; it's on the seed when this returns.
-    fn request(&mut self, code: &str, owner: &str) {
-        let social = self.expect("friendRequest", &[code, NOTE], "meshSocial");
+    /// Adds the code's owner (social R3-1): on our side only.
+    fn add_by_code(&mut self, code: &str, owner: &str) {
+        let social = self.expect("friendRequest", &[code], "meshSocial");
         assert!(has(&social, "outgoing", owner), "{social}");
     }
 
@@ -76,8 +75,10 @@ impl Helper {
     }
 }
 
+/// SPEC-social revision 3: a code only gives someone your ID. Using it adds
+/// them on your side; nothing shows on theirs. Friends once both have.
 #[test]
-fn requests_go_through_a_live_code() {
+fn friends_when_both_have_added_each_other() {
     let dirs = ["seed", "alice", "bob", "carol", "dave"].map(|n| temp_dir(&format!("social-{n}")));
     let relay = Relay::start();
     let mut seed = Seed::start(&dirs[0], &relay);
@@ -87,67 +88,40 @@ fn requests_go_through_a_live_code() {
     let (mut carol, id_c) = helper(&dirs[3], &relay, &ticket, "carol");
     let (mut dave, id_d) = helper(&dirs[4], &relay, &ticket, "dave");
 
-    // Bob's single-use code; Bob locks. Alice's request waits on the seed,
-    // and uses the code up.
-    let once = bob.code("1");
-    bob.expect("idLock", &[], "meshIdentity");
-    alice.request(&once, &id_b);
-    let spent = carol.expect("friendRequest", &[&once, ""], "meshError");
-    assert_eq!(spent["kind"], "not-found", "{spent}");
-
-    // Bob unlocks: the request is there, with Alice's name and note. It
-    // doesn't let her in yet.
-    bob.expect("idUnlock", &["bob", PASSWORD], "meshIdentity");
-    assert_eq!(bob.event().0, "meshCodes");
-    let social = bob.until("incoming", &id_a);
-    let request = &social["incoming"][0];
-    assert_eq!(
-        (request["name"].as_str(), request["note"].as_str()),
-        (Some("alice"), Some(NOTE))
-    );
-    // Its request collected, the spent code leaves the list (D7).
-    while bob.expect("codeList", &[], "meshCodes")["codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["code"] == once)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    // Alice uses Bob's code: Bob is hers as `outgoing`; Bob sees nothing,
+    // and doesn't let her in.
+    let bobs = bob.code("unlimited");
+    alice.add_by_code(&bobs, &id_b);
+    let mine = alice.code("1");
+    let own = alice.expect("friendRequest", &[&mine], "meshError");
+    assert_eq!(own["kind"], "self", "{own}");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let social = bob.list();
+    for list in ["friends", "incoming", "outgoing", "blocked"] {
+        assert!(!has(&social, list, &id_a), "{list}: {social}");
     }
     let refused = bob.expect("netPingId", &[&id_a], "meshError");
     assert_eq!(refused["kind"], "not-a-contact");
 
-    // Accept: friends on both sides once Bob's device reaches Alice's.
-    let social = bob.expect("friendAccept", &[&id_a], "meshSocial");
-    assert!(has(&social, "friends", &id_b) || has(&social, "friends", &id_a));
+    // Bob uses Alice's code: friends on both sides.
+    let alices = alice.code("unlimited");
+    bob.add_by_code(&alices, &id_a);
     alice.until("friends", &id_b);
     bob.until("friends", &id_a);
     assert_eq!(alice.expect("netPingId", &[&id_b], "meshPing")["id"], id_b);
-    assert!(bob.list()["incoming"].as_array().unwrap().is_empty());
 
-    // Decline is silent: Carol stays asked, and hears nothing.
-    let open = bob.code("unlimited");
-    carol.request(&open, &id_b);
-    bob.relock("bob");
-    bob.until("incoming", &id_c);
-    let social = bob.expect("friendDecline", &[&id_c], "meshSocial");
-    assert!(!has(&social, "incoming", &id_c));
-    assert!(has(&carol.list(), "outgoing", &id_b));
-
-    // Blocked from the request: Dave's next one never shows.
-    dave.request(&open, &id_b);
-    bob.relock("bob");
-    bob.until("incoming", &id_d);
+    // Carol adds Bob by code and Bob never adds her: nothing, ever. Bob
+    // blocks Dave, who added him; Dave stays `outgoing`, unseen.
+    carol.add_by_code(&bobs, &id_b);
+    dave.add_by_code(&bobs, &id_b);
     let social = bob.expect("block", &[&id_d], "meshSocial");
-    assert!(has(&social, "blocked", &id_d) && !has(&social, "incoming", &id_d));
-    dave.expect("friendCancel", &[&id_b], "meshSocial");
-    dave.request(&open, &id_b);
+    assert!(has(&social, "blocked", &id_d) && !has(&social, "incoming", &id_c));
     bob.relock("bob");
     let social = bob.list();
-    assert!(!has(&social, "incoming", &id_d) && has(&social, "blocked", &id_d));
+    assert!(!has(&social, "friends", &id_c) && !has(&social, "outgoing", &id_c));
+    assert!(has(&carol.list(), "outgoing", &id_b));
 
     // Add by ID on both sides: friends once their devices connect.
-    carol.expect("friendCancel", &[&id_b], "meshSocial");
     carol.expect("friendAdd", &[&id_a, "Al"], "meshSocial");
     alice.expect("friendAdd", &[&id_c, ""], "meshSocial");
     carol.until("friends", &id_a);
@@ -158,7 +132,8 @@ fn requests_go_through_a_live_code() {
     let log = seed.stop().join("\n");
     let stored: Vec<u8> = ["codes.bin", "addrs.bin", "knocks.bin"]
         .iter()
-        .flat_map(|f| std::fs::read(dirs[0].join(f)).unwrap())
+        // No request is ever sent now, so there may be no knocks.bin.
+        .flat_map(|f| std::fs::read(dirs[0].join(f)).unwrap_or_default())
         .collect();
     for id in [&id_a, &id_b, &id_c, &id_d] {
         assert!(!log.contains(id.as_str()), "an ID reached the seed's log");
@@ -168,7 +143,7 @@ fn requests_go_through_a_live_code() {
             "an ID is in the seed's files"
         );
     }
-    for text in [NOTE, "alice", "dave"] {
+    for text in ["alice", "dave"] {
         assert!(!log.contains(text));
         assert!(
             !stored.windows(text.len()).any(|w| w == text.as_bytes()),
