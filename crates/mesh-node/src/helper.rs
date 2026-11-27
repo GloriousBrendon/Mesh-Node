@@ -968,7 +968,7 @@ impl Helper {
             f if f.starts_with("call") || f.starts_with("voice") || f == "audioTest" => {
                 self.call_command(f, args)?
             }
-            f if f.starts_with("space") => self.space_command(f, args)?,
+            f if f.starts_with("space") || f.starts_with("card") => self.space_command(f, args)?,
             f if f.starts_with("profile") => self.profile_command(f, args)?,
             f if f.starts_with("top8") => self.top8_command(f, args)?,
             "linkJoin" => self.link_join(arg(0)?, arg(1)?)?,
