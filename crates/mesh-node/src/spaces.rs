@@ -15,8 +15,8 @@ use mesh_identity::MeshId;
 use mesh_dm::chat::Taken;
 use mesh_dm::space::SpaceEvent;
 use mesh_dm::space::{
-    Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, check_history, space_id,
-    to_redo, would_count,
+    Change, ChannelId, Role, SpaceBody, SpaceChange, SpaceVersion, check_card, check_history,
+    space_id, to_redo, would_count,
 };
 use mesh_dm::space_store::{
     SPACE_BATCH, from_batch, from_member, from_own, to_batch, to_member, to_own,
@@ -738,7 +738,19 @@ impl Helper {
             let members: Vec<Value> = (st.members.iter())
                 .filter_map(|(p, m)| {
                     let id = MeshId::from_bytes(p).ok()?;
-                    Some(json!({ "id": id.to_string(), "name": m.display, "role": role_text(m.role) }))
+                    // A hidden avatar or line isn't passed on at all (PR13).
+                    let avatar = (m.avatar.as_ref())
+                        .filter(|_| !m.avatar_hidden)
+                        .map(|a| json!({ "size": a.size, "mime": a.mime }));
+                    let line = Some(&m.line).filter(|l| !m.line_hidden && !l.is_empty());
+                    Some(json!({
+                        "id": id.to_string(),
+                        "name": m.display,
+                        "role": role_text(m.role),
+                        "avatar": avatar,
+                        "line": line,
+                        "hidden": { "avatar": m.avatar_hidden, "line": m.line_hidden },
+                    }))
                 })
                 .collect();
             let categories: Vec<Value> = (st.categories.iter())
@@ -2075,6 +2087,78 @@ impl Helper {
                     file,
                     members,
                 )?;
+            }
+            // A Space card (SPEC-profile PR12): the name, one line and a
+            // still avatar ("" for none), all of it replacing the last.
+            "cardSet" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let (display, line) = (arg(1)?.trim().to_owned(), arg(2)?.trim().to_owned());
+                let bad = |e: mesh_dm::event::EventError| match e {
+                    mesh_dm::event::EventError::TooLong(_) => Fail("too-long", e.to_string()),
+                    _ => Fail(
+                        "bad-args",
+                        "a card's avatar is a png, jpeg or webp".to_owned(),
+                    ),
+                };
+                check_card(&display, None, &line).map_err(bad)?;
+                let avatar = match args.get(3).filter(|p| !p.is_empty()) {
+                    None => None,
+                    Some(path) => {
+                        // Checked before it's kept, so a refused one leaves nothing behind.
+                        let size = (std::fs::metadata(path))
+                            .map_err(|e| Fail("io", format!("couldn't read that file: {e}")))?
+                            .len();
+                        let probe = mesh_dm::event::Attachment {
+                            key: [0; 32],
+                            hash: [0; 32],
+                            size,
+                            name: String::new(),
+                            mime: super::files::mime_of(path).to_owned(),
+                            preview: None,
+                        };
+                        check_card(&display, Some(&probe), &line).map_err(bad)?;
+                        let file = self.keep_attachment(path, None, Where::Group(space))?;
+                        check_card(&display, Some(&file), &line).map_err(bad)?;
+                        Some(file)
+                    }
+                };
+                let change = Change::Card {
+                    display,
+                    avatar,
+                    line,
+                };
+                self.space_command_change(&space, change)?;
+            }
+            // An owner's or admin's hide (PR13): `avatar`, `line`, `both`, or
+            // `none` to show them again.
+            "cardHide" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let who = parse_id(arg(1)?)?.to_bytes();
+                let (avatar, line) = match arg(2)? {
+                    "avatar" => (true, false),
+                    "line" => (false, true),
+                    "both" => (true, true),
+                    "none" => (false, false),
+                    _ => return Err(Fail("bad-args", "avatar, line, both or none".to_owned())),
+                };
+                self.space_command_change(&space, Change::CardHide { who, avatar, line })?;
+            }
+            // A member's card avatar, opened as a Space file is (`meshDmFile`,
+            // its `message` the member's ID, `index` 0).
+            "cardFetch" => {
+                let space = parse16(arg(0)?, "Space")?;
+                let who = parse_id(arg(1)?)?;
+                let me = self.me_sender()?.person;
+                let v = self.space_version(&space).ok_or_else(not_found)?;
+                let file = (v.state.members.get(&who.to_bytes()))
+                    .filter(|m| !m.avatar_hidden)
+                    .and_then(|m| m.avatar.clone())
+                    .ok_or_else(|| Fail("not-found", "no card avatar".to_owned()))?;
+                let members = (v.state.members.keys())
+                    .filter(|p| **p != me)
+                    .filter_map(|p| MeshId::from_bytes(p).ok())
+                    .collect();
+                self.fetch_attachment(Where::Group(space), who.to_string(), 0, file, members)?;
             }
             "spaceReport" => self.space_report(args)?,
             "spaceReports" => self.emit_reports(&parse16(arg(0)?, "Space")?),
