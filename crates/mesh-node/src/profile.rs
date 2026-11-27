@@ -109,6 +109,47 @@ fn fail(e: ProfileError) -> Fail {
     Fail(kind, e.to_string())
 }
 
+/// A profile file as Aflos may open it: a picture the capped decoder took,
+/// unchanged; a song it decoded, as 16-bit PCM WAV (PR8).
+#[cfg(feature = "profile-media")]
+fn vetted(asset: &Asset, plain: Vec<u8>) -> Result<Vec<u8>, String> {
+    if asset.slot != Slot::Song {
+        crate::decode::picture(&plain, &asset.mime).map_err(|e| e.to_string())?;
+        return Ok(plain);
+    }
+    let song = crate::decode::song(&plain, &asset.mime).map_err(|e| e.to_string())?;
+    Ok(wav(song.rate, song.channels, &song.samples))
+}
+
+/// Without the decoder nothing a friend sent is opened: all placeholders.
+#[cfg(not(feature = "profile-media"))]
+fn vetted(_: &Asset, _: Vec<u8>) -> Result<Vec<u8>, String> {
+    Err("this build has no profile decoder".to_owned())
+}
+
+/// Interleaved 16-bit samples as a WAV file.
+#[cfg_attr(not(feature = "profile-media"), allow(dead_code))]
+fn wav(rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+    let data = u32::try_from(samples.len() * 2).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * u32::from(channels) * 2).to_le_bytes());
+    out.extend_from_slice(&(channels * 2).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// Offers `manifest` (version first) on one connected device.
 async fn offer(node: crate::nodes::Nodes, addr: MeshAddr, version: u64, manifest: Vec<u8>) {
     let sent = async {
@@ -371,40 +412,42 @@ impl Helper {
             e2ee::hex(&id.to_bytes()[..8]),
             manifest.version
         ));
-        // Only this version's copy stays.
+        // Only this version's copy stays; it's kept, so each file is
+        // decoded once per version.
         let prefix = format!("profile-{}-", e2ee::hex(&id.to_bytes()[..8]));
-        self.clear_opened(|name| name.starts_with(&prefix));
+        let this = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.clear_opened(|name| name.starts_with(&prefix) && Some(name) != this.as_deref());
+        // A file still coming has no path; one the decoder refused (PR8)
+        // has none either, and is marked a placeholder.
+        let open = |name: String, asset: &Asset| -> (Option<String>, bool) {
+            if !blobs.has(&asset.hash) {
+                return (None, false);
+            }
+            match self.open_vetted(&dir, &name, asset) {
+                Some(path) => (Some(path.to_string_lossy().into_owned()), false),
+                None => (None, true),
+            }
+        };
         let mut shown = Vec::new();
         let mut counts: HashMap<&'static str, usize> = HashMap::new();
         for asset in &manifest.assets {
             let n = counts.entry(slot_name(asset.slot)).or_default();
             *n += 1;
-            let path = if blobs.has(&asset.hash) {
-                let name = format!("{}-{n}.{}", slot_name(asset.slot), extension(&asset.mime));
-                self.open_profile_file(&dir, &name, asset).ok()
-            } else {
-                None
-            };
+            let (path, placeholder) = open(format!("{}-{n}", slot_name(asset.slot)), asset);
             shown.push(json!({
                 "slot": slot_name(asset.slot),
                 "mime": asset.mime,
                 "size": asset.size,
                 "seconds": asset.seconds,
-                "path": path.map(|p| p.to_string_lossy().into_owned()),
+                "path": path,
+                "placeholder": placeholder,
             }));
         }
         let mut top8 = Vec::new();
         for (i, friend) in manifest.top8.iter().enumerate() {
-            let path = (friend.avatar.as_ref())
-                .filter(|a| blobs.has(&a.hash))
-                .and_then(|a| {
-                    let name = format!("top8-{}.{}", i + 1, extension(&a.mime));
-                    self.open_profile_file(&dir, &name, a).ok()
-                });
-            top8.push(json!({
-                "name": friend.name,
-                "avatar": path.map(|p| p.to_string_lossy().into_owned()),
-            }));
+            let (path, _) = (friend.avatar.as_ref())
+                .map_or((None, false), |a| open(format!("top8-{}", i + 1), a));
+            top8.push(json!({ "name": friend.name, "avatar": path }));
         }
         emit(
             "meshProfile",
@@ -420,8 +463,35 @@ impl Helper {
         Ok(())
     }
 
-    /// Opens one kept profile file into `dir` as `name`.
-    fn open_profile_file(&self, dir: &Path, name: &str, asset: &Asset) -> Result<PathBuf, Fail> {
+    /// Opens one kept profile file into `dir` as `stem`, once the capped
+    /// decoder took it (PR8): a picture as it is, a song as a WAV Aflos
+    /// plays. `None` if it's refused, or couldn't be opened. Already in
+    /// `dir`: vetted before, so not decoded again.
+    fn open_vetted(&self, dir: &Path, stem: &str, asset: &Asset) -> Option<PathBuf> {
+        let ext = if asset.slot == Slot::Song {
+            "wav"
+        } else {
+            extension(&asset.mime)
+        };
+        let path = dir.join(format!("{stem}.{ext}"));
+        if path.exists() {
+            return Some(path);
+        }
+        let plain = self.profile_plain(asset).ok()?;
+        let bytes = match vetted(asset, plain) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                eprintln!("mesh-node: a profile file shows as a placeholder: {why}");
+                return None;
+            }
+        };
+        std::fs::create_dir_all(dir).ok()?;
+        std::fs::write(&path, bytes).ok()?;
+        Some(path)
+    }
+
+    /// One kept profile file, decrypted.
+    fn profile_plain(&self, asset: &Asset) -> Result<Vec<u8>, Fail> {
         let blobs = self.blobs()?;
         let unavailable = |e: mesh_dm::blob::BlobError| Fail("unavailable", e.to_string());
         let io = |e: std::io::Error| Fail("io", format!("couldn't open a profile file: {e}"));
@@ -434,10 +504,7 @@ impl Helper {
             plain.extend(opener.chunk(&chunk).map_err(unavailable)?);
         }
         opener.finish().map_err(unavailable)?;
-        std::fs::create_dir_all(dir).map_err(io)?;
-        let path = dir.join(name);
-        std::fs::write(&path, &plain).map_err(io)?;
-        Ok(path)
+        Ok(plain)
     }
 
     /// Offers our profile to every connected friend and own device.
@@ -679,5 +746,21 @@ mod tests {
         assert_eq!(mime_of("avatar.JPG"), Some("image/jpeg"));
         assert_eq!(mime_of("avatar.svg"), None);
         assert_eq!(mime_of("noextension"), None);
+    }
+
+    /// A song goes to Aflos as 16-bit PCM WAV: the header says what follows.
+    #[test]
+    fn a_song_as_wav() {
+        let w = wav(48_000, 2, &[1, -1, 2, -2]);
+        assert_eq!(&w[..4], b"RIFF");
+        assert_eq!(&w[8..16], b"WAVEfmt ");
+        assert_eq!(u16::from_le_bytes([w[22], w[23]]), 2, "channels");
+        assert_eq!(u32::from_le_bytes([w[24], w[25], w[26], w[27]]), 48_000);
+        assert_eq!(
+            u32::from_le_bytes([w[40], w[41], w[42], w[43]]),
+            8,
+            "data bytes"
+        );
+        assert_eq!(w.len(), 44 + 8);
     }
 }

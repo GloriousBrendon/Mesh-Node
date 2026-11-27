@@ -64,6 +64,20 @@ fn ask(h: &mut Helper, func: &str, args: &[&str]) -> (String, Value) {
     }
 }
 
+/// A real picture, as the decoder takes it (PR8): `side` pixels square, in
+/// a color of its own.
+fn png(shade: u8, side: u32) -> Vec<u8> {
+    let picture = image::RgbaImage::from_pixel(side, side, image::Rgba([shade, 40, 90, 255]));
+    let mut bytes = Vec::new();
+    picture
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
 fn write_profile(dir: &Path, bio: &str, avatar: &[u8]) {
     std::fs::create_dir_all(dir).unwrap();
     let toml = format!(
@@ -71,26 +85,27 @@ fn write_profile(dir: &Path, bio: &str, avatar: &[u8]) {
     );
     std::fs::write(dir.join("profile.toml"), toml).unwrap();
     std::fs::write(dir.join("avatar.png"), avatar).unwrap();
-    std::fs::write(dir.join("gallery-1.png"), vec![7u8; 150_000]).unwrap();
-    std::fs::write(dir.join("gallery-2.png"), vec![9u8; 10]).unwrap();
+    std::fs::write(dir.join("gallery-1.png"), png(7, 300)).unwrap();
+    // Not a picture at all: a friend sees a placeholder.
+    std::fs::write(dir.join("gallery-2.png"), b"not a picture").unwrap();
     // Not a profile file: left out.
     std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
 }
 
-/// `profileGet`'s files, by slot and in order, read from their paths.
+/// `profileGet`'s files, by slot and in order, read from their paths;
+/// a placeholder (the decoder refused it) as no bytes.
 fn files(profile: &Value) -> Vec<(String, Vec<u8>)> {
     profile["assets"]
         .as_array()
         .unwrap()
         .iter()
         .map(|a| {
-            let path = a["path"]
-                .as_str()
-                .unwrap_or_else(|| panic!("not opened: {a}"));
-            (
-                a["slot"].as_str().unwrap().to_owned(),
-                std::fs::read(path).unwrap(),
-            )
+            let bytes = match a["path"].as_str() {
+                Some(path) => std::fs::read(path).unwrap(),
+                None if a["placeholder"] == true => Vec::new(),
+                None => panic!("not opened: {a}"),
+            };
+            (a["slot"].as_str().unwrap().to_owned(), bytes)
         })
         .collect()
 }
@@ -127,7 +142,7 @@ fn a_friend_gets_your_profile_and_loses_it_when_unfriended() {
         "{err}"
     );
 
-    write_profile(folder, "Frontman of Nagbreek.", b"avatar, first");
+    write_profile(folder, "Frontman of Nagbreek.", &png(1, 16));
     let (got, set) = ask(&mut alice, "profileSet", &[folder.to_str().unwrap()]);
     assert_eq!(
         (got.as_str(), set["version"].as_u64()),
@@ -150,9 +165,9 @@ fn a_friend_gets_your_profile_and_loses_it_when_unfriended() {
     assert_eq!(
         files(&profile),
         vec![
-            ("avatar".to_owned(), b"avatar, first".to_vec()),
-            ("gallery".to_owned(), vec![7u8; 150_000]),
-            ("gallery".to_owned(), vec![9u8; 10]),
+            ("avatar".to_owned(), png(1, 16)),
+            ("gallery".to_owned(), png(7, 300)),
+            ("gallery".to_owned(), Vec::new()),
         ]
     );
 
@@ -161,7 +176,7 @@ fn a_friend_gets_your_profile_and_loses_it_when_unfriended() {
     assert_eq!(own["version"], 1);
 
     // A new version replaces it.
-    write_profile(folder, "Mixing tonight.", b"avatar, second");
+    write_profile(folder, "Mixing tonight.", &png(2, 16));
     let (_, set) = ask(&mut alice, "profileSet", &[folder.to_str().unwrap()]);
     assert_eq!(set["version"], 2);
     until(&mut bob, "meshProfile", |p| {
@@ -174,10 +189,7 @@ fn a_friend_gets_your_profile_and_loses_it_when_unfriended() {
             .unwrap()
             .contains("Mixing tonight.")
     );
-    assert_eq!(
-        files(&profile)[0],
-        ("avatar".to_owned(), b"avatar, second".to_vec())
-    );
+    assert_eq!(files(&profile)[0], ("avatar".to_owned(), png(2, 16)));
     let opened = profile["assets"][0]["path"].as_str().unwrap().to_owned();
 
     // A friend made after she published is offered it when they connect.
@@ -190,10 +202,7 @@ fn a_friend_gets_your_profile_and_loses_it_when_unfriended() {
         p["id"] == *id_a && p["version"] == 2 && p["complete"] == true
     });
     let (_, profile) = ask(&mut carol, "profileGet", &[&id_a]);
-    assert_eq!(
-        files(&profile)[0],
-        ("avatar".to_owned(), b"avatar, second".to_vec())
-    );
+    assert_eq!(files(&profile)[0], ("avatar".to_owned(), png(2, 16)));
 
     // Unfriended: her profile and its opened files are gone from Bob's device.
     bob.expect("friendRemove", &[&id_a], "meshSocial");
@@ -253,12 +262,12 @@ fn a_top8_ask_accept_and_withdraw() {
         b.social_until(|s| has(s, "friends", &id_a));
     }
     // Bob has a profile with an avatar, and Alice holds it.
-    write_profile(&dirs[5], "Bob's.", b"bob's avatar");
+    write_profile(&dirs[5], "Bob's.", &png(3, 16));
     ask(&mut bob, "profileSet", &[dirs[5].to_str().unwrap()]);
     until(&mut alice, "meshProfile", |p| {
         p["id"] == *id_b && p["complete"] == true
     });
-    write_profile(&dirs[4], "Alice's.", b"alice's avatar");
+    write_profile(&dirs[4], "Alice's.", &png(4, 16));
     ask(&mut alice, "profileSet", &[dirs[4].to_str().unwrap()]);
 
     // Not before he says yes.
@@ -286,7 +295,7 @@ fn a_top8_ask_accept_and_withdraw() {
     let (_, profile) = ask(&mut carol, "profileGet", &[&id_a]);
     assert_eq!(profile["top8"][0]["name"], "Bobby", "{profile}");
     let avatar = profile["top8"][0]["avatar"].as_str().unwrap();
-    assert_eq!(std::fs::read(avatar).unwrap(), b"bob's avatar");
+    assert_eq!(std::fs::read(avatar).unwrap(), png(3, 16));
     assert!(!profile.to_string().contains(&id_b), "no ID in {profile}");
 
     // He withdraws: Alice's profile drops him, and Carol's copy follows.
