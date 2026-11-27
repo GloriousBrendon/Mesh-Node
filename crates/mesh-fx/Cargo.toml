@@ -1,0 +1,40 @@
+[package]
+name = "mesh-fx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Hosts people's own voice plugins out of mesh-node's process (SPEC-voice-quality F2).
+[dependencies]
+# Control messages with mesh-node.
+serde_json.workspace = true
+# CLAP hosting.
+clack-host = "0.2.0"
+clack-extensions = { version = "0.2.0", features = ["clack-host", "audio-ports", "gui", "latency", "params", "state", "timer", "posix-fd"] }
+# VST3 hosting (raw COM bindings; Steinberg's SDK is MIT since 3.8).
+vst3 = "0.3.0"
+# Loading a VST3 bundle's library.
+libloading = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The X11 parent window for plugin editors (XWayland on Wayland).
+x11rb = "0.14"
+
+[target.'cfg(unix)'.dependencies]
+# poll(2) for the VST3 run loop; dup(2) to keep plugins off the protocol's stdout.
+libc = "0.2"
+
+# The test plugins (Task 7): built as libraries for mesh-fx's process tests.
+[dev-dependencies]
+clack-plugin = "0.2.0"
+clack-extensions = { version = "0.2.0", features = ["clack-plugin", "params", "state"] }
+
+[[example]]
+name = "test_gain_clap"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "test_gain_vst3"
+crate-type = ["cdylib"]

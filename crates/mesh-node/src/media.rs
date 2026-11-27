@@ -25,8 +25,72 @@ use crate::audio::{self, FRAME_SAMPLES, SAMPLE_RATE};
 
 /// A datagram's first byte: call media (C2).
 pub const MEDIA: u8 = 1;
-/// Opus at 32 kbit/s (Q6).
-const BITRATE: i32 = 32_000;
+/// Voice quality (SPEC-voice-quality): Opus's bitrate, Standard (32 kb/s,
+/// calls Q6) by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quality {
+    Low,
+    #[default]
+    Standard,
+    High,
+    Studio,
+}
+
+impl Quality {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "low" => Self::Low,
+            "standard" => Self::Standard,
+            "high" => Self::High,
+            "studio" => Self::Studio,
+            _ => return None,
+        })
+    }
+
+    fn bits(self) -> i32 {
+        match self {
+            Self::Low => 16_000,
+            Self::Standard => 32_000,
+            Self::High => 64_000,
+            Self::Studio => 128_000,
+        }
+    }
+
+    /// High and Studio carry music as well as speech. libopus can't change
+    /// its application after the first frame, so crossing it means a new
+    /// encoder.
+    fn application(self) -> Application {
+        match self {
+            Self::Low | Self::Standard => Application::Voip,
+            Self::High | Self::Studio => Application::Audio,
+        }
+    }
+}
+
+/// An encoder for `quality`, with in-band FEC for 10% loss.
+fn encoder_for(quality: Quality) -> Result<Encoder, String> {
+    let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, quality.application())
+        .map_err(|e| format!("opus: {e}"))?;
+    encoder
+        .set_bitrate(Bitrate::Bits(quality.bits()))
+        .and_then(|()| encoder.set_inband_fec(true))
+        .and_then(|()| encoder.set_packet_loss_perc(10))
+        .map_err(|e| format!("opus: {e}"))?;
+    Ok(encoder)
+}
+
+/// Re-sets `encoder` for `to` from `from`: the bitrate within a mode, a new
+/// encoder across them.
+fn requality(encoder: &mut Encoder, from: Quality, to: Quality) {
+    if from.application() != to.application() {
+        match encoder_for(to) {
+            Ok(e) => *encoder = e,
+            Err(e) => eprintln!("mesh-node: voice quality: {e}"),
+        }
+    } else if let Err(e) = encoder.set_bitrate(Bitrate::Bits(to.bits())) {
+        eprintln!("mesh-node: voice quality: {e}");
+    }
+}
 /// Frames a buffer holds before it starts playing (60 ms, C5).
 const JITTER_START: usize = 3;
 /// Frames it may grow to on a late path (200 ms).
@@ -82,6 +146,13 @@ struct Shared {
     audio: Mutex<Audio>,
     /// Told the mic's level (dBFS) and whether it goes out (A5).
     level: Box<dyn Fn(f32, bool) + Send + Sync>,
+    /// A person's own plugins (SPEC-voice-quality): the chain's version
+    /// (a new one restarts them) and its plugins, `[{path, id, on}]`.
+    fx: Mutex<(u64, Arc<serde_json::Value>)>,
+    /// Told each change in how the plugins are doing (`meshFx`).
+    fx_report: Box<dyn Fn(serde_json::Value) + Send + Sync>,
+    /// Control commands for the running plugins, taken with the next frame.
+    fx_controls: Mutex<Vec<serde_json::Value>>,
     /// Each peer device's volume, in percent, where it isn't 100 (A6).
     volumes: Mutex<HashMap<[u8; 32], u32>>,
     /// `--echo`: the level, and what was played, waiting its delay.
@@ -92,6 +163,7 @@ impl Shared {
     fn new(
         call: [u8; 8],
         level: impl Fn(f32, bool) + Send + Sync + 'static,
+        fx_report: impl Fn(serde_json::Value) + Send + Sync + 'static,
         echo: Option<(u32, f32)>,
     ) -> Arc<Self> {
         let echo = echo.map(|(ms, at)| {
@@ -108,6 +180,9 @@ impl Shared {
             gain: std::sync::atomic::AtomicU32::new(100),
             audio: Mutex::new(Audio::default()),
             level: Box::new(level),
+            fx: Mutex::new((0, Arc::new(serde_json::Value::Null))),
+            fx_report: Box::new(fx_report),
+            fx_controls: Mutex::new(Vec::new()),
             volumes: Mutex::new(HashMap::new()),
         })
     }
@@ -154,6 +229,8 @@ pub struct Audio {
     pub threshold: Option<f32>,
     /// What we hear, in percent (A3).
     pub output: u32,
+    /// What we send at (SPEC-voice-quality).
+    pub quality: Quality,
 }
 
 impl Default for Audio {
@@ -164,6 +241,7 @@ impl Default for Audio {
             gain: true,
             threshold: None,
             output: 100,
+            quality: Quality::Standard,
         }
     }
 }
@@ -201,18 +279,13 @@ impl Media {
         io: &Io,
         speaking: impl Fn(Vec<[u8; 32]>) + Send + 'static,
         level: impl Fn(f32, bool) + Send + Sync + 'static,
+        fx_report: impl Fn(serde_json::Value) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Shared::new(call, level, io.echo);
+        let shared = Shared::new(call, level, fx_report, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, capture, denoise) = mic(io, &stop)?;
         let (sink, playback) = speakers(io)?;
-        let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)
-            .map_err(|e| format!("opus: {e}"))?;
-        encoder
-            .set_bitrate(Bitrate::Bits(BITRATE))
-            .and_then(|()| encoder.set_inband_fec(true))
-            .and_then(|()| encoder.set_packet_loss_perc(10))
-            .map_err(|e| format!("opus: {e}"))?;
+        let encoder = encoder_for(Quality::Standard)?;
         let us = Arc::new(Mutex::new(Speakers::default()));
         let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
         let jitter: Arc<Mutex<HashMap<[u8; 32], Jitter>>> = Arc::default();
@@ -253,8 +326,9 @@ impl Media {
         io: &Io,
         hear: bool,
         level: impl Fn(f32, bool) + Send + Sync + 'static,
+        fx_report: impl Fn(serde_json::Value) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let shared = Shared::new([0; 8], level, io.echo);
+        let shared = Shared::new([0; 8], level, fx_report, io.echo);
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, capture, denoise) = mic(io, &stop)?;
         let (played_tx, played_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -302,6 +376,16 @@ impl Media {
     /// The switches and sensitivity, from the next frame on.
     pub fn set_audio(&self, audio: Audio) {
         *lock(&self.shared.audio) = audio;
+    }
+
+    /// The plugin chain at `version`; a version it hasn't run restarts them.
+    pub fn set_fx(&self, version: u64, plugins: Arc<serde_json::Value>) {
+        *lock(&self.shared.fx) = (version, plugins);
+    }
+
+    /// A control command for the running plugins (Task 5).
+    pub fn fx_control(&self, command: serde_json::Value) {
+        lock(&self.shared.fx_controls).push(command);
     }
 
     /// Input volume, 0 to 200 percent.
@@ -505,6 +589,7 @@ struct Chain {
     processing: crate::processing::Processing,
     agc: crate::processing::Gain,
     denoise: Option<Denoise>,
+    fx: crate::fx::Runner,
     played: Played,
     delay: i32,
     frames: u32,
@@ -517,6 +602,7 @@ impl Chain {
             processing: crate::processing::Processing::new(),
             agc: crate::processing::Gain::new(),
             denoise,
+            fx: crate::fx::Runner::new(Arc::new(crate::fx::start_mesh_fx)),
             played,
             delay: DEVICE_DELAY_MS,
             frames: 0,
@@ -545,6 +631,11 @@ impl Chain {
         if let Some(d) = self.denoise.as_mut().filter(|_| audio.noise) {
             *frame = d.frame(frame);
         }
+        // A person's own plugins: after echo and noise, before gain (F3).
+        let (version, plugins) = lock(&shared.fx).clone();
+        let controls = std::mem::take(&mut *lock(&shared.fx_controls));
+        self.fx
+            .step(frame, version, &plugins, controls, &*shared.fx_report);
         if audio.gain {
             self.agc.process(frame);
         }
@@ -578,8 +669,15 @@ async fn send(
 ) {
     let mut seq: u32 = 0;
     let mut out = vec![0u8; 1500];
+    let mut quality = Quality::Standard;
     while let Some(mut frame) = frames.recv().await {
         seq = seq.wrapping_add(1);
+        // Changed live (`callAudio`), from the next frame on.
+        let wanted = lock(&shared.audio).quality;
+        if wanted != quality {
+            requality(&mut encoder, quality, wanted);
+            quality = wanted;
+        }
         let now = Instant::now();
         let open = chain.step(&mut frame, &shared, now);
         if shared.muted.load(Ordering::Relaxed) || !open {
@@ -867,6 +965,57 @@ mod tests {
                 out[..n].to_vec()
             })
             .collect()
+    }
+
+    /// Voice quality: Studio's packets average about 4 times Standard's, and
+    /// switching modes mid-stream decodes with no error.
+    #[test]
+    fn quality_sets_the_bitrate_and_switches_cleanly() {
+        // Noise-like speech stand-in: a sine with a pseudo-random wobble.
+        let frame = |k: usize| -> Vec<i16> {
+            let mut x = (k as u32).wrapping_mul(2_654_435_761) | 1;
+            (0..FRAME_SAMPLES)
+                .map(|i| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    let t = (k * FRAME_SAMPLES + i) as f32 / SAMPLE_RATE as f32;
+                    let tone = (t * 220.0 * std::f32::consts::TAU).sin() * 6000.0;
+                    (tone + (x % 4000) as f32 - 2000.0) as i16
+                })
+                .collect()
+        };
+        let mut out = vec![0u8; 1500];
+        let mut average = |q: Quality| {
+            let mut enc = encoder_for(q).unwrap();
+            let sizes: Vec<usize> = (0..100)
+                .map(|k| enc.encode(&frame(k), &mut out).unwrap())
+                .collect();
+            sizes[20..].iter().sum::<usize>() as f64 / 80.0
+        };
+        let ratio = average(Quality::Studio) / average(Quality::Standard);
+        assert!((3.0..=5.0).contains(&ratio), "Studio/Standard = {ratio:.2}");
+
+        let mut enc = encoder_for(Quality::Standard).unwrap();
+        let mut dec = Decoder::new(SAMPLE_RATE, Channels::Mono).unwrap();
+        let mut pcm = vec![0i16; FRAME_SAMPLES];
+        let mut q = Quality::Standard;
+        for (k, next) in [
+            Quality::Studio,
+            Quality::Low,
+            Quality::High,
+            Quality::Standard,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for j in 0..10 {
+                let n = enc.encode(&frame(k * 10 + j), &mut out).unwrap();
+                dec.decode(&out[..n], &mut pcm, false).unwrap();
+            }
+            requality(&mut enc, q, next);
+            q = next;
+        }
     }
 
     fn jitter() -> Jitter {

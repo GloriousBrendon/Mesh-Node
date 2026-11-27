@@ -41,6 +41,8 @@ mod codes;
 #[cfg_attr(not(test), allow(dead_code))]
 mod decode;
 mod e2ee;
+mod fx;
+mod fxscan;
 mod helper;
 mod knocks;
 mod maillog;
