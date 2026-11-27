@@ -267,6 +267,11 @@ impl Helper {
                     if let Some(o) = v["output"].as_u64() {
                         a.output = (o as u32).min(200);
                     }
+                    // `low`, `standard`, `high` or `studio` (SPEC-voice-quality).
+                    if let Some(q) = v["quality"].as_str() {
+                        a.quality = crate::media::Quality::parse(q)
+                            .ok_or_else(|| Fail("bad-args", "quality: low, standard, high or studio".into()))?;
+                    }
                     let audio = *a;
                     if let Some(m) = self.calls.current.as_ref().and_then(|c| c.media.as_ref()) {
                         m.set_audio(audio);
