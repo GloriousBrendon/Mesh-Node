@@ -5,7 +5,9 @@ use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
-use clack_extensions::gui::{GuiApiType, GuiConfiguration, PluginGui, Window};
+#[cfg(target_os = "linux")]
+use clack_extensions::gui::Window;
+use clack_extensions::gui::{GuiApiType, GuiConfiguration, PluginGui};
 use clack_extensions::latency::PluginLatency;
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState;
@@ -242,7 +244,9 @@ impl Instance {
     /// Its state, as the plugin saves it (CLAP's `state` extension).
     pub fn state(&mut self) -> Result<Vec<u8>, String> {
         let h = self.instance.plugin_handle();
-        let ext = h.get_extension::<PluginState>().ok_or("no state extension")?;
+        let ext = h
+            .get_extension::<PluginState>()
+            .ok_or("no state extension")?;
         let mut out = Vec::new();
         ext.save(&h, &mut out).map_err(|e| format!("save: {e:?}"))?;
         Ok(out)
@@ -251,8 +255,11 @@ impl Instance {
     /// Loads a saved state.
     pub fn set_state(&mut self, bytes: &[u8]) -> Result<(), String> {
         let h = self.instance.plugin_handle();
-        let ext = h.get_extension::<PluginState>().ok_or("no state extension")?;
-        ext.load(&h, &mut &bytes[..]).map_err(|e| format!("load: {e:?}"))
+        let ext = h
+            .get_extension::<PluginState>()
+            .ok_or("no state extension")?;
+        ext.load(&h, &mut &bytes[..])
+            .map_err(|e| format!("load: {e:?}"))
     }
 
     /// Its parameters: `{id, name, min, max, value}`, plain values.
@@ -276,7 +283,8 @@ impl Instance {
     /// Sets a parameter (a plain value): it goes in with the next block.
     pub fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
         let id = ClapId::from_raw(id).ok_or("bad parameter id")?;
-        let event = clack_host::events::event_types::ParamValueEvent::new(0, id, Pckn::match_all(), value);
+        let event =
+            clack_host::events::event_types::ParamValueEvent::new(0, id, Pckn::match_all(), value);
         match self.running.as_mut() {
             Some(r) => {
                 r.events_in.push(&event);
@@ -318,20 +326,31 @@ impl Instance {
         }
         let api = GuiApiType::default_for_current_platform().ok_or("no GUI API here")?;
         let h = self.instance.plugin_handle();
-        let gui = h.get_extension::<PluginGui>().ok_or("plugin has no editor")?;
-        let floating = GuiConfiguration { api_type: api, is_floating: true };
-        let embedded = GuiConfiguration { api_type: api, is_floating: false };
+        let gui = h
+            .get_extension::<PluginGui>()
+            .ok_or("plugin has no editor")?;
+        let floating = GuiConfiguration {
+            api_type: api,
+            is_floating: true,
+        };
+        let embedded = GuiConfiguration {
+            api_type: api,
+            is_floating: false,
+        };
         #[cfg(target_os = "linux")]
         let mut parent = None;
         let how = if gui.is_api_supported(&h, floating) {
-            gui.create(&h, floating).map_err(|e| format!("create floating: {e:?}"))?;
+            gui.create(&h, floating)
+                .map_err(|e| format!("create floating: {e:?}"))?;
             gui.suggest_title(&h, c"Aflos plugin");
             "floating"
         } else if gui.is_api_supported(&h, embedded) {
-            gui.create(&h, embedded).map_err(|e| format!("create embedded: {e:?}"))?;
-            let size = gui
-                .get_size(&h)
-                .unwrap_or(clack_extensions::gui::GuiSize { width: 800, height: 500 });
+            gui.create(&h, embedded)
+                .map_err(|e| format!("create embedded: {e:?}"))?;
+            let size = gui.get_size(&h).unwrap_or(clack_extensions::gui::GuiSize {
+                width: 800,
+                height: 500,
+            });
             #[cfg(target_os = "linux")]
             {
                 let x = crate::x11::Parent::new(size.width as u16, size.height as u16)?;
@@ -345,6 +364,7 @@ impl Instance {
                 let _ = size;
                 return Err("embedded CLAP editors are Linux-only for now".into());
             }
+            #[cfg(target_os = "linux")]
             "embedded"
         } else {
             return Err("no supported editor API".into());

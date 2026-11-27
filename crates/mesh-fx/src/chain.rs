@@ -127,7 +127,10 @@ impl Chain {
             let mut plugin = Plugin::open(path, id)
                 .and_then(|mut plugin| plugin.start().map(|()| plugin))
                 .map_err(|e| format!("{id}: {e}"))?;
-            let state = p["state"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
+            let state = p["state"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
             if let Some(file) = &state
                 && let Ok(bytes) = std::fs::read(file)
                 && let Err(e) = plugin.set_state(&bytes)
@@ -158,7 +161,10 @@ impl Chain {
 
 impl Chain {
     fn slot(&mut self, at: usize) -> Result<&mut Slot, String> {
-        self.0.iter_mut().find(|s| s.at == at).ok_or_else(|| "no such plugin on".to_owned())
+        self.0
+            .iter_mut()
+            .find(|s| s.at == at)
+            .ok_or_else(|| "no such plugin on".to_owned())
     }
 
     /// Writes each plugin's state to its file (through a temporary file,
@@ -170,7 +176,9 @@ impl Chain {
             match slot.plugin.state() {
                 Ok(bytes) => {
                     let tmp = file.with_extension("tmp");
-                    let written = file.parent().map_or(Ok(()), std::fs::create_dir_all)
+                    let written = file
+                        .parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
                         .and_then(|()| std::fs::write(&tmp, &bytes))
                         .and_then(|()| std::fs::rename(&tmp, file));
                     match written {

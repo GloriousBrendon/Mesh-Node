@@ -27,7 +27,8 @@ impl Shared {
         f32::from_bits(self.db.load(Ordering::Relaxed))
     }
     fn set_db(&self, db: f64) {
-        self.db.store((db.clamp(-60.0, 24.0) as f32).to_bits(), Ordering::Relaxed);
+        self.db
+            .store((db.clamp(-60.0, 24.0) as f32).to_bits(), Ordering::Relaxed);
     }
     fn take(&self, events: &InputEvents) {
         for e in events {
@@ -63,7 +64,8 @@ impl DefaultPluginFactory for TestGain {
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
         let s = Shared {
             db: AtomicU32::new(0f32.to_bits()),
-            sleep: env("MESH_FX_TEST_SLEEP_MS").map(|ms| Duration::from_micros((ms * 1000.0) as u64)),
+            sleep: env("MESH_FX_TEST_SLEEP_MS")
+                .map(|ms| Duration::from_micros((ms * 1000.0) as u64)),
         };
         s.set_db(env("MESH_FX_TEST_GAIN_DB").unwrap_or(0.0));
         Ok(s)
@@ -105,13 +107,23 @@ impl PluginMainThreadParams for Main<'_> {
         (id.get() == GAIN).then(|| f64::from(self.0.db()))
     }
 
-    fn value_to_text(&self, _id: ClapId, value: f64, writer: &mut ParamDisplayWriter) -> std::fmt::Result {
+    fn value_to_text(
+        &self,
+        _id: ClapId,
+        value: f64,
+        writer: &mut ParamDisplayWriter,
+    ) -> std::fmt::Result {
         use std::fmt::Write as _;
         write!(writer, "{value:.1} dB")
     }
 
     fn text_to_value(&self, _id: ClapId, text: &CStr) -> Option<f64> {
-        text.to_str().ok()?.trim_end_matches(" dB").trim().parse().ok()
+        text.to_str()
+            .ok()?
+            .trim_end_matches(" dB")
+            .trim()
+            .parse()
+            .ok()
     }
 
     fn flush(&self, input: &InputEvents, _output: &mut OutputEvents) {
@@ -149,14 +161,21 @@ impl<'a> PluginAudioProcessor<'a, Shared, Main<'a>> for Processor<'a> {
         Ok(Self(shared))
     }
 
-    fn process(&mut self, _process: Process, mut audio: Audio, events: Events) -> Result<ProcessStatus, PluginError> {
+    fn process(
+        &mut self,
+        _process: Process,
+        mut audio: Audio,
+        events: Events,
+    ) -> Result<ProcessStatus, PluginError> {
         self.0.take(events.input);
         if let Some(d) = self.0.sleep {
             std::thread::sleep(d);
         }
         let g = 10f32.powf(self.0.db() / 20.0);
         for mut port in &mut audio {
-            let Some(channels) = port.channels()?.into_f32() else { continue };
+            let Some(channels) = port.channels()?.into_f32() else {
+                continue;
+            };
             for pair in channels {
                 match pair {
                     ChannelPair::InputOnly(_) => {}

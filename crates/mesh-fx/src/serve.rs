@@ -60,7 +60,8 @@ pub fn serve(r: impl Read + Send + 'static, mut w: impl Write) -> io::Result<()>
                 let v: Value = serde_json::from_slice(&json)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let at = v["plugin"].as_u64().unwrap_or(u64::MAX) as usize;
-                let on = |f: &mut dyn FnMut(&mut Chain) -> Result<Value, String>, chain: &mut Option<Chain>| {
+                let on = |f: &mut dyn FnMut(&mut Chain) -> Result<Value, String>,
+                          chain: &mut Option<Chain>| {
                     match chain.as_mut() {
                         Some(c) => f(c).unwrap_or_else(|e| json!({ "error": e })),
                         None => json!({ "error": "no chain" }),
@@ -80,7 +81,10 @@ pub fn serve(r: impl Read + Send + 'static, mut w: impl Write) -> io::Result<()>
                     Some("save") => on(&mut |c| Ok(json!({ "saved": c.save() })), &mut chain),
                     Some("params") => on(&mut |c| c.params(at), &mut chain),
                     Some("param") => {
-                        let (id, value) = (v["param"].as_u64().unwrap_or(u64::MAX) as u32, v["value"].as_f64().unwrap_or(0.0));
+                        let (id, value) = (
+                            v["param"].as_u64().unwrap_or(u64::MAX) as u32,
+                            v["value"].as_f64().unwrap_or(0.0),
+                        );
                         on(&mut |c| c.set_param(at, id, value), &mut chain)
                     }
                     Some("edit") => on(&mut |c| c.edit(at), &mut chain),

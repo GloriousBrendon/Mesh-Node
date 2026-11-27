@@ -300,15 +300,22 @@ impl IParameterChangesTrait for Changes {
         self.0.len() as int32
     }
     unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
-        self.0.get(index as usize).map_or(ptr::null_mut(), ComPtr::as_ptr)
+        self.0
+            .get(index as usize)
+            .map_or(ptr::null_mut(), ComPtr::as_ptr)
     }
-    unsafe fn addParameterData(&self, _id: *const ParamID, _index: *mut int32) -> *mut IParamValueQueue {
+    unsafe fn addParameterData(
+        &self,
+        _id: *const ParamID,
+        _index: *mut int32,
+    ) -> *mut IParamValueQueue {
         ptr::null_mut()
     }
 }
 
 /// The editor's frame; on Linux also the run loop the editor drives its UI with.
 #[derive(Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Frame {
     #[cfg(target_os = "linux")]
     fds: Mutex<Vec<(ComPtr<Linux::IEventHandler>, i32)>>,
@@ -701,7 +708,10 @@ impl Instance {
 
     /// Loads a state `state` made; the controller follows the component's.
     pub fn set_state(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let n = bytes.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("short state")?;
+        let n = bytes
+            .get(..4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+            .ok_or("short state")?;
         let component = bytes.get(4..4 + n).ok_or("short state")?;
         let controller = &bytes[4 + n..];
         let s = stream(component.to_vec());
@@ -724,7 +734,9 @@ impl Instance {
 
     /// Its parameters: `{id, name, min: 0, max: 1, value}` (normalized).
     pub fn params(&mut self) -> Vec<serde_json::Value> {
-        let Some(c) = &self.controller else { return Vec::new() };
+        let Some(c) = &self.controller else {
+            return Vec::new();
+        };
         let count = unsafe { c.getParameterCount() };
         (0..count)
             .filter_map(|i| {
@@ -733,7 +745,7 @@ impl Instance {
                     return None;
                 }
                 let name = String::from_utf16_lossy(
-                    &info.title.iter().take_while(|&&ch| ch != 0).map(|&ch| ch as u16).collect::<Vec<_>>(),
+                    &info.title.iter().take_while(|&&ch| ch != 0).copied().collect::<Vec<_>>(),
                 );
                 let value = unsafe { c.getParamNormalized(info.id) };
                 Some(serde_json::json!({ "id": info.id, "name": name, "min": 0.0, "max": 1.0, "value": value }))
@@ -766,12 +778,24 @@ impl Instance {
         }
         let frame = ComWrapper::new(Frame::default());
         unsafe { view.setFrame(frame.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()) };
-        let mut rect = ViewRect { left: 0, top: 0, right: 800, bottom: 500 };
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 500,
+        };
         unsafe { view.getSize(&mut rect) };
-        let (w, h) = ((rect.right - rect.left).max(1), (rect.bottom - rect.top).max(1));
+        let (w, h) = (
+            (rect.right - rect.left).max(1),
+            (rect.bottom - rect.top).max(1),
+        );
         let parent = crate::x11::Parent::new(w as u16, h as u16)?;
-        if unsafe { view.attached(parent.id as usize as *mut c_void, kPlatformTypeX11EmbedWindowID) }
-            != kResultOk
+        if unsafe {
+            view.attached(
+                parent.id as usize as *mut c_void,
+                kPlatformTypeX11EmbedWindowID,
+            )
+        } != kResultOk
         {
             return Err("attached failed".into());
         }

@@ -11,12 +11,12 @@
 #![allow(non_snake_case)]
 
 use std::cell::Cell;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{ptr, slice};
 
-use vst3::{uid, Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
+use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*, uid};
 
 fn copy_cstring(src: &str, dst: &mut [c_char]) {
     let c_string = CString::new(src).unwrap_or_else(|_| CString::default());
@@ -69,7 +69,10 @@ impl Class for GainProcessor {
 
 /// The normalized gain `MESH_FX_TEST_GAIN_DB` asks for.
 fn start_gain() -> f64 {
-    let db: f64 = std::env::var("MESH_FX_TEST_GAIN_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let db: f64 = std::env::var("MESH_FX_TEST_GAIN_DB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
     (10f64.powf(db / 20.0) / 4.0).clamp(0.0, 1.0)
 }
 
@@ -79,7 +82,9 @@ unsafe fn read_f64(stream: *mut IBStream) -> Option<f64> {
     let mut b = [0u8; 8];
     let mut n = 0;
     let ok = unsafe { s.read(b.as_mut_ptr().cast(), 8, &mut n) };
-    (ok == kResultOk && n == 8).then(|| f64::from_le_bytes(b)).filter(|v| v.is_finite())
+    (ok == kResultOk && n == 8)
+        .then(|| f64::from_le_bytes(b))
+        .filter(|v| v.is_finite())
 }
 
 impl GainProcessor {
@@ -195,7 +200,8 @@ impl IComponentTrait for GainProcessor {
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
         match unsafe { read_f64(state) } {
             Some(g) => {
-                self.gain.store(g.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+                self.gain
+                    .store(g.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
                 kResultOk
             }
             None => kResultFalse,
@@ -310,7 +316,10 @@ impl IAudioProcessorTrait for GainProcessor {
             }
         }
 
-        if let Some(ms) = std::env::var("MESH_FX_TEST_SLEEP_MS").ok().and_then(|v| v.parse::<f64>().ok()) {
+        if let Some(ms) = std::env::var("MESH_FX_TEST_SLEEP_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
             std::thread::sleep(std::time::Duration::from_micros((ms * 1000.0) as u64));
         }
         let gain = 4.0 * f64::from_bits(self.gain.load(Ordering::Relaxed)) as f32;

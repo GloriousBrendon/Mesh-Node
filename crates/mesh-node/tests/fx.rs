@@ -20,7 +20,10 @@ const PASSWORD: &str = "correct horse battery staple";
 /// mesh-fx is copied under a name of this test's own, so killing it hits
 /// nothing else.
 fn built(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let bin = Path::new(env!("CARGO_BIN_EXE_mesh-node")).parent().unwrap().to_owned();
+    let bin = Path::new(env!("CARGO_BIN_EXE_mesh-node"))
+        .parent()
+        .unwrap()
+        .to_owned();
     let ok = Command::new(env!("CARGO"))
         .args(["build", "-q", "-p", "mesh-fx", "--bin", "mesh-fx"])
         .args(["--example", "test_gain_clap", "--example", "test_gain_vst3"])
@@ -35,7 +38,11 @@ fn built(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let vst3 = dir.join("test-gain.vst3");
     let lib = vst3.join("Contents/x86_64-linux");
     std::fs::create_dir_all(&lib).unwrap();
-    std::fs::copy(bin.join("examples/libtest_gain_vst3.so"), lib.join("test-gain.so")).unwrap();
+    std::fs::copy(
+        bin.join("examples/libtest_gain_vst3.so"),
+        lib.join("test-gain.so"),
+    )
+    .unwrap();
     (fx, clap, vst3)
 }
 
@@ -87,7 +94,10 @@ fn level(h: &mut Helper) -> f64 {
 }
 
 fn near(got: f64, want: f64, what: &str) {
-    assert!((got - want).abs() <= 1.0, "{what}: {got:.2} dBFS, wanted {want:.2} ±1");
+    assert!(
+        (got - want).abs() <= 1.0,
+        "{what}: {got:.2} dBFS, wanted {want:.2} ±1"
+    );
 }
 
 fn chain(h: &mut Helper, plugins: Value) {
@@ -102,7 +112,10 @@ fn plugins_change_the_voice_keep_their_state_and_never_stall_it() {
     let (fx, clap, vst3) = built(&dir);
     let fx_s = fx.to_str().unwrap().to_owned();
     let mut a = helper(&dir.join("a"), &relay, &[("MESH_FX", &fx_s)]);
-    a.send("callAudio", &[r#"{"gain": false, "noise": false, "echo": false}"#]);
+    a.send(
+        "callAudio",
+        &[r#"{"gain": false, "noise": false, "echo": false}"#],
+    );
     a.send("audioTest", &["on"]);
     let dry = level(&mut a);
 
@@ -144,8 +157,15 @@ fn plugins_change_the_voice_keep_their_state_and_never_stall_it() {
     near(level(&mut a), dry, "a damaged state ignored");
 
     // The VST3 gain: normalized 0.5 is twice as loud, +6 dB.
-    let out = Command::new(&fx).args(["list", vst3.to_str().unwrap()]).output().unwrap();
-    let id = String::from_utf8_lossy(&out.stdout).split('\t').next().unwrap().to_owned();
+    let out = Command::new(&fx)
+        .args(["list", vst3.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let id = String::from_utf8_lossy(&out.stdout)
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_owned();
     chain(&mut a, json!([{ "path": vst3, "id": id, "on": true }]));
     fx_until(&mut a, "VST3 on", |v| v["state"] == "on");
     near(level(&mut a), dry, "through the VST3 plugin at 0 dB");
@@ -155,7 +175,10 @@ fn plugins_change_the_voice_keep_their_state_and_never_stall_it() {
 
     // mesh-fx killed mid-stream: bypassed at once, and the voice goes on dry.
     let killed = Instant::now();
-    Command::new("pkill").args(["-f", "mesh-fx-under-test serve"]).status().unwrap();
+    Command::new("pkill")
+        .args(["-f", "mesh-fx-under-test serve"])
+        .status()
+        .unwrap();
     fx_until(&mut a, "bypassed", |v| v["state"] == "bypassed");
     let took = killed.elapsed();
     assert!(took < Duration::from_millis(500), "bypassed after {took:?}");
@@ -163,11 +186,24 @@ fn plugins_change_the_voice_keep_their_state_and_never_stall_it() {
     let _ = a.quit();
 
     // A plugin that takes 50 ms a block: bypassed as too slow.
-    let mut b = helper(&dir.join("b"), &relay, &[("MESH_FX", &fx_s), ("MESH_FX_TEST_SLEEP_MS", "50")]);
-    b.send("callAudio", &[r#"{"gain": false, "noise": false, "echo": false}"#]);
+    let mut b = helper(
+        &dir.join("b"),
+        &relay,
+        &[("MESH_FX", &fx_s), ("MESH_FX_TEST_SLEEP_MS", "50")],
+    );
+    b.send(
+        "callAudio",
+        &[r#"{"gain": false, "noise": false, "echo": false}"#],
+    );
     b.send("audioTest", &["on"]);
-    chain(&mut b, json!([{ "path": clap, "id": "aflos.test.gain", "on": true }]));
+    chain(
+        &mut b,
+        json!([{ "path": clap, "id": "aflos.test.gain", "on": true }]),
+    );
     let bypassed = fx_until(&mut b, "too slow", |v| v["state"] == "bypassed");
-    assert!(bypassed["error"].as_str().unwrap().contains("too slow"), "{bypassed}");
+    assert!(
+        bypassed["error"].as_str().unwrap().contains("too slow"),
+        "{bypassed}"
+    );
     let _ = b.quit();
 }

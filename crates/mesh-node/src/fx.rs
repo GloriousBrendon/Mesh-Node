@@ -275,13 +275,17 @@ impl Runner {
         }
         let Some(fx) = self.fx.as_mut() else {
             for c in controls {
-                report(json!({ "answer": { "cmd": c["cmd"], "plugin": c["plugin"], "error": "the plugins aren't running" } }));
+                report(
+                    json!({ "answer": { "cmd": c["cmd"], "plugin": c["plugin"], "error": "the plugins aren't running" } }),
+                );
             }
             return;
         };
         for c in controls {
             if fx.send_control(c.clone()).is_err() {
-                report(json!({ "answer": { "cmd": c["cmd"], "plugin": c["plugin"], "error": "busy; try again" } }));
+                report(
+                    json!({ "answer": { "cmd": c["cmd"], "plugin": c["plugin"], "error": "busy; try again" } }),
+                );
             }
         }
         // The wait mustn't hold up the other tasks on this runtime thread.
@@ -416,7 +420,9 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(2);
         while Instant::now() < until {
             let mut frame = vec![9i16; FRAME];
-            r.step(&mut frame, version, plugins, Vec::new(), &|v| got.borrow_mut().push(v));
+            r.step(&mut frame, version, plugins, Vec::new(), &|v| {
+                got.borrow_mut().push(v)
+            });
             assert_eq!(
                 frame,
                 vec![9i16; FRAME],
@@ -445,7 +451,9 @@ mod tests {
         let got = std::cell::RefCell::new(Vec::new());
         for _ in 0..20 {
             let mut frame = vec![3i16; FRAME];
-            r.step(&mut frame, 1, &on(), Vec::new(), &|v| got.borrow_mut().push(v));
+            r.step(&mut frame, 1, &on(), Vec::new(), &|v| {
+                got.borrow_mut().push(v)
+            });
         }
         assert!(got.borrow().is_empty(), "{:?}", got.borrow());
         assert!(r.fx.is_some());
@@ -462,7 +470,9 @@ mod tests {
         for k in 0..3 {
             let mut frame = vec![4i16; FRAME];
             let started = Instant::now();
-            r.step(&mut frame, 1, &on(), Vec::new(), &|v| got.borrow_mut().push(v));
+            r.step(&mut frame, 1, &on(), Vec::new(), &|v| {
+                got.borrow_mut().push(v)
+            });
             assert!(started.elapsed() < Duration::from_millis(200));
             assert_eq!(frame, vec![4i16; FRAME], "late: sent dry");
             assert_eq!(

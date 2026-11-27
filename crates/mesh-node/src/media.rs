@@ -634,7 +634,8 @@ impl Chain {
         // A person's own plugins: after echo and noise, before gain (F3).
         let (version, plugins) = lock(&shared.fx).clone();
         let controls = std::mem::take(&mut *lock(&shared.fx_controls));
-        self.fx.step(frame, version, &plugins, controls, &*shared.fx_report);
+        self.fx
+            .step(frame, version, &plugins, controls, &*shared.fx_report);
         if audio.gain {
             self.agc.process(frame);
         }
@@ -987,7 +988,9 @@ mod tests {
         let mut out = vec![0u8; 1500];
         let mut average = |q: Quality| {
             let mut enc = encoder_for(q).unwrap();
-            let sizes: Vec<usize> = (0..100).map(|k| enc.encode(&frame(k), &mut out).unwrap()).collect();
+            let sizes: Vec<usize> = (0..100)
+                .map(|k| enc.encode(&frame(k), &mut out).unwrap())
+                .collect();
             sizes[20..].iter().sum::<usize>() as f64 / 80.0
         };
         let ratio = average(Quality::Studio) / average(Quality::Standard);
@@ -997,7 +1000,15 @@ mod tests {
         let mut dec = Decoder::new(SAMPLE_RATE, Channels::Mono).unwrap();
         let mut pcm = vec![0i16; FRAME_SAMPLES];
         let mut q = Quality::Standard;
-        for (k, next) in [Quality::Studio, Quality::Low, Quality::High, Quality::Standard].into_iter().enumerate() {
+        for (k, next) in [
+            Quality::Studio,
+            Quality::Low,
+            Quality::High,
+            Quality::Standard,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             for j in 0..10 {
                 let n = enc.encode(&frame(k * 10 + j), &mut out).unwrap();
                 dec.decode(&out[..n], &mut pcm, false).unwrap();
