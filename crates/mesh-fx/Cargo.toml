@@ -25,3 +25,16 @@ x11rb = "0.14"
 [target.'cfg(unix)'.dependencies]
 # poll(2) for the VST3 run loop; dup(2) to keep plugins off the protocol's stdout.
 libc = "0.2"
+
+# The test plugins (Task 7): built as libraries for mesh-fx's process tests.
+[dev-dependencies]
+clack-plugin = "0.2.0"
+clack-extensions = { version = "0.2.0", features = ["clack-plugin", "params", "state"] }
+
+[[example]]
+name = "test_gain_clap"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "test_gain_vst3"
+crate-type = ["cdylib"]

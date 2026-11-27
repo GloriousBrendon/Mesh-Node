@@ -836,6 +836,7 @@ dependencies = [
  "bitflags 2.13.2",
  "clack-common",
  "clack-host",
+ "clack-plugin",
  "clap-sys",
 ]
 
@@ -849,6 +850,16 @@ dependencies = [
  "clap-sys",
  "libloading",
  "objc2-foundation",
+]
+
+[[package]]
+name = "clack-plugin"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d36954ed91d485b42f8329b12618e6ec398cc806a8e1f5ae8a50ccaba1d9b94f"
+dependencies = [
+ "clack-common",
+ "clap-sys",
 ]
 
 [[package]]
@@ -2776,6 +2787,7 @@ version = "0.1.0"
 dependencies = [
  "clack-extensions",
  "clack-host",
+ "clack-plugin",
  "libc",
  "libloading",
  "serde_json",
