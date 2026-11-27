@@ -195,6 +195,118 @@ impl IComponentHandlerTrait for Handler {
     }
 }
 
+/// A state in memory, as plugins read and write it (Task 5).
+#[derive(Default)]
+struct MemStream(Mutex<(Vec<u8>, usize)>);
+
+impl Class for MemStream {
+    type Interfaces = (IBStream,);
+}
+
+impl IBStreamTrait for MemStream {
+    unsafe fn read(&self, buffer: *mut c_void, n: int32, read: *mut int32) -> tresult {
+        let mut s = self.0.lock().unwrap();
+        let (data, pos) = &mut *s;
+        let take = (n.max(0) as usize).min(data.len().saturating_sub(*pos));
+        unsafe { ptr::copy_nonoverlapping(data[*pos..].as_ptr(), buffer.cast(), take) };
+        *pos += take;
+        if !read.is_null() {
+            unsafe { *read = take as int32 };
+        }
+        kResultOk
+    }
+
+    unsafe fn write(&self, buffer: *mut c_void, n: int32, written: *mut int32) -> tresult {
+        let mut s = self.0.lock().unwrap();
+        let (data, pos) = &mut *s;
+        let n = n.max(0) as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
+        if data.len() < *pos + n {
+            data.resize(*pos + n, 0);
+        }
+        data[*pos..*pos + n].copy_from_slice(bytes);
+        *pos += n;
+        if !written.is_null() {
+            unsafe { *written = n as int32 };
+        }
+        kResultOk
+    }
+
+    unsafe fn seek(&self, to: int64, mode: int32, result: *mut int64) -> tresult {
+        let mut s = self.0.lock().unwrap();
+        let (data, pos) = &mut *s;
+        let base = match mode {
+            0 => 0,
+            1 => *pos as i64,
+            _ => data.len() as i64,
+        };
+        *pos = (base + to).clamp(0, data.len() as i64) as usize;
+        if !result.is_null() {
+            unsafe { *result = *pos as int64 };
+        }
+        kResultOk
+    }
+
+    unsafe fn tell(&self, at: *mut int64) -> tresult {
+        if !at.is_null() {
+            unsafe { *at = self.0.lock().unwrap().1 as int64 };
+        }
+        kResultOk
+    }
+}
+
+fn stream(bytes: Vec<u8>) -> ComWrapper<MemStream> {
+    ComWrapper::new(MemStream(Mutex::new((bytes, 0))))
+}
+
+/// One parameter's change for the next block: a single point at its start.
+struct Queue(ParamID, ParamValue);
+
+impl Class for Queue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for Queue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.0
+    }
+    unsafe fn getPointCount(&self) -> int32 {
+        1
+    }
+    unsafe fn getPoint(&self, index: int32, offset: *mut int32, value: *mut ParamValue) -> tresult {
+        if index != 0 {
+            return kInvalidArgument;
+        }
+        unsafe {
+            *offset = 0;
+            *value = self.1;
+        }
+        kResultOk
+    }
+    unsafe fn addPoint(&self, _offset: int32, _value: ParamValue, _index: *mut int32) -> tresult {
+        kResultFalse
+    }
+}
+
+/// The parameter changes a block carries in.
+struct Changes(Vec<ComPtr<IParamValueQueue>>);
+
+impl Class for Changes {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for Changes {
+    unsafe fn getParameterCount(&self) -> int32 {
+        self.0.len() as int32
+    }
+    unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
+        self.0.get(index as usize).map_or(ptr::null_mut(), ComPtr::as_ptr)
+    }
+    unsafe fn addParameterData(&self, _id: *const ParamID, _index: *mut int32) -> *mut IParamValueQueue {
+        ptr::null_mut()
+    }
+}
+
 /// The editor's frame; on Linux also the run loop the editor drives its UI with.
 #[derive(Default)]
 struct Frame {
@@ -332,6 +444,11 @@ pub struct Instance {
     buses: (Vec<usize>, Vec<usize>),
     /// Input and output buffers while processing.
     running: Option<(Buses, Buses)>,
+    /// Parameter changes for the next block (normalized values).
+    pending: Vec<(ParamID, ParamValue)>,
+    /// Its editor while it's open: the view, its frame, our window.
+    #[cfg(target_os = "linux")]
+    editor: Option<(ComPtr<IPlugView>, ComWrapper<Frame>, crate::x11::Parent)>,
     _module: Module,
 }
 
@@ -421,12 +538,16 @@ pub fn open(path: &str, id: &str) -> Result<Instance, String> {
         _handler: handler,
         buses,
         running: None,
+        pending: Vec::new(),
+        #[cfg(target_os = "linux")]
+        editor: None,
         _module: module,
     })
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        self.close_editor();
         self.stop();
         unsafe {
             if let Some((a, b)) = &self.points {
@@ -496,6 +617,13 @@ impl Instance {
                 channelBuffers32: p.as_mut_ptr(),
             },
         };
+        // Parameter changes set since the last block go in with this one.
+        let queues = std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter_map(|(id, v)| ComWrapper::new(Queue(id, v)).to_com_ptr::<IParamValueQueue>())
+            .collect();
+        let changes = ComWrapper::new(Changes(queues));
+        let changes_ptr = changes.to_com_ptr::<IParameterChanges>().unwrap();
         let mut in_bufs: Vec<AudioBusBuffers> = in_ptrs.iter_mut().map(bus).collect();
         let mut out_bufs: Vec<AudioBusBuffers> = out_ptrs.iter_mut().map(bus).collect();
         let mut data = ProcessData {
@@ -506,7 +634,7 @@ impl Instance {
             numOutputs: out_bufs.len() as i32,
             inputs: in_bufs.as_mut_ptr(),
             outputs: out_bufs.as_mut_ptr(),
-            inputParameterChanges: ptr::null_mut(),
+            inputParameterChanges: changes_ptr.as_ptr(),
             outputParameterChanges: ptr::null_mut(),
             inputEvents: ptr::null_mut(),
             outputEvents: ptr::null_mut(),
@@ -549,9 +677,87 @@ impl Instance {
         Ok((out, times))
     }
 
-    /// Opens its editor for `secs`, embedded in an X11 window, pumping its run loop.
+    /// Its state: the component's, then the controller's, each with its
+    /// length first (u32 LE).
+    pub fn state(&mut self) -> Result<Vec<u8>, String> {
+        let get = |f: &dyn Fn(*mut IBStream) -> tresult| -> Result<Vec<u8>, String> {
+            let s = stream(Vec::new());
+            let p = s.to_com_ptr::<IBStream>().unwrap();
+            if f(p.as_ptr()) != kResultOk {
+                return Err("getState failed".into());
+            }
+            Ok(s.0.lock().unwrap().0.clone())
+        };
+        let component = get(&|p| unsafe { self.component.getState(p) })?;
+        let controller = match (&self.controller, self.separate) {
+            (Some(c), true) => get(&|p| unsafe { c.getState(p) }).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut out = (component.len() as u32).to_le_bytes().to_vec();
+        out.extend(component);
+        out.extend(controller);
+        Ok(out)
+    }
+
+    /// Loads a state `state` made; the controller follows the component's.
+    pub fn set_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let n = bytes.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("short state")?;
+        let component = bytes.get(4..4 + n).ok_or("short state")?;
+        let controller = &bytes[4 + n..];
+        let s = stream(component.to_vec());
+        let p = s.to_com_ptr::<IBStream>().unwrap();
+        if unsafe { self.component.setState(p.as_ptr()) } != kResultOk {
+            return Err("setState failed".into());
+        }
+        if let Some(c) = &self.controller {
+            let s = stream(component.to_vec());
+            let p = s.to_com_ptr::<IBStream>().unwrap();
+            unsafe { c.setComponentState(p.as_ptr()) };
+            if self.separate && !controller.is_empty() {
+                let s = stream(controller.to_vec());
+                let p = s.to_com_ptr::<IBStream>().unwrap();
+                unsafe { c.setState(p.as_ptr()) };
+            }
+        }
+        Ok(())
+    }
+
+    /// Its parameters: `{id, name, min: 0, max: 1, value}` (normalized).
+    pub fn params(&mut self) -> Vec<serde_json::Value> {
+        let Some(c) = &self.controller else { return Vec::new() };
+        let count = unsafe { c.getParameterCount() };
+        (0..count)
+            .filter_map(|i| {
+                let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                if unsafe { c.getParameterInfo(i, &mut info) } != kResultOk {
+                    return None;
+                }
+                let name = String::from_utf16_lossy(
+                    &info.title.iter().take_while(|&&ch| ch != 0).map(|&ch| ch as u16).collect::<Vec<_>>(),
+                );
+                let value = unsafe { c.getParamNormalized(info.id) };
+                Some(serde_json::json!({ "id": info.id, "name": name, "min": 0.0, "max": 1.0, "value": value }))
+            })
+            .collect()
+    }
+
+    /// Sets a parameter (normalized, 0 to 1): on the controller now, and to
+    /// the processor with the next block.
+    pub fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+        let value = value.clamp(0.0, 1.0);
+        if let Some(c) = &self.controller {
+            unsafe { c.setParamNormalized(id, value) };
+        }
+        self.pending.push((id, value));
+        Ok(())
+    }
+
+    /// Opens its editor embedded in an X11 window; `pump` keeps it alive.
     #[cfg(target_os = "linux")]
-    pub fn edit(&mut self, secs: u64) -> Result<String, String> {
+    pub fn open_editor(&mut self) -> Result<String, String> {
+        if self.editor.is_some() {
+            return Ok("already open".into());
+        }
         let c = self.controller.as_ref().ok_or("no edit controller")?;
         let view = unsafe { ComPtr::from_raw(c.createView(c"editor".as_ptr())) }
             .ok_or("no editor view")?;
@@ -560,47 +766,63 @@ impl Instance {
         }
         let frame = ComWrapper::new(Frame::default());
         unsafe { view.setFrame(frame.to_com_ptr::<IPlugFrame>().unwrap().as_ptr()) };
-        let mut rect = ViewRect {
-            left: 0,
-            top: 0,
-            right: 800,
-            bottom: 500,
-        };
+        let mut rect = ViewRect { left: 0, top: 0, right: 800, bottom: 500 };
         unsafe { view.getSize(&mut rect) };
-        let (w, h) = (
-            (rect.right - rect.left).max(1),
-            (rect.bottom - rect.top).max(1),
-        );
+        let (w, h) = ((rect.right - rect.left).max(1), (rect.bottom - rect.top).max(1));
         let parent = crate::x11::Parent::new(w as u16, h as u16)?;
-        if unsafe {
-            view.attached(
-                parent.id as usize as *mut c_void,
-                kPlatformTypeX11EmbedWindowID,
-            )
-        } != kResultOk
+        if unsafe { view.attached(parent.id as usize as *mut c_void, kPlatformTypeX11EmbedWindowID) }
+            != kResultOk
         {
             return Err("attached failed".into());
         }
+        self.editor = Some((view, frame, parent));
+        Ok(format!("embedded {w}x{h}"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn open_editor(&mut self) -> Result<String, String> {
+        Err("VST3 editors are Linux-only for now; use the parameters".into())
+    }
+
+    pub fn editor_open(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.editor.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// One turn of the editor's run loop and window events; true while open.
+    pub fn pump(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some((_, frame, parent)) = &self.editor {
+            frame.pump();
+            if parent.pump() {
+                return true;
+            }
+            self.close_editor();
+        }
+        false
+    }
+
+    pub fn close_editor(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some((view, _frame, _parent)) = self.editor.take() {
+            unsafe {
+                view.removed();
+                view.setFrame(ptr::null_mut());
+            }
+        }
+    }
+
+    /// Opens its editor for `secs` (the spike's `edit` command).
+    #[cfg(target_os = "linux")]
+    pub fn edit(&mut self, secs: u64) -> Result<String, String> {
+        let how = self.open_editor()?;
         let until = Instant::now() + Duration::from_secs(secs);
-        let (mut fds, mut ticks) = (0, 0);
-        while Instant::now() < until {
-            let (f, t) = frame.pump();
-            fds += f;
-            ticks += t;
-            parent.pump();
+        while Instant::now() < until && self.pump() {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let handlers = (
-            frame.fds.lock().unwrap().len(),
-            frame.timers.lock().unwrap().len(),
-        );
-        unsafe {
-            view.removed();
-            view.setFrame(ptr::null_mut());
-        }
-        Ok(format!(
-            "embedded editor {w}x{h}, run loop: {} fd handlers, {} timers, {fds} fd events, {ticks} timer ticks",
-            handlers.0, handlers.1
-        ))
+        self.close_editor();
+        Ok(format!("{how} editor for {secs} s"))
     }
 }

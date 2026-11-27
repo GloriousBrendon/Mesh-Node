@@ -14,6 +14,8 @@ mesh-identity.workspace = true
 mesh-transport.workspace = true
 postcard.workspace = true
 serde.workspace = true
+# Plugin state file names (voice-quality Task 5).
+blake3.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

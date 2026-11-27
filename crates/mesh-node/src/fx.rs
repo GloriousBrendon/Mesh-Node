@@ -42,11 +42,14 @@ pub fn mesh_fx_path() -> std::path::PathBuf {
 }
 
 pub struct Fx {
-    child: Child,
+    child: Option<Child>,
     to: SyncSender<Msg>,
     from: Receiver<Msg>,
     seq: u32,
     id: u64,
+    /// Control messages that came in while waiting for audio: answers to
+    /// `send_control`, and what mesh-fx says unasked (an editor closed).
+    replies: Vec<Value>,
 }
 
 impl Fx {
@@ -86,11 +89,12 @@ impl Fx {
                 // Dropping `got` here is what tells a waiting caller it's dead.
             })?;
         Ok(Fx {
-            child,
+            child: Some(child),
             to,
             from,
             seq: 0,
             id: 0,
+            replies: Vec::new(),
         })
     }
 
@@ -99,15 +103,33 @@ impl Fx {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
         self.send(Msg::Audio(seq, frame.to_vec()))?;
-        self.wait(within, |msg| match msg {
+        let mut replies = Vec::new();
+        let done = self.wait(within, |msg| match msg {
             Msg::Audio(s, pcm) if s == seq && pcm.len() == frame.len() => {
                 frame.copy_from_slice(&pcm);
                 Some(())
             }
-            // An earlier frame that came back late, or a control answer
-            // nobody waits for any more.
-            _ => None,
-        })
+            Msg::Control(json) => {
+                replies.extend(serde_json::from_slice::<Value>(&json).ok());
+                None
+            }
+            // An earlier frame that came back late.
+            Msg::Audio(..) => None,
+        });
+        self.replies.extend(replies);
+        done
+    }
+
+    /// Sends a control command without waiting: its answer turns up in
+    /// `take_replies` after a later frame.
+    pub fn send_control(&mut self, mut command: Value) -> Result<(), FxError> {
+        self.id += 1;
+        command["id"] = self.id.into();
+        self.send(Msg::Control(command.to_string().into_bytes()))
+    }
+
+    pub fn take_replies(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.replies)
     }
 
     /// Sends `command` (a JSON object) and waits for its answer.
@@ -206,12 +228,15 @@ impl Runner {
         }
     }
 
-    /// `frame` through the chain at `version` (`plugins`, `[{path, id, on}]`).
+    /// `frame` through the chain at `version` (`plugins`, `[{path, id, on}]`),
+    /// after sending `controls` (Task 5: `edit`, `params`, `param`, `save`)
+    /// to the running mesh-fx. Their answers are reported as `{"answer": …}`.
     pub fn step(
         &mut self,
         frame: &mut [i16],
         version: u64,
         plugins: &Arc<Value>,
+        controls: Vec<Value>,
         report: &dyn Fn(Value),
     ) {
         if version != self.applied {
@@ -248,7 +273,17 @@ impl Runner {
                 }
             }
         }
-        let Some(fx) = self.fx.as_mut() else { return };
+        let Some(fx) = self.fx.as_mut() else {
+            for c in controls {
+                report(json!({ "answer": { "cmd": c["cmd"], "plugin": c["plugin"], "error": "the plugins aren't running" } }));
+            }
+            return;
+        };
+        for c in controls {
+            if fx.send_control(c.clone()).is_err() {
+                report(json!({ "answer": { "cmd": c["cmd"], "plugin": c["plugin"], "error": "busy; try again" } }));
+            }
+        }
         // The wait mustn't hold up the other tasks on this runtime thread.
         let result = match tokio::runtime::Handle::try_current() {
             Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -256,6 +291,9 @@ impl Runner {
             }
             _ => fx.process(frame, DEADLINE),
         };
+        for answer in fx.take_replies() {
+            report(json!({ "answer": answer }));
+        }
         let why = match result {
             Ok(()) => {
                 self.late = 0;
@@ -276,9 +314,27 @@ impl Runner {
 }
 
 impl Drop for Fx {
+    /// Asks mesh-fx to save its plugins' state (kept when the chain changes
+    /// or the call ends), then closes its stdin so it exits once that's
+    /// done; off this thread, which may be the audio thread, it's killed if
+    /// it hasn't within a second.
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.send_control(json!({ "cmd": "save" }));
+        let (closed, _) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.to, closed));
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < until {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -332,7 +388,7 @@ mod tests {
         let mut fx = cat();
         let mut frame = vec![1i16; FRAME];
         fx.process(&mut frame, Duration::from_secs(1)).unwrap();
-        fx.child.kill().unwrap();
+        fx.child.as_mut().unwrap().kill().unwrap();
         let killed = Instant::now();
         let mut frame = vec![1i16; FRAME];
         let r = fx.process(&mut frame, Duration::from_secs(1));
@@ -360,7 +416,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(2);
         while Instant::now() < until {
             let mut frame = vec![9i16; FRAME];
-            r.step(&mut frame, version, plugins, &|v| got.borrow_mut().push(v));
+            r.step(&mut frame, version, plugins, Vec::new(), &|v| got.borrow_mut().push(v));
             assert_eq!(
                 frame,
                 vec![9i16; FRAME],
@@ -389,7 +445,7 @@ mod tests {
         let got = std::cell::RefCell::new(Vec::new());
         for _ in 0..20 {
             let mut frame = vec![3i16; FRAME];
-            r.step(&mut frame, 1, &on(), &|v| got.borrow_mut().push(v));
+            r.step(&mut frame, 1, &on(), Vec::new(), &|v| got.borrow_mut().push(v));
         }
         assert!(got.borrow().is_empty(), "{:?}", got.borrow());
         assert!(r.fx.is_some());
@@ -406,7 +462,7 @@ mod tests {
         for k in 0..3 {
             let mut frame = vec![4i16; FRAME];
             let started = Instant::now();
-            r.step(&mut frame, 1, &on(), &|v| got.borrow_mut().push(v));
+            r.step(&mut frame, 1, &on(), Vec::new(), &|v| got.borrow_mut().push(v));
             assert!(started.elapsed() < Duration::from_millis(200));
             assert_eq!(frame, vec![4i16; FRAME], "late: sent dry");
             assert_eq!(
@@ -419,7 +475,7 @@ mod tests {
         assert!(r.fx.is_none());
         // Bypassed: frames go straight through without waiting.
         let started = Instant::now();
-        r.step(&mut vec![4i16; FRAME], 1, &on(), &|_| {});
+        r.step(&mut vec![4i16; FRAME], 1, &on(), Vec::new(), &|_| {});
         assert!(started.elapsed() < Duration::from_millis(5));
         // Restart (the same chain, a new version) starts it again.
         r.start = runner(&["cat"]).start.clone();
@@ -440,7 +496,7 @@ mod tests {
         let got = std::cell::RefCell::new(Vec::new());
         let until = Instant::now() + Duration::from_secs(2);
         while got.borrow().is_empty() && Instant::now() < until {
-            r.step(&mut vec![1i16; FRAME], 1, &on(), &|v| {
+            r.step(&mut vec![1i16; FRAME], 1, &on(), Vec::new(), &|v| {
                 got.borrow_mut().push(v)
             });
         }

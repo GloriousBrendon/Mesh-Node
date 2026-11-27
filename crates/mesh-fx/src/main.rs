@@ -130,7 +130,7 @@ fn serve_stdio() -> Result<(), String> {
     // ponytail: on Windows a plugin printing to stdout would corrupt the protocol; redirect it there too (Task 11).
     #[cfg(not(unix))]
     let out = std::io::stdout().lock();
-    if let Err(e) = serve::serve(std::io::stdin().lock(), std::io::BufWriter::new(out)) {
+    if let Err(e) = serve::serve(std::io::stdin(), std::io::BufWriter::new(out)) {
         eprintln!("mesh-fx: {e}");
         std::process::exit(2);
     }

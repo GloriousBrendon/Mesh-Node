@@ -288,10 +288,17 @@ impl Helper {
                     let (version, plugins) = &mut self.calls.fx;
                     *version += 1;
                     if func == "fxChain" {
-                        let v: serde_json::Value = serde_json::from_str(arg(0)?)
+                        let mut v: serde_json::Value = serde_json::from_str(arg(0)?)
                             .ok()
                             .filter(serde_json::Value::is_array)
                             .ok_or_else(|| Fail("bad-args", "fxChain takes a JSON array".into()))?;
+                        // Each plugin's state file (Task 5), in our data.
+                        let dir = self.path.parent().unwrap_or(std::path::Path::new(".")).join("fx");
+                        for p in v.as_array_mut().into_iter().flatten() {
+                            let key = format!("{}\0{}", p["path"].as_str().unwrap_or(""), p["id"].as_str().unwrap_or(""));
+                            let name = format!("{}.state", blake3::hash(key.as_bytes()).to_hex());
+                            p["state"] = dir.join(name).to_string_lossy().into_owned().into();
+                        }
                         *plugins = Arc::new(v);
                     }
                     let (version, plugins) = (*version, plugins.clone());
@@ -307,6 +314,36 @@ impl Helper {
                     "unavailable",
                     "this Mesh was built without calls".into(),
                 ));
+            }
+            // A plugin's editor, parameters and state (Task 5), by its place
+            // in the chain: `fxEdit <i>`, `fxEditClose <i>`, `fxParams <i>`,
+            // `fxParam <i> <param id> <value>`, `fxSave`. They go to the
+            // plugins running in the call or the mic test; answers come as
+            // `meshFx {"answer": …}`.
+            "fxEdit" | "fxEditClose" | "fxParams" | "fxParam" | "fxSave" => {
+                #[cfg(feature = "audio")]
+                {
+                    let plugin = || -> Result<u64, Fail> {
+                        arg(0)?.parse().map_err(|_| Fail("bad-args", "which plugin (its place in the chain)".into()))
+                    };
+                    let command = match func {
+                        "fxEdit" => serde_json::json!({ "cmd": "edit", "plugin": plugin()? }),
+                        "fxEditClose" => serde_json::json!({ "cmd": "editClose", "plugin": plugin()? }),
+                        "fxParams" => serde_json::json!({ "cmd": "params", "plugin": plugin()? }),
+                        "fxParam" => {
+                            let param: u64 = arg(1)?.parse().map_err(|_| Fail("bad-args", "a parameter id".into()))?;
+                            let value: f64 = arg(2)?.parse().map_err(|_| Fail("bad-args", "a value".into()))?;
+                            serde_json::json!({ "cmd": "param", "plugin": plugin()?, "param": param, "value": value })
+                        }
+                        _ => serde_json::json!({ "cmd": "save" }),
+                    };
+                    let media = (self.calls.current.as_ref().and_then(|c| c.media.as_ref()))
+                        .or(self.calls.test.as_ref())
+                        .ok_or_else(|| Fail("unavailable", "start the mic test or a call first".into()))?;
+                    media.fx_control(command);
+                }
+                #[cfg(not(feature = "audio"))]
+                return Err(Fail("unavailable", "this Mesh was built without calls".into()));
             }
             // The mic test (A5): `on` or `off`, and with `on`, `hear` to
             // play it back. A call stops it.

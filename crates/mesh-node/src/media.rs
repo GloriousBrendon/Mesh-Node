@@ -151,6 +151,8 @@ struct Shared {
     fx: Mutex<(u64, Arc<serde_json::Value>)>,
     /// Told each change in how the plugins are doing (`meshFx`).
     fx_report: Box<dyn Fn(serde_json::Value) + Send + Sync>,
+    /// Control commands for the running plugins, taken with the next frame.
+    fx_controls: Mutex<Vec<serde_json::Value>>,
     /// Each peer device's volume, in percent, where it isn't 100 (A6).
     volumes: Mutex<HashMap<[u8; 32], u32>>,
     /// `--echo`: the level, and what was played, waiting its delay.
@@ -180,6 +182,7 @@ impl Shared {
             level: Box::new(level),
             fx: Mutex::new((0, Arc::new(serde_json::Value::Null))),
             fx_report: Box::new(fx_report),
+            fx_controls: Mutex::new(Vec::new()),
             volumes: Mutex::new(HashMap::new()),
         })
     }
@@ -378,6 +381,11 @@ impl Media {
     /// The plugin chain at `version`; a version it hasn't run restarts them.
     pub fn set_fx(&self, version: u64, plugins: Arc<serde_json::Value>) {
         *lock(&self.shared.fx) = (version, plugins);
+    }
+
+    /// A control command for the running plugins (Task 5).
+    pub fn fx_control(&self, command: serde_json::Value) {
+        lock(&self.shared.fx_controls).push(command);
     }
 
     /// Input volume, 0 to 200 percent.
@@ -625,7 +633,8 @@ impl Chain {
         }
         // A person's own plugins: after echo and noise, before gain (F3).
         let (version, plugins) = lock(&shared.fx).clone();
-        self.fx.step(frame, version, &plugins, &*shared.fx_report);
+        let controls = std::mem::take(&mut *lock(&shared.fx_controls));
+        self.fx.step(frame, version, &plugins, controls, &*shared.fx_report);
         if audio.gain {
             self.agc.process(frame);
         }

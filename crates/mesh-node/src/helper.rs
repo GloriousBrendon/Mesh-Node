@@ -968,7 +968,7 @@ impl Helper {
             f if f.starts_with("dm") => self.dm_command(f, args)?,
             f if f.starts_with("call")
                 || f.starts_with("voice")
-                || matches!(f, "audioTest" | "fxChain" | "fxRestart") =>
+                || matches!(f, "audioTest" | "fxChain" | "fxRestart" | "fxEdit" | "fxEditClose" | "fxParams" | "fxParam" | "fxSave") =>
             {
                 self.call_command(f, args)?
             }

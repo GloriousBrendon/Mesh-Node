@@ -823,7 +823,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca905d78f46117492bce49e64a765f8b3f5c71794486a1369242721860e2640"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "clap-sys",
 ]
 
@@ -833,7 +833,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "733d43b7ebd76a65931e8de2aa077200add4902514f4bda941c99326c14937dd"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.2",
  "clack-common",
  "clack-host",
  "clap-sys",
@@ -2807,6 +2807,7 @@ dependencies = [
 name = "mesh-node"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "cpal",
  "image",
  "iroh-relay",
