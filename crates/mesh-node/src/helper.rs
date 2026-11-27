@@ -39,8 +39,8 @@ use mesh_e2ee::{Conversation, E2ee, E2eeError, Kind as NoteKind, Opened};
 use mesh_identity::{
     Account, AddrRecord, CodeError, DEFAULT_EXPIRY, DEFAULT_USES, DIRECT_CERT_LEN, DeviceCert,
     DeviceKey, DeviceList, DirectCert, FriendCode, HeldCode, IdError, Keystore, KeystoreError,
-    Kind, KnockFrom, LastAddr, Link, MAX_DEVICE_NAME, MAX_NOTE, MeshId, RootKey, SafetyNumber,
-    Status as Chosen, check_password, is_kept, keyring_status, open_knock, seal_knock, unix_now,
+    Kind, LastAddr, Link, MAX_DEVICE_NAME, MeshId, RootKey, SafetyNumber, Status as Chosen,
+    check_password, is_kept, keyring_status, unix_now,
 };
 use mesh_transport::{
     Allow, Config, HandshakeError, MeshAddr, Node, Path as NetPath, Pong, Relays, Status,
@@ -73,8 +73,8 @@ mod spaces;
 #[path = "top8.rs"]
 mod top8;
 use social::{
-    COLLECT_EVERY, Collected, PRESENCE, PRESENCE_SILENCE, Presence, SYNC, SYNC_TIMEOUT,
-    push_account,
+    ADDED, COLLECT_EVERY, Collected, PRESENCE, PRESENCE_SILENCE, Presence, SYNC, SYNC_TIMEOUT,
+    push_account, serve_added,
 };
 pub use spaces::PEER_IDLE;
 
@@ -559,8 +559,8 @@ enum Back {
     /// A friend code resolved to its owner and lookup ID, for a request with
     /// this note.
     Resolved(Box<(MeshId, [u8; 16], String)>),
-    /// A seed took our request to them.
-    Requested(MeshId),
+    /// Someone told us they've added us (social R3-3).
+    Added(MeshId),
     /// What the seeds hold for our codes.
     Collected(Vec<Collected>),
     /// What a mail collect found (mailbox), the holders where our claims
@@ -791,15 +791,10 @@ impl Helper {
                     }
                 });
             }
+            // Add by code (social R3-1): no request, no note.
             "friendRequest" => {
                 let code = parse_code(arg(0)?)?;
-                let note = arg(1).unwrap_or("").trim().to_owned();
-                if note.len() > MAX_NOTE {
-                    return Err(Fail(
-                        "bad-note",
-                        format!("a note is at most {MAX_NOTE} bytes"),
-                    ));
-                }
+                let note = String::new();
                 let (anon, seeds) = self.seed_node()?;
                 let back = self.back.clone();
                 tokio::spawn(async move {
@@ -816,20 +811,7 @@ impl Helper {
                 self.unlocked()?.add_contact(id, arg(1).unwrap_or(""))?;
                 self.contacts_changed(Some(&id));
                 self.dial(&id);
-                self.changed(Some(func));
-            }
-            "friendAccept" => {
-                let id = parse_id(arg(0)?)?;
-                self.unlocked()?.accept(&id)?;
-                self.contacts_changed(Some(&id));
-                // Their device lets us in (they asked), so this connection
-                // makes us friends on their side too (D8, D9).
-                self.dial(&id);
-                self.changed(Some(func));
-            }
-            "friendDecline" => {
-                let id = parse_id(arg(0)?)?;
-                self.unlocked()?.decline(&id)?;
+                self.send_added(&id);
                 self.changed(Some(func));
             }
             "friendCancel" | "friendRemove" => {
@@ -1350,7 +1332,9 @@ impl Helper {
                     // A newer list of theirs may have removed a device.
                     self.allow_contacts();
                 }
-                let promoted = self.connected(&id);
+                // A connection alone isn't consent (social R3-2): we say
+                // we've added them, and they say so back if they have.
+                self.send_added(&id);
                 self.present_to(&id);
                 self.offer_profile(&id);
                 self.top8_deliver(&id);
@@ -1360,9 +1344,6 @@ impl Helper {
                 self.dm_deliver(&id);
                 self.space_deliver(&id);
                 self.history_again(&id);
-                if promoted {
-                    return self.changed(None);
-                }
                 return self.emit_social(None);
             }
             Back::MailFound(found, wiped, unlock, paid) => {
@@ -1390,9 +1371,7 @@ impl Helper {
                     self.offer_profile(&id);
                     return self.tell_direct(&id);
                 }
-                if self.connected(&id) {
-                    self.changed(None);
-                }
+                self.send_added(&id);
                 self.keys_for(&id);
                 self.mail_records_missing(&id);
                 self.offer_profile(&id);
@@ -1428,19 +1407,13 @@ impl Helper {
                 }
                 return self.presence_heard(id, device, heard, &name);
             }
+            // A code resolved: add its owner on our side only (social R3-1).
             Back::Resolved(resolved) => {
-                let (id, lookup_id, note) = *resolved;
-                if let Err(Fail(kind, message)) = self.request(id, lookup_id, &note) {
-                    emit_fail("friendRequest", kind, &message);
-                }
-                return;
-            }
-            Back::Requested(id) => {
+                let (id, _, _) = *resolved;
                 let Some(store) = self.store.as_mut() else {
                     return;
                 };
                 match store.add_contact(id, "") {
-                    // A resend, or they'd asked us (then this accepted).
                     Ok(()) | Err(KeystoreError::AlreadyContact) => {}
                     Err(e) => {
                         let Fail(kind, message) = e.into();
@@ -1449,8 +1422,10 @@ impl Helper {
                 }
                 self.contacts_changed(Some(&id));
                 self.dial(&id);
+                self.send_added(&id);
                 return self.changed(Some("friendRequest"));
             }
+            Back::Added(id) => return self.added_heard(id),
             Back::Collected(found) => return self.collected(found),
         };
         let mut gone = false;
@@ -1950,6 +1925,9 @@ impl Helper {
     /// Starts this device's node for the open identity (replacing any running).
     async fn start_net(&mut self) {
         self.stop_net().await;
+        if let Some(Err(e)) = self.store.as_mut().map(Keystore::forget_requests) {
+            eprintln!("mesh-node: couldn't drop old friend requests: {e}");
+        }
         let Some(store) = &self.store else { return };
         let data = self.path.parent().unwrap_or(Path::new("."));
         let opened = E2ee::open(
@@ -2010,6 +1988,7 @@ impl Helper {
                 files::BLOB.to_owned(),
                 profile::SERVICE.to_owned(),
                 top8::SERVICE.to_owned(),
+                ADDED.to_owned(),
                 spaces::SPACE_HISTORY.to_owned(),
             ]
             .into_iter()
@@ -2697,6 +2676,10 @@ async fn serve_streams(
         }
         if stream.service == top8::SERVICE {
             tokio::spawn(top8::serve(stream, back));
+            continue;
+        }
+        if stream.service == ADDED {
+            tokio::spawn(serve_added(stream, back));
             continue;
         }
         if stream.service == calls::CALL {

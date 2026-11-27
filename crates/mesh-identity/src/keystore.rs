@@ -830,7 +830,7 @@ impl Keystore {
         match self.account.kind(&id) {
             Some(Kind::Outgoing | Kind::Friend) => return Err(KeystoreError::AlreadyContact),
             Some(Kind::Blocked) => return Err(KeystoreError::Blocked),
-            Some(Kind::Incoming) => return self.accept(&id),
+            // An old request doesn't count as their consent (social R3-2).
             _ => {}
         }
         if !self.room_for(&[id]) {
@@ -930,14 +930,27 @@ impl Keystore {
         self.save()
     }
 
-    /// A connection with `id` passed the handshake. Their device let us in,
-    /// so an `outgoing` contact has added us too: friends now (D8). True if
-    /// that changed anything.
+    /// `id` proved they've added us (social R3-2: their `added` message or
+    /// their presence): an `outgoing` contact is a friend now. True if that
+    /// changed anything.
     pub fn connected(&mut self, id: &MeshId) -> Result<bool, KeystoreError> {
         if self.account.kind(id) != Some(Kind::Outgoing) {
             return Ok(false);
         }
         self.set_kind(id, Kind::Friend, |_| {}).map(|()| true)
+    }
+
+    /// Requests from before social revision 3 that were never answered go,
+    /// without being shown again (R3-2). True if any did.
+    pub fn forget_requests(&mut self) -> Result<bool, KeystoreError> {
+        let asked: Vec<MeshId> = (self.account.entries().iter())
+            .filter(|e| e.kind == Kind::Incoming)
+            .map(Entry::id)
+            .collect();
+        for id in &asked {
+            self.set_kind(id, Kind::Removed, |_| {})?;
+        }
+        Ok(!asked.is_empty())
     }
 
     /// A friend's own name, as their presence carries it: the request only
@@ -1662,6 +1675,26 @@ mod tests {
             note: "hi".into(),
             created_at: at,
         }
+    }
+
+    /// Social revision 3: an old request is never consent. Adding its
+    /// sender makes them `outgoing`, not a friend; unanswered ones go at
+    /// the migration.
+    #[test]
+    fn old_requests_are_not_consent() {
+        let path = temp_path("social-r3");
+        let mut store = create(&path);
+        let (sam, ana) = (RootKey::generate().unwrap(), RootKey::generate().unwrap());
+        let now = unix_now();
+        store.knocked(&knock_from(&sam, now)).unwrap();
+        store.knocked(&knock_from(&ana, now)).unwrap();
+        store.add_contact(sam.id(), "").unwrap();
+        assert_eq!(store.account().kind(&sam.id()), Some(Kind::Outgoing));
+        assert!(store.forget_requests().unwrap());
+        assert_eq!(store.account().kind(&ana.id()), Some(Kind::Removed));
+        assert_eq!(store.account().kind(&sam.id()), Some(Kind::Outgoing));
+        assert!(!store.forget_requests().unwrap(), "once");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
