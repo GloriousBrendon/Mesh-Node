@@ -39,6 +39,10 @@ pub const MAX_LINK_LEN: usize = 512;
 pub const MAX_LINK_LABEL: usize = 64;
 pub const MAX_BLOCKS: usize = 32;
 pub const MAX_FONT_NAME: usize = 64;
+/// Friends shown in a Top 8 (PR11).
+pub const MAX_TOP8: usize = 8;
+/// A shown friend's name, in bytes.
+pub const MAX_TOP8_NAME: usize = 64;
 
 /// The kinds of picture a profile may hold (PR7).
 pub const PICTURE_TYPES: [&str; 5] = [
@@ -144,13 +148,25 @@ pub struct Manifest {
     pub version: u64,
     pub toml: String,
     pub assets: Vec<Asset>,
+    /// The friends who agreed to be shown (PR11), in order: the name they
+    /// gave and their own profile's avatar, never their ID.
+    pub top8: Vec<Shown>,
     pub cert: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
+/// One friend in a Top 8 (PR11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shown {
+    pub name: String,
+    /// Their profile's avatar, passed on as they sealed it: within the
+    /// avatar's caps, but not counted in the bundle's 25 MB.
+    pub avatar: Option<Asset>,
+}
+
 /// The fields a device signs: everything but the signature.
 fn signed_bytes(m: &Manifest) -> Vec<u8> {
-    let fields = (m.format, m.version, &m.toml, &m.assets, &m.cert);
+    let fields = (m.format, m.version, &m.toml, &m.assets, &m.top8, &m.cert);
     postcard::to_stdvec(&fields).expect("to memory")
 }
 
@@ -161,6 +177,7 @@ impl Manifest {
         version: u64,
         toml: String,
         assets: Vec<Asset>,
+        top8: Vec<Shown>,
         device: &DeviceKey,
         cert: &DeviceCert,
     ) -> Result<Self, ProfileError> {
@@ -169,6 +186,7 @@ impl Manifest {
             version,
             toml,
             assets,
+            top8,
             cert: cert.to_bytes(),
             signature: Vec::new(),
         };
@@ -259,7 +277,29 @@ impl Manifest {
         if total > MAX_BUNDLE {
             return Err(ProfileError::BundleTooBig);
         }
+        if self.top8.len() > MAX_TOP8 {
+            return Err(ProfileError::TooMany("friends in the Top 8"));
+        }
+        for shown in &self.top8 {
+            if shown.name.len() > MAX_TOP8_NAME {
+                return Err(ProfileError::TooLong("Top 8 name"));
+            }
+            if let Some(a) = &shown.avatar
+                && (a.slot != Slot::Avatar
+                    || a.size > MAX_AVATAR
+                    || !Slot::Avatar.types().contains(&a.mime.as_str())
+                    || a.seconds.is_some())
+            {
+                return Err(ProfileError::WrongType("Top 8 avatar"));
+            }
+        }
         Ok(profile)
+    }
+
+    /// Every file it shows: its own, then its Top 8's avatars.
+    pub fn files(&self) -> impl Iterator<Item = &Asset> {
+        let top8 = self.top8.iter().filter_map(|s| s.avatar.as_ref());
+        self.assets.iter().chain(top8)
     }
 
     /// The manifest's bytes, once it's checked.
@@ -474,6 +514,7 @@ text = "mixing"
                 version,
                 SAMPLE.to_string(),
                 assets,
+                Vec::new(),
                 &self.device,
                 &self.cert,
             )
@@ -703,6 +744,52 @@ text = "mixing"
         assert_eq!(me.sign(1, assets), Err(ProfileError::BundleTooBig));
     }
 
+    /// PR11: at most 8 shown, each a name and an avatar within its caps,
+    /// outside the bundle's 25 MB; signed with the rest.
+    #[test]
+    fn top8_caps_and_signature() {
+        let me = Someone::new();
+        let shown = |name: &str, avatar: Option<Asset>| Shown {
+            name: name.into(),
+            avatar,
+        };
+        let sign = |top8: Vec<Shown>| {
+            Manifest::signed(1, SAMPLE.to_string(), vec![], top8, &me.device, &me.cert)
+        };
+        let big = asset(Slot::Avatar, MAX_AVATAR, "image/gif");
+        let full: Vec<Shown> = (0..MAX_TOP8)
+            .map(|_| shown("bea", Some(big.clone())))
+            .collect();
+        let m = sign(full.clone()).expect("8 at their caps, over 25 MB together");
+        assert_eq!(m.files().count(), MAX_TOP8);
+        assert_eq!(Manifest::from_bytes(&m.to_bytes().unwrap()).unwrap(), m);
+        let mut nine = full;
+        nine.push(shown("one more", None));
+        assert_eq!(
+            sign(nine),
+            Err(ProfileError::TooMany("friends in the Top 8"))
+        );
+        let long = "n".repeat(MAX_TOP8_NAME + 1);
+        assert_eq!(
+            sign(vec![shown(&long, None)]),
+            Err(ProfileError::TooLong("Top 8 name"))
+        );
+        for bad in [
+            asset(Slot::Avatar, MAX_AVATAR + 1, "image/png"),
+            asset(Slot::Song, 10, "audio/ogg"),
+            asset(Slot::Avatar, 10, "image/svg+xml"),
+        ] {
+            assert_eq!(
+                sign(vec![shown("bea", Some(bad))]),
+                Err(ProfileError::WrongType("Top 8 avatar"))
+            );
+        }
+        // Who's shown is signed: changing it breaks the signature.
+        let mut m = sign(vec![shown("bea", None)]).unwrap();
+        m.top8[0].name = "someone else".into();
+        assert_eq!(m.author(), None);
+    }
+
     #[test]
     fn song_length() {
         let me = Someone::new();
@@ -730,7 +817,8 @@ text = "mixing"
         // Two devices both publish version 4: every device picks the same.
         let device = DeviceKey::generate().unwrap();
         let cert = DeviceCert::issue(&me.root, &device.public(), "desktop", 1).unwrap();
-        let desktop = Manifest::signed(4, SAMPLE.to_string(), vec![], &device, &cert).unwrap();
+        let desktop =
+            Manifest::signed(4, SAMPLE.to_string(), vec![], vec![], &device, &cert).unwrap();
         assert_ne!(newer.replaces(&desktop), desktop.replaces(&newer));
     }
 
