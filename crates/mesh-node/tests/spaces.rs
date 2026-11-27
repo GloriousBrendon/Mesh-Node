@@ -2033,3 +2033,42 @@ fn a_card_reaches_members_who_arent_friends() {
     assert_eq!(err["kind"], "not-found", "{err}");
     let _ = (k.o.quit(), k.b.quit(), k.c.quit());
 }
+
+/// SPEC-social revision 3: B adds C, a member C never added, and they
+/// talk in the club, so their devices connect. That's no consent from C:
+/// B keeps C as `outgoing`, and C sees nothing. Once C adds B, friends.
+#[test]
+fn a_space_connection_is_not_consent() {
+    let mut k = club("spaces-consent");
+    let (s, g) = (k.space.clone(), k.general.clone());
+    let social = ask(&mut k.b, "friendAdd", &[&k.id_c, ""], "meshSocial");
+    assert!(has(&social, "outgoing", &k.id_c), "{social}");
+    ask(
+        &mut k.b,
+        "spaceSend",
+        &[&s, &g, "hello cal"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.c, "meshSpaceNotify", |n| n["text"] == "hello cal");
+    ask(
+        &mut k.c,
+        "spaceSend",
+        &[&s, &g, "hi bea"],
+        "meshSpaceMessages",
+    );
+    until(&mut k.b, "meshSpaceNotify", |n| n["text"] == "hi bea");
+    std::thread::sleep(Duration::from_secs(3));
+    let b = ask(&mut k.b, "socialList", &[], "meshSocial");
+    assert!(
+        has(&b, "outgoing", &k.id_c) && !has(&b, "friends", &k.id_c),
+        "{b}"
+    );
+    let c = ask(&mut k.c, "socialList", &[], "meshSocial");
+    for list in ["friends", "incoming", "outgoing"] {
+        assert!(!has(&c, list, &k.id_b), "{list}: {c}");
+    }
+    ask(&mut k.c, "friendAdd", &[&k.id_b, ""], "meshSocial");
+    until(&mut k.b, "meshSocial", |v| has(v, "friends", &k.id_c));
+    until(&mut k.c, "meshSocial", |v| has(v, "friends", &k.id_b));
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}

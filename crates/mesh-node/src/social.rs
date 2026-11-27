@@ -1,5 +1,5 @@
-//! The helper's side of `social` (SPEC-social): collecting the friend
-//! requests left with our codes, presence to and from friends (D12, D13),
+//! The helper's side of `social` (SPEC-social revision 3): learning which
+//! of our codes are gone, the `added` proof that a friendship is mutual, presence to and from friends (D12, D13),
 //! and account sync between our own devices (D11). A child of `helper`, so
 //! it works on the same `Helper`.
 
@@ -37,12 +37,32 @@ impl Presence {
 /// One code's requests, from every seed that answered.
 pub(super) struct Collected {
     pub(super) code: FriendCode,
-    pub(super) lookup_id: [u8; 16],
     /// A seed says the code is still live.
     pub(super) live: bool,
     /// A seed knows the code and says it's gone.
     pub(super) gone: bool,
-    pub(super) knocks: Vec<Vec<u8>>,
+}
+
+/// "I have you as outgoing or friend" (social R3-3): one frame, `1`.
+pub(super) const ADDED: &str = "added";
+
+/// Takes one `added` frame and answers that it came.
+pub(super) async fn serve_added(
+    mut stream: mesh_transport::ServiceStream,
+    back: tokio::sync::mpsc::UnboundedSender<Back>,
+) {
+    let id = stream.peer.id;
+    let got = async {
+        let frame = mesh_transport::frame::read_frame(&mut stream.recv)
+            .await
+            .ok()??;
+        (frame == [1]).then(|| back.send(Back::Added(id)).ok())??;
+        mesh_transport::frame::write_frame(&mut stream.send, &[1])
+            .await
+            .ok()
+    };
+    let _ = tokio::time::timeout(SYNC_TIMEOUT, got).await;
+    let _ = stream.send.finish();
 }
 
 /// The account-state service between our own devices (D11).
@@ -97,12 +117,10 @@ impl Helper {
             let requests: Vec<Vec<u8>> = codes.iter().map(|(_, r)| r.to_bytes().to_vec()).collect();
             let mut found: Vec<Collected> = codes
                 .iter()
-                .map(|(code, revoke)| Collected {
+                .map(|(code, _)| Collected {
                     code: *code,
-                    lookup_id: revoke.lookup_id(),
                     live: false,
                     gone: false,
-                    knocks: Vec::new(),
                 })
                 .collect();
             for addr in seeds.iter() {
@@ -111,12 +129,10 @@ impl Helper {
                     continue;
                 };
                 for (got, answer) in found.iter_mut().zip(answers) {
-                    if let Some(knocks::Get::Found { live, knocks }) =
-                        knocks::Get::from_bytes(&answer)
+                    if let Some(knocks::Get::Found { live, .. }) = knocks::Get::from_bytes(&answer)
                     {
                         got.live |= live;
                         got.gone |= !live;
-                        got.knocks.extend(knocks);
                     }
                 }
             }
@@ -124,91 +140,15 @@ impl Helper {
         });
     }
 
-    /// Seals our request to the owner of a code we resolved, and puts it on
-    /// every seed.
-    pub(super) fn request(
-        &mut self,
-        id: MeshId,
-        lookup_id: [u8; 16],
-        note: &str,
-    ) -> Result<(), Fail> {
-        let store = self.unlocked()?;
-        if id == store.id() {
-            return Err(Fail("self", "that's your own code".to_owned()));
-        }
-        match store.account().kind(&id) {
-            Some(Kind::Blocked) => {
-                return Err(Fail(
-                    "blocked",
-                    "you've blocked them; unblock them first".to_owned(),
-                ));
-            }
-            Some(Kind::Friend) => {
-                return Err(Fail("already-friend", "you're already friends".to_owned()));
-            }
-            _ => {}
-        }
-        let from = KnockFrom {
-            root: store.root_key(),
-            device: store.device_key(),
-            devices: store.devices(),
-            name: store.username(),
-        };
-        let knock = seal_knock(&from, &id, &lookup_id, note, unix_now())
-            .map_err(|e| Fail("bad-request", e.to_string()))?;
-        let (anon, seeds) = self.seed_node()?;
-        let back = self.back.clone();
-        tokio::spawn(async move {
-            let mut best = None;
-            for addr in seeds.iter() {
-                let answer =
-                    seed::ask_many(&anon, addr, seed::KNOCK_PUT, std::slice::from_ref(&knock))
-                        .await
-                        .ok()
-                        .and_then(|a| knocks::Put::from_byte(*a.first()?.first()?));
-                best = match (best, answer) {
-                    (_, Some(knocks::Put::Ok)) | (Some(knocks::Put::Ok), _) => {
-                        Some(knocks::Put::Ok)
-                    }
-                    (best, answer) => answer.or(best),
-                };
-            }
-            match best {
-                Some(knocks::Put::Ok) => drop(back.send(Back::Requested(id))),
-                Some(knocks::Put::Gone) => emit_fail(
-                    "friendRequest",
-                    "not-found",
-                    "no such code: it may have expired, been used or been revoked",
-                ),
-                Some(knocks::Put::SlowDown) => emit_fail(
-                    "friendRequest",
-                    "slow-down",
-                    "too many requests; wait a while",
-                ),
-                _ => emit_fail("friendRequest", "offline", "couldn't reach a seed"),
-            }
-        });
-        Ok(())
-    }
-
-    /// Takes in the requests left with our codes, and drops codes that are
-    /// gone once their requests are in.
+    /// Drops our codes the seeds say are gone.
     pub(super) fn collected(&mut self, found: Vec<Collected>) {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        let (now, mut changed, mut dropped) = (unix_now(), false, false);
+        let mut dropped = false;
+        // Requests left by 0.5.x clients are never read (social R3-4); a
+        // collect only learns which codes are gone.
         for got in found {
-            for bytes in &got.knocks {
-                // Anything that doesn't open is junk: the seed can't make one.
-                let Ok(knock) = open_knock(store.root_key(), &got.lookup_id, bytes, now) else {
-                    continue;
-                };
-                match store.knocked(&knock) {
-                    Ok(c) => changed |= c,
-                    Err(e) => eprintln!("mesh-node: couldn't save a friend request: {e}"),
-                }
-            }
             if got.gone && !got.live {
                 dropped = true;
                 if let Err(e) = store.drop_code(&got.code) {
@@ -216,14 +156,46 @@ impl Helper {
                 }
             }
         }
-        if changed {
-            // A request from someone we'd asked made them a friend.
-            self.contacts_changed(None);
-            self.dial_contacts();
-            self.changed(None);
-        }
         if dropped {
             self.emit_codes(None);
+        }
+    }
+
+    /// Tells each connected device of `id` that we've added them, if we
+    /// have (social R3-3).
+    pub(super) fn send_added(&self, id: &MeshId) {
+        let (Some(store), Some(net)) = (&self.store, &self.net) else {
+            return;
+        };
+        if !matches!(
+            store.account().kind(id),
+            Some(Kind::Outgoing | Kind::Friend)
+        ) {
+            return;
+        }
+        for addr in net.node.connected(id) {
+            let node = net.node.clone();
+            tokio::spawn(async move {
+                let sent = async {
+                    let (_, mut send, mut recv) = node.open(&addr, ADDED).await.ok()?;
+                    mesh_transport::frame::write_frame(&mut send, &[1])
+                        .await
+                        .ok()?;
+                    let _ = mesh_transport::frame::read_frame(&mut recv).await;
+                    send.finish().ok()
+                };
+                let _ = tokio::time::timeout(SYNC_TIMEOUT, sent).await;
+            });
+        }
+    }
+
+    /// `id` says they've added us: if we'd added them, friends now, and we
+    /// say so back. From anyone else it's dropped and nothing shows.
+    pub(super) fn added_heard(&mut self, id: MeshId) {
+        if self.connected(&id) {
+            self.changed(None);
+            self.present_to(&id);
+            self.send_added(&id);
         }
     }
 
@@ -465,8 +437,7 @@ impl Helper {
     /// by itself (a request came, someone connected).
     pub(super) fn emit_social(&self, answers: Option<&str>) {
         let Some(store) = &self.store else { return };
-        let (mut friends, mut incoming, mut outgoing, mut blocked) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut friends, mut outgoing, mut blocked) = (Vec::new(), Vec::new(), Vec::new());
         for e in store.account().entries() {
             let id = e.id();
             match e.kind {
@@ -478,9 +449,8 @@ impl Helper {
                     "presence": self.presence_of(&id).as_str(),
                     "seen": store.contact(&id).and_then(|c| c.seen),
                 })),
-                Kind::Incoming => incoming.push(json!({
-                    "id": id.to_string(), "name": e.name, "note": e.note, "at": e.at,
-                })),
+                // Never shown (social R3-2): an old device's sync may bring one.
+                Kind::Incoming => {}
                 Kind::Outgoing => outgoing.push(json!({
                     "id": id.to_string(), "nick": e.nick, "at": e.at,
                 })),
@@ -495,7 +465,7 @@ impl Helper {
             json!({
                 "fn": answers,
                 "friends": friends,
-                "incoming": incoming,
+                "incoming": [],
                 "outgoing": outgoing,
                 "blocked": blocked,
                 "status": store.account().status().as_str(),
