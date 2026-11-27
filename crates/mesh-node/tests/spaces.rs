@@ -1937,3 +1937,99 @@ fn a_passing_test_leaves_no_folders() {
     assert!(failed.exists(), "a failed test's folder is kept");
     std::fs::remove_dir_all(failed).unwrap();
 }
+
+/// The member's entry in a `meshSpaces` Space, by ID.
+fn member<'a>(space: &'a Value, id: &str) -> &'a Value {
+    let members = space["members"].as_array().unwrap();
+    members.iter().find(|m| m["id"] == id).unwrap()
+}
+
+/// SPEC-profile PR12, PR13: B's card reaches C, a member who isn't B's
+/// friend, avatar and all, but B's full profile never does; only the owner
+/// or an admin hides a card's line.
+#[test]
+fn a_card_reaches_members_who_arent_friends() {
+    let mut k = club("spaces-cards");
+    let s = k.space.clone();
+    let dir = temp_dir("spaces-cards-files");
+    let avatar = dir.join("bea.png");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&avatar, b"a still picture").unwrap();
+    let avatar = avatar.to_str().unwrap();
+    // B has a full profile too, for friends only.
+    let folder = dir.join("profile");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("profile.toml"),
+        "[theme]\naccent = \"#d88f92\"\n",
+    )
+    .unwrap();
+    std::fs::write(folder.join("avatar.png"), b"the profile one").unwrap();
+    k.b.send("profileSet", &[folder.to_str().unwrap()]);
+    until(&mut k.b, "meshProfile", |p| p["fn"] == "profileSet");
+
+    // Over the caps, or not a still picture: refused before anything goes.
+    let big = dir.join("big.png");
+    std::fs::write(&big, vec![1u8; 1_000_001]).unwrap();
+    let err = ask(
+        &mut k.b,
+        "cardSet",
+        &[&s, "Bea", "", big.to_str().unwrap()],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "too-long", "{err}");
+    let gif = dir.join("moving.gif");
+    std::fs::write(&gif, b"GIF89a").unwrap();
+    let err = ask(
+        &mut k.b,
+        "cardSet",
+        &[&s, "Bea", "", gif.to_str().unwrap()],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "bad-args", "{err}");
+    let err = ask(
+        &mut k.b,
+        "cardSet",
+        &[&s, "Bea", &"x".repeat(191), ""],
+        "meshError",
+    );
+    assert_eq!(err["kind"], "too-long", "{err}");
+
+    ask(
+        &mut k.b,
+        "cardSet",
+        &[&s, "Bea", "I mix on Fridays", avatar],
+        "meshSpaces",
+    );
+    let seen =
+        until(&mut k.c, "meshSpaces", |v| {
+            v["spaces"].as_array().unwrap().iter().any(|sp| {
+                sp["id"] == s.as_str() && member(sp, &k.id_b)["line"] == "I mix on Fridays"
+            })
+        });
+    let b = member(space(&seen, "club"), &k.id_b);
+    assert_eq!(b["name"], "Bea");
+    assert_eq!(b["avatar"]["mime"], "image/png", "{b}");
+
+    k.c.send("cardFetch", &[&s, &k.id_b]);
+    let file = until(&mut k.c, "meshDmFile", |f| f["message"] == k.id_b.as_str());
+    let got = std::fs::read(file["path"].as_str().unwrap()).unwrap();
+    assert_eq!(got, b"a still picture");
+
+    // A member can't hide another's card; the owner can.
+    let err = ask(&mut k.c, "cardHide", &[&s, &k.id_b, "line"], "meshError");
+    assert_eq!(err["kind"], "not-allowed", "{err}");
+    ask(&mut k.o, "cardHide", &[&s, &k.id_b, "line"], "meshSpaces");
+    let seen = until(&mut k.c, "meshSpaces", |v| {
+        (v["spaces"].as_array().unwrap().iter())
+            .any(|sp| sp["id"] == s.as_str() && member(sp, &k.id_b)["hidden"]["line"] == true)
+    });
+    let b = member(space(&seen, "club"), &k.id_b);
+    assert!(b["line"].is_null(), "{b}");
+    assert!(!b["avatar"].is_null(), "only the line is hidden: {b}");
+
+    // Never the full profile: C isn't B's friend.
+    let err = ask(&mut k.c, "profileGet", &[&k.id_b], "meshError");
+    assert_eq!(err["kind"], "not-found", "{err}");
+    let _ = (k.o.quit(), k.b.quit(), k.c.quit());
+}

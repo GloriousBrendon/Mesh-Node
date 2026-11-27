@@ -24,7 +24,7 @@ const CHUNK_WAIT: Duration = Duration::from_secs(20);
 pub(super) type Fetched = (Where, String, usize, Attachment, Option<Vec<Vec<u8>>>);
 
 /// A file's type from its name: the common ones, else bytes.
-fn mime_of(name: &str) -> &'static str {
+pub(super) fn mime_of(name: &str) -> &'static str {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     match ext.as_deref() {
         Some("jpg" | "jpeg") => "image/jpeg",
